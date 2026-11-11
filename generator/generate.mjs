@@ -626,7 +626,8 @@ function withUsageDescriptions(plist, appName) {
   ];
   for (const [key, text] of wanted) {
     if (plist.includes(`<key>${key}</key>`)) continue;
-    const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", `\t<key>${key}</key>\n\t<string>${text}</string>\n\t<key>LSRequiresIPhoneOS</key>`);
+    // A callback, not a replacement string: "$&" or "$'" in the app name must stay literal.
+    const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>${key}</key>\n\t<string>${text}</string>\n\t<key>LSRequiresIPhoneOS</key>`);
     if (anchored === plist) fail(`Info.plist layout changed, ${key} was not added`);
     plist = anchored;
   }
@@ -689,7 +690,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
                 <data android:scheme="${callbackScheme}" />
             </intent-filter>` : ""}
         </activity>`;
-  manifest = manifest.replace(/\s*<\/activity>/, filter);
+  manifest = manifest.replace(/\s*<\/activity>/, () => filter);
   manifest = withAudioPermissions(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
@@ -753,7 +754,7 @@ function patchIos(dir, { appName, appId, host, versionName, buildNumber, associa
   if (callbackScheme && !plist.includes("CFBundleURLTypes")) {
     // The sign-in return by scheme. ASWebAuthenticationSession catches it by itself; registering it
     // also brings a tap on the fallback link of the app page back to the shell.
-    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", `\t<key>CFBundleURLTypes</key>
+    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>CFBundleURLTypes</key>
 \t<array>
 \t\t<dict>
 \t\t\t<key>CFBundleURLName</key>
@@ -804,7 +805,7 @@ ${entitlements.join("\n")}
 </plist>
 `);
     pbx = pbx.replace(new RegExp(`(\\t+)PRODUCT_BUNDLE_IDENTIFIER = ${appId.replace(/\./g, "\\.")};`, "g"),
-      `$1CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n$1PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
+      (_, indent) => `${indent}CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n${indent}PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
   }
   if (push) {
     // The push plugin learns the device token (or the failure) from these two AppDelegate calls.
@@ -1456,6 +1457,12 @@ function selftest() {
     [`<script>${viewport("viewport-fit=cover")}`, false, "an unterminated script"]
   ]) {
     assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  for (const hostileName of ["Caixa $& Co", "A$'B", "A$`B", "A$1B", "A$$B", "$&$'$`$1$$"]) {
+    const out = withUsageDescriptions("<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>", hostileName);
+    const once = (needle) => out.split(needle).length === 2;
+    assert(out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa o microfone`) && out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa a c\u00e2mera`), `the name ${hostileName} stays literal in the usage strings`);
+    assert(once("<key>NSMicrophoneUsageDescription</key>") && once("<key>NSCameraUsageDescription</key>") && once("<key>LSRequiresIPhoneOS</key>") && once("<key>CFBundleName</key>"), `the plist keeps one of each key with the name ${hostileName}`);
   }
   const usagePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
   const usage = withUsageDescriptions(usagePlist, `Caf\u00e9 & <Co> "x" 'y'`);

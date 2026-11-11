@@ -53,3 +53,27 @@ jobs:
           grep -q '>CF</text>' assets/logo.svg
           test -f assets/composed/icon-only.png
           test -f android/app/src/main/res/drawable-v31/splash_icon.xml
+      # The fixture page has no viewport meta, so detection gives "automatic" and nothing is recorded
+      # in mitra-shell.json (only a forced value is).
+      - name: Check the safe area and microphone reach the artifacts
+        working-directory: ${{ runner.temp }}/out/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "automatic" ? 0 : 1)'
+          node -e 'process.exit("iosContentInset" in require("./mitra-shell.json") ? 1 : 0)'
+          grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.hardware.microphone" android:required="false"' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml
+      # With iOS and the opposite of the detected value. The CLI skips CocoaPods and xcodebuild with
+      # a warning when they are missing, so this needs no macOS tooling.
+      - name: Generate a shell with iOS and a forced inset
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --ios-content-inset never --out "$RUNNER_TEMP/out-ios"
+      - name: Check the forced inset and the iOS usage strings
+        working-directory: ${{ runner.temp }}/out-ios/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "never" ? 0 : 1)'
+          node -e 'process.exit(require("./mitra-shell.json").iosContentInset === "never" ? 0 : 1)'
+          test "$(grep -c '<key>NSMicrophoneUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          test "$(grep -c '<key>NSCameraUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          grep -q 'CI Fixture usa o microfone' ios/App/App/Info.plist
+
