@@ -708,6 +708,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
   writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
+  writeFileSync(join(javaDir, "ShellWebChromeClient.java"), shellWebChromeClientJava(appId, host));
 
   // build.gradle: version and release signing from the environment.
   const gradlePath = join(app, "build.gradle");
@@ -836,6 +837,7 @@ function mainActivityJava(appId, callbackScheme) {
 
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Bundle;
 import android.webkit.WebView;
 
 import com.getcapacitor.BridgeActivity;
@@ -845,6 +847,17 @@ public class MainActivity extends BridgeActivity {
     private static final String SHELL_LINK_PARAM = "shellLink";
     // Sign-in return by URL scheme (null when the shell relies on the App Link alone).
     private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+
+    // Replaces the bridge's own chrome client, once, to make media permission requests safe (see
+    // ShellWebChromeClient). Done here, before the activity starts, because the client registers
+    // activity result launchers when it is created.
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getBridge() != null && getBridge().getWebView() != null) {
+            getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge()));
+        }
+    }
 
     // Capacitor only tells the web app about an incoming link (appUrlOpen); the app published
     // by the platform does not know the shell exists. So when the link is on the app's own host,
@@ -873,6 +886,150 @@ public class MainActivity extends BridgeActivity {
             .build();
         WebView webView = getBridge().getWebView();
         webView.post(() -> webView.loadUrl(target.toString()));
+    }
+}
+`;
+}
+
+// BridgeWebChromeClient keeps one permission listener for the whole client and shares it between
+// media, geolocation and the camera of the file chooser: each overwrites it before launching its
+// dialog, never clears it, and answers the web request when the dialog closes (an interrupted dialog
+// comes back as "granted"). A second getUserMedia while the dialog is up leaves the first request
+// unanswered, and answering a request the WebView already resolved throws IllegalStateException on
+// the main thread, which ended the app ("Only this time" on Android 14+). This client keeps one
+// dialog in progress for all media requests and, when it closes, decides each request by the
+// permissions the app really holds, whatever the dialog reported. Everything else is the bridge's.
+function shellWebChromeClientJava(appId, host) {
+  return `package ${appId};
+
+import android.Manifest;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.SystemClock;
+import android.webkit.PermissionRequest;
+
+import androidx.core.content.ContextCompat;
+
+import com.getcapacitor.Bridge;
+import com.getcapacitor.BridgeWebChromeClient;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class ShellWebChromeClient extends BridgeWebChromeClient {
+
+    // Only the page of the app itself may capture; frames from other hosts are denied.
+    private static final String APP_HOST = ${JSON.stringify(host.replace(/:\d+$/, ""))};
+    // No callback tells that a launch was abandoned (an interrupted dialog may never report back),
+    // so a launch older than this is treated as gone: the next request settles the queue by the
+    // permissions held and starts a fresh dialog, which makes a stuck queue impossible.
+    private static final long STALE_MS = 60_000;
+
+    private final Bridge shellBridge;
+    // Main thread only.
+    private final List<PermissionRequest> pending = new ArrayList<>();
+    private boolean inProgress = false;
+    private long launchedAt = 0;
+    private int launchId = 0;
+
+    public ShellWebChromeClient(Bridge bridge) {
+        super(bridge);
+        this.shellBridge = bridge;
+    }
+
+    @Override
+    public void onPermissionRequest(final PermissionRequest request) {
+        List<String> needs = needsOf(request);
+        if (needs.isEmpty()) {
+            super.onPermissionRequest(request);
+            return;
+        }
+        Uri origin = request.getOrigin();
+        if (origin == null || origin.getHost() == null || !APP_HOST.equalsIgnoreCase(origin.getHost()) || !allDeclared(needs)) {
+            // A permission the manifest does not declare (CAMERA) can never be granted.
+            safeDeny(request);
+            return;
+        }
+        if (allHeld(needs)) {
+            safeGrant(request);
+            return;
+        }
+        if (inProgress && SystemClock.elapsedRealtime() - launchedAt > STALE_MS) settle();
+        pending.add(request);
+        if (inProgress) return;
+        inProgress = true;
+        launchedAt = SystemClock.elapsedRealtime();
+        final int id = ++launchId;
+        final String[] resources = request.getResources();
+        super.onPermissionRequest(new PermissionRequest() {
+            private boolean answered = false;
+
+            @Override public Uri getOrigin() { return request.getOrigin(); }
+            @Override public String[] getResources() { return resources; }
+            @Override public void grant(String[] ignored) { answer(); }
+            @Override public void deny() { answer(); }
+
+            private void answer() {
+                if (answered || id != launchId) return;
+                answered = true;
+                settle();
+            }
+        });
+    }
+
+    @Override
+    public void onPermissionRequestCanceled(PermissionRequest request) {
+        pending.remove(request);
+        super.onPermissionRequestCanceled(request);
+    }
+
+    private void settle() {
+        List<PermissionRequest> queued = new ArrayList<>(pending);
+        pending.clear();
+        inProgress = false;
+        for (PermissionRequest r : queued) {
+            if (allHeld(needsOf(r))) safeGrant(r); else safeDeny(r);
+        }
+    }
+
+    private List<String> needsOf(PermissionRequest request) {
+        List<String> resources = Arrays.asList(request.getResources());
+        List<String> needs = new ArrayList<>();
+        if (resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) needs.add(Manifest.permission.CAMERA);
+        if (resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+            needs.add(Manifest.permission.RECORD_AUDIO);
+            needs.add(Manifest.permission.MODIFY_AUDIO_SETTINGS);
+        }
+        return needs;
+    }
+
+    private boolean allHeld(List<String> needs) {
+        for (String permission : needs) {
+            if (ContextCompat.checkSelfPermission(shellBridge.getContext(), permission) != PackageManager.PERMISSION_GRANTED) return false;
+        }
+        return true;
+    }
+
+    private boolean allDeclared(List<String> needs) {
+        try {
+            PackageInfo info = shellBridge.getContext().getPackageManager()
+                .getPackageInfo(shellBridge.getContext().getPackageName(), PackageManager.GET_PERMISSIONS);
+            List<String> declared = info.requestedPermissions == null ? new ArrayList<String>() : Arrays.asList(info.requestedPermissions);
+            return declared.containsAll(needs);
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    // The WebView may have resolved or cancelled the request already, and answering it throws.
+    private void safeGrant(PermissionRequest request) {
+        try { request.grant(request.getResources()); } catch (IllegalStateException ignored) { }
+    }
+
+    private void safeDeny(PermissionRequest request) {
+        try { request.deny(); } catch (IllegalStateException ignored) { }
     }
 }
 `;
@@ -1477,6 +1634,14 @@ function selftest() {
   assert(audio.includes('android.permission.RECORD_AUDIO" />') && audio.includes('android.permission.MODIFY_AUDIO_SETTINGS" />'), "the audio permissions are declared");
   assert(audio.includes('<uses-feature android:name="android.hardware.microphone" android:required="false" />'), "the microphone feature is optional");
   assert(!audio.includes("CAMERA"), "the camera permission is not declared");
+  const mainJava = mainActivityJava("io.example.app", undefined);
+  const clientJava = shellWebChromeClientJava("io.example.app", "app.example.com:8443");
+  assert(mainJava.split("setWebChromeClient(new ShellWebChromeClient(").length === 2 && mainJava.includes("super.onCreate(savedInstanceState);"), "MainActivity installs the media-safe chrome client once, after super.onCreate");
+  assert(clientJava.startsWith("package io.example.app;") && clientJava.includes("class ShellWebChromeClient extends BridgeWebChromeClient")
+    && clientJava.includes("catch (IllegalStateException") && clientJava.includes("onPermissionRequestCanceled") && clientJava.includes("super.onPermissionRequest("), "the client extends the bridge's, answers once and catches the double answer");
+  assert(clientJava.includes('APP_HOST = "app.example.com";') && clientJava.includes("STALE_MS") && clientJava.includes("checkSelfPermission") && clientJava.includes("allDeclared(needs)"), "the client gates by the app host without the port, settles by held permissions and has a stale bound");
+  assert(!clientJava.includes("android.permission.CAMERA\"") && (clientJava.match(/super\.onPermissionRequest\(/g) || []).length === 2, "only non-media requests and the one dialog go to the bridge");
+  assert(mainActivityJava("io.example.app", undefined) === mainJava, "writing MainActivity twice gives the same file");
   const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
   assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
   assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");

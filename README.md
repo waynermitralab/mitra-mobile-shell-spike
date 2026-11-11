@@ -77,6 +77,19 @@ Every generated app declares microphone use, so a page can record audio with `ge
   without the key). The strings are in Portuguese and carry the app name, which is escaped (control
   characters are dropped).
 
+Only the app's own host can capture audio: a request from an iframe of another host is denied,
+and so is any request that needs `CAMERA`, which the manifest does not declare.
+
+The Android shell installs its own web chrome client (`ShellWebChromeClient`, written next to
+`MainActivity`) for media permissions. Capacitor's `BridgeWebChromeClient` shares one permission
+listener between media, geolocation and the camera of the file chooser, so a second request while a
+dialog is up, or a request the WebView had already cancelled, was answered twice or not at all, and
+the double answer crashed the app. The shell keeps one dialog in progress, and when it closes
+decides each queued request by the permissions the app holds. A dialog with no answer for 60 s is
+treated as gone by the next request. Everything else stays Capacitor's. Compile coverage of this
+class is in the release pipeline (the Android build of `shell.yml`); the `ci.yml` build job runs no
+Gradle.
+
 The permission prompt appears only when the page asks for the microphone or camera. Once the OS
 permission is granted, Capacitor grants the page loaded in the web view access without asking
 again (`WebViewDelegationHandler` on iOS, `BridgeWebChromeClient` on Android), so the page is
