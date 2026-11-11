@@ -10,6 +10,7 @@
 //          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
+//          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
 // (public, no token) gives name, published origins, accent color and the login logo. The page
@@ -114,6 +115,15 @@ if (!url) fail("Missing --app <uuid> (platform app) or --url <published URL>, or
 if (info && !info.origins?.length) fail(`App ${appUuid} has no published origin yet; publish it first or pass --url.`);
 const page = await fetchText(url);
 const scraped = scrape(page, url);
+// The page is already in hand in every mode, so the decision costs no extra request.
+const pageOwnsSafeArea = pageHandlesSafeArea(page);
+// The caller can force the value: the choice is frozen at generation, and a page that later adds or
+// drops viewport-fit=cover is otherwise out of step with the shell until it is generated again.
+const insetOverride = flags["ios-content-inset"] ?? descriptor.iosContentInset ?? undefined;
+let contentInset;
+try {
+  contentInset = resolveContentInset(insetOverride, pageOwnsSafeArea);
+} catch (e) { fail(e.message); }
 const appName = clean(flags.name || descriptor.name || info?.name || scraped.title || new URL(url).hostname);
 const slug = slugify(appName);
 const appId = flags["app-id"] || descriptor.appId || `cloud.${brandSegment(info?.brand)}.${packageSegment(slug)}`;
@@ -162,6 +172,7 @@ log(`slug     ${slug}`);
 log(`appId    ${appId}`);
 log(`url      ${url}`);
 log(`theme    ${themeColor}`);
+log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
 log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
@@ -232,12 +243,15 @@ writeJson(join(projectDir, "capacitor.config.json"), {
   appName,
   webDir: "www",
   server: { url, cleartext: false },
-  ios: { contentInset: "automatic", includePlugins: pluginsFor(pushIos) },
+  ios: { contentInset, includePlugins: pluginsFor(pushIos) },
   android: { allowMixedContent: false, webContentsDebuggingEnabled: Boolean(flags.debug || descriptor.debug), includePlugins: pluginsFor(pushAndroid) },
   plugins: {
     // The splash sits behind the mark, so it takes the color behind the mark; the theme color is
     // the app chrome after load (status bar).
     SplashScreen: { launchShowDuration: 1500, launchAutoHide: true, backgroundColor: brand.bg, showSpinner: false },
+    // Android reads the live page's viewport-fit at runtime; the hint only spares the first layout
+    // a shift when the page is known to declare cover.
+    ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
     MitraShell: { authHosts, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
@@ -247,7 +261,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, version: versionName, buildNumber, associatedDomains, authHosts, callback,
+  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -261,7 +275,7 @@ if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand });
 
 // ---------- 5. iOS patches ----------
-if (wantIos) patchIos(projectDir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
+if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
 
 // ---------- 6. Assets, sync, CI ----------
@@ -307,6 +321,37 @@ githubOutputs(summary);
 log("done");
 
 // ======================================================================
+// The caller's value when there is one (null counts as none), else what the page asks for.
+function resolveContentInset(override, pageOwnsSafeArea) {
+  if (override == null) return pageOwnsSafeArea ? "never" : "automatic";
+  if (!["never", "automatic"].includes(override)) throw new Error(`--ios-content-inset must be never or automatic, got ${JSON.stringify(override)}`);
+  return override;
+}
+// Whether the page reserves the safe area itself: its viewport meta carries viewport-fit=cover.
+// Then the native scroll view must not add the inset too, or the status bar height shows up twice
+// on iOS. The text is third-party and only matched, never evaluated. Comments, scripts and
+// noscript blocks are dropped first (a viewport meta inside a string or a fallback block is not the
+// page's), and the meta is read attribute by attribute, so viewport-fit inside the content of some
+// other meta does not count either. An unterminated block runs to the end of the text, which keeps
+// every pattern linear: tag patterns exclude "<", so a run of unclosed tags is not rescanned from
+// each start. Only the first 256 KB are looked at, which also bounds the work.
+function pageHandlesSafeArea(html) {
+  const head = html.slice(0, 262144).replace(
+    /<!--(?:-?>|[\s\S]*?(?:-->|$))|<script\b[^<>]*>[\s\S]*?(?:<\/script\s*>|$)|<noscript\b[^<>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, "");
+  let content = null;
+  for (const [tag] of head.matchAll(/<meta\b[^<>]*>/gi)) {
+    const attrs = {};
+    for (const m of tag.slice(5).matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+      const key = m[1].toLowerCase();
+      if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
+    }
+    // Browsers apply the last viewport meta.
+    if ((attrs.name || "").trim().toLowerCase() === "viewport") content = attrs.content ?? "";
+  }
+  if (content === null) return false;
+  return content.split(/[,;]/).some((part) => /^viewport-fit\s*=\s*cover$/i.test(part.trim()));
+}
+
 function scrape(html, baseUrl) {
   const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
   const themeColor = (html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i) || [])[1];
@@ -569,6 +614,45 @@ function withLaunchStatusBar(plist, dark) {
 \t<key>LSRequiresIPhoneOS</key>`);
 }
 
+// Every app can record voice and take photos through the page (getUserMedia, a file input), and
+// iOS terminates an app that touches the microphone or camera without these strings. The app name
+// comes from a third party and lands in XML, hence the escaping. Keys already present are kept.
+function withUsageDescriptions(plist, appName) {
+  // Control characters other than tab and line feed, and U+FFFE and U+FFFF, are not valid in XML 1.0, even escaped.
+  const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
+  const wanted = [
+    ["NSMicrophoneUsageDescription", `${name} usa o microfone para gravar \u00e1udio que voc\u00ea envia.`],
+    ["NSCameraUsageDescription", `${name} usa a c\u00e2mera para tirar fotos que voc\u00ea envia.`]
+  ];
+  for (const [key, text] of wanted) {
+    if (plist.includes(`<key>${key}</key>`)) continue;
+    const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", `\t<key>${key}</key>\n\t<string>${text}</string>\n\t<key>LSRequiresIPhoneOS</key>`);
+    if (anchored === plist) fail(`Info.plist layout changed, ${key} was not added`);
+    plist = anchored;
+  }
+  return plist;
+}
+
+// Capacitor's BridgeWebChromeClient asks for these two at runtime when the page calls
+// getUserMedia({ audio: true }), but only a declared permission can be requested. CAMERA is left
+// out on purpose: declaring it makes the camera capture of a file input require the runtime grant,
+// while without it the system camera app handles the capture. RECORD_AUDIO alone implies a required
+// microphone feature, which would make Play hide the app from devices without one.
+function withAudioPermissions(manifest) {
+  for (const [name, element] of [
+    ["android.permission.RECORD_AUDIO", `<uses-permission android:name="android.permission.RECORD_AUDIO" />`],
+    ["android.permission.MODIFY_AUDIO_SETTINGS", `<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />`],
+    ["android.hardware.microphone", `<uses-feature android:name="android.hardware.microphone" android:required="false" />`]
+  ]) {
+    if (manifest.includes(`android:name="${name}"`)) continue;
+    const anchored = manifest.replace(/([ \t]*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+      `$&\n$1${element}`);
+    if (anchored === manifest) fail(`AndroidManifest layout changed, ${name} was not added`);
+    manifest = anchored;
+  }
+  return manifest;
+}
+
 // The mark SceneDelegate animates in over the launch image (see templates/ios/SceneDelegate.swift).
 function patchIosSplash(appDir, brand) {
   if (!brand.iosMark) return;
@@ -606,6 +690,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
             </intent-filter>` : ""}
         </activity>`;
   manifest = manifest.replace(/\s*<\/activity>/, filter);
+  manifest = withAudioPermissions(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
     // PushNotifications.requestPermissions().
@@ -660,7 +745,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   if (sdk) writeFileSync(join(dir, "android", "local.properties"), `sdk.dir=${sdk}\n`);
 }
 
-function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
+function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
   const appDir = join(dir, "ios", "App", "App");
   patchIosSplash(appDir, brand);
   const plistPath = join(appDir, "Info.plist");
@@ -682,6 +767,7 @@ function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomain
 \t<key>LSRequiresIPhoneOS</key>`);
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
+  plist = withUsageDescriptions(plist, appName);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
     plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t<false/>\n\t<key>LSRequiresIPhoneOS</key>");
   }
@@ -1323,6 +1409,70 @@ function selftest() {
   const plainTheme = patchLaunchTheme(capacitorStyles, asIs);
   assert(plainTheme.includes("windowSplashScreenBackground") && !plainTheme.includes("windowSplashScreenAnimatedIcon"), "the fallback theme has the color and no animated icon");
   assert(capacitorAssetsArgs(asIs).includes("--splashBackgroundColor") && !capacitorAssetsArgs({ branch: "own-background" }).includes("--splashBackgroundColor"), "only the fallback gives capacitor-assets the colors");
+  const viewport = (content, extra = "") => `<html><head><meta charset="utf-8">${extra}<meta name="viewport" content="${content}"></head></html>`;
+  for (const [html, expected, why] of [
+    [viewport("width=device-width, initial-scale=1, viewport-fit=cover"), true, "the usual cover viewport"],
+    ['<meta content="width=device-width,viewport-fit=cover" name="viewport">', true, "content before name"],
+    ["<meta name='viewport' content='width=device-width, viewport-fit=cover'>", true, "single quotes"],
+    ['<META  NAME = "Viewport"   CONTENT = "viewport-fit = COVER" />', true, "case and extra spaces"],
+    ['<meta name=viewport content="viewport-fit=cover">', true, "unquoted name"],
+    ['<meta name="viewport" content="width=device-width; viewport-fit=cover">', true, "semicolon separator"],
+    [viewport("width=device-width, viewport-fit=contain"), false, "contain"],
+    [viewport("width=device-width, viewport-fit=auto"), false, "auto"],
+    [viewport("width=device-width, initial-scale=1"), false, "no viewport-fit"],
+    [viewport("width=device-width, x-viewport-fit=cover"), false, "a longer key is not viewport-fit"],
+    ["<html><head><title>x</title></head></html>", false, "no viewport meta"],
+    ['<!-- <meta name="viewport" content="viewport-fit=cover"> --><meta name="viewport" content="width=device-width">', false, "a commented meta"],
+    ['<!-- never closed <meta name="viewport" content="viewport-fit=cover">', false, "an unterminated comment"],
+    ['<meta name="description" content="try viewport-fit=cover">', false, "viewport-fit in another meta"],
+    ['<meta name="description" content=\'name="viewport" content="viewport-fit=cover"\'>', false, "a viewport meta quoted inside another attribute"],
+    [viewport("width=device-width", '<meta name="x" content="viewport-fit=cover">'), false, "another meta before the viewport"],
+    [`${viewport("viewport-fit=cover")}${viewport("width=device-width")}`, false, "the last viewport meta wins"],
+    ["", false, "empty page"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  assert(pageHandlesSafeArea(`${"<!--".repeat(50000)}${viewport("viewport-fit=cover")}`) === false, "many unterminated comments finish and hide the meta");
+  assert(resolveContentInset(undefined, true) === "never" && resolveContentInset(null, false) === "automatic" && resolveContentInset(null, true) === "never", "a null or missing override falls back to detection");
+  assert(resolveContentInset("automatic", true) === "automatic" && throws(() => resolveContentInset("always", true)), "an override wins and must be never or automatic");
+  for (const [html, expected, why] of [
+    [`<!-->${viewport("viewport-fit=cover")}`, true, "an empty comment <!--> does not swallow the meta"],
+    [`<!--->${viewport("viewport-fit=cover")}`, true, "an empty comment <!---> does not swallow the meta"],
+    [`<!--x-->${viewport("viewport-fit=cover")}`, true, "a normal comment still ends at -->"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why}`);
+  }
+  assert(withUsageDescriptions("<dict>\n\t<key>LSRequiresIPhoneOS</key>\n</dict>", "A\ufffeB\uffffC").includes("<string>ABC usa o microfone"), "U+FFFE and U+FFFF are dropped from the name");
+  const hostile = `${"<meta ".repeat(50000)}${viewport("viewport-fit=cover")}`;
+  const started = Date.now();
+  pageHandlesSafeArea(hostile);
+  pageHandlesSafeArea(`${"<script ".repeat(40000)}${"<noscript ".repeat(40000)}${"<!--".repeat(40000)}`);
+  assert(Date.now() - started < 1000, `a page of unclosed tags is scanned in linear time (${Date.now() - started} ms)`);
+  for (const [html, expected, why] of [
+    [`<script>var s = '<meta name="viewport" content="viewport-fit=cover">';</script>${viewport("width=device-width")}`, false, "a meta inside a script string"],
+    [`<script type="module">x</script><noscript><meta name="viewport" content="viewport-fit=cover"></noscript>`, false, "a meta inside noscript"],
+    [`<noscript><meta name="viewport" content="viewport-fit=cover">`, false, "an unterminated noscript"],
+    [`<SCRIPT src=a></SCRIPT>${viewport("viewport-fit=cover")}`, true, "a real meta after an empty script"],
+    [`<script>${viewport("viewport-fit=cover")}`, false, "an unterminated script"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  const usagePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  const usage = withUsageDescriptions(usagePlist, `Caf\u00e9 & <Co> "x" 'y'`);
+  assert(usage.includes("<key>NSMicrophoneUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o microfone para gravar \u00e1udio que voc\u00ea envia.</string>"), "the microphone string names the escaped app");
+  assert(withUsageDescriptions(usagePlist, "A\u0000B\u0007\u001fC\tD").includes("<string>ABC\tD usa o microfone"), "control characters are dropped from the name");
+  assert(usage.includes("<key>NSCameraUsageDescription</key>") && usage.includes("usa a c\u00e2mera para tirar fotos que voc\u00ea envia."), "the camera string is added");
+  assert(withUsageDescriptions(usage, "Other") === usage, "adding the usage strings twice changes nothing");
+  const ownMic = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSMicrophoneUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
+  assert(withUsageDescriptions(ownMic, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownMic, "A").split("NSMicrophoneUsageDescription").length === 2, "an existing microphone string is kept");
+  const androidManifest = `<manifest>\n    <application/>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
+  const audio = withAudioPermissions(androidManifest);
+  assert(audio.includes('android.permission.RECORD_AUDIO" />') && audio.includes('android.permission.MODIFY_AUDIO_SETTINGS" />'), "the audio permissions are declared");
+  assert(audio.includes('<uses-feature android:name="android.hardware.microphone" android:required="false" />'), "the microphone feature is optional");
+  assert(!audio.includes("CAMERA"), "the camera permission is not declared");
+  const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
+  assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
+  assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");
   console.log("[generate] selftest ok");
 }
 function log(msg) { console.log(`[generate] ${msg}`); }

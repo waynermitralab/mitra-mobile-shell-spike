@@ -40,6 +40,50 @@ is `--api`, then the `MITRA_API_URL` environment variable, then `https://beta.mi
 An app without an icon gets one drawn by the generator: the initials of its name (the first
 letter of the first two words, or the first two letters of a single word) on the theme color.
 
+### Safe area
+
+The generator reads the viewport meta of the published page (ignoring comments, `<script>` and
+`<noscript>` blocks). When it declares `viewport-fit=cover`, the page reserves the notch and status
+bar space itself (`env(safe-area-inset-top)`), so the shell writes `ios.contentInset: "never"`;
+otherwise it keeps `"automatic"` and the web view pushes the content below the status bar. With
+`automatic` on a page that already reserves the space, a blank band the height of the status bar
+shows above the header. The run prints the value chosen and why. `mitra-shell.json` records it as
+`iosContentInset` only when it was forced, so that file can be reused as a descriptor without
+freezing the detection. `--ios-content-inset never|automatic` (or `iosContentInset` in the
+descriptor) forces the value; anything else fails the run. The choice is made at generation, so a
+page that later adds or removes `viewport-fit=cover` needs a new generation. Only the HTML the
+server sends is read, and only its first 256 KB: a viewport meta added by script after load, or
+past a very large inline head, is not seen, and the page then gets `automatic`.
+
+On Android, Capacitor's `SystemBars` plugin reads the live page's `viewport-fit=cover` at runtime
+and applies the insets accordingly, so a later change in the page is followed without a new
+generation. When the page declares cover at generation time, the shell also passes
+`plugins.SystemBars.initialViewportFitValueHint: "cover"`, which only spares the first layout a
+shift.
+
+### Microphone and camera
+
+Every generated app declares microphone use, so a page can record audio with `getUserMedia`:
+
+- Android: `RECORD_AUDIO` and `MODIFY_AUDIO_SETTINGS` in the manifest, plus the microphone feature
+  as not required (`RECORD_AUDIO` alone would make Play hide the app from devices without a
+  microphone). Capacitor's `BridgeWebChromeClient` asks for the runtime permission when the page
+  requests audio. `CAMERA` is not declared on purpose: a file input that opens the camera then goes
+  through the system camera app, and declaring it would make that path require the runtime grant.
+  As a consequence `getUserMedia` asking for video, alone or together with audio, is denied on Android;
+  file-input capture still works.
+- iOS: `NSMicrophoneUsageDescription` and `NSCameraUsageDescription` in `Info.plist` (the second
+  because the file input offers "Take Photo", and iOS terminates an app that opens the camera
+  without the key). The strings are in Portuguese and carry the app name, which is escaped (control
+  characters are dropped).
+
+The permission prompt appears only when the page asks for the microphone or camera. Once the OS
+permission is granted, Capacitor grants the page loaded in the web view access without asking
+again (`WebViewDelegationHandler` on iOS, `BridgeWebChromeClient` on Android), so the page is
+trusted with it. The store privacy answers (App Privacy in App Store Connect, Data safety in Play
+Console) are about data collected or shared, not about access: what changes them is whether
+recorded audio or photos leave the device, which depends on what the published app does with them.
+
 ### Icon and splash
 
 The logo is kept as it came in `assets/logo.*`; what `@capacitor/assets` reads is composed from it
@@ -99,6 +143,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--version 1.0`, `--build-number 1` | Marketing version and build number |
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |
+| `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
 | `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session on iOS |
