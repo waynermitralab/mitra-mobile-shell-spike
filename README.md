@@ -93,7 +93,9 @@ Off by default, and then the push plugin is left out of the native projects.
 
 ## Workflows
 
-Runners come from the repository variables `LINUX_RUNNER` (default `ubuntu-latest`) and
+The jobs that read the `stores` secrets on Linux (`version` and `android` in `shell.yml`, and
+`asc-info.yml`) run on the org's `mitra-delivery` runner group, which has no Android SDK: the
+Android job installs it (`android-actions/setup-android`). `ci.yml` runs on `mitra-ci`. iOS runs on
 `MACOS_RUNNER` (default `macos-26`).
 
 ### App shell (`shell.yml`)

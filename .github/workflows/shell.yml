@@ -7,12 +7,11 @@ name: App shell
 #   iOS:     unsigned device build by default; with upload_testflight the archive is cloud-signed
 #            with the App Store Connect API key, uploaded, and once processed added to the
 #            TestFlight group (the app record must exist in App Store Connect once).
-# The build number comes from App Store Connect (latest build + 1) so both stores move together;
-# the run number is the fallback for an app that has no record yet.
+# The build number is resolved once, in the version job, for both stores (see that job).
 #
-# Runners come from repository variables so the same workflow runs on GitHub-hosted machines
-# today and on self-hosted ones later: LINUX_RUNNER (default ubuntu-latest) and MACOS_RUNNER
-# (default macos-26, the first image with the iOS 26 SDK App Store Connect requires).
+# Linux jobs run on the org's delivery runners, the group used by every job that ships something
+# with an environment; GitHub-hosted Linux machines are not available to the org. iOS needs macOS:
+# MACOS_RUNNER (default macos-26, the first image with the iOS 26 SDK App Store Connect requires).
 
 on:
   workflow_dispatch:
@@ -92,7 +91,9 @@ jobs:
   # invalidate it.
   version:
     name: Build number
-    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on:
+      group: mitra-delivery
+      labels: mitra-delivery
     environment: stores
     outputs:
       number: ${{ steps.build.outputs.number }}
@@ -154,7 +155,9 @@ jobs:
   android:
     name: Android (signed AAB and APK, Play upload)
     needs: version
-    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on:
+      group: mitra-delivery
+      labels: mitra-delivery
     environment: stores
     defaults:
       run:
@@ -169,6 +172,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      # The delivery runners carry no Android SDK (GitHub-hosted images do). The action installs the
+      # command-line tools and accepts the SDK licenses, which Gradle requires to fetch platforms.
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd  # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
       - name: Resolve the app identity
         id: identity
         run: |
