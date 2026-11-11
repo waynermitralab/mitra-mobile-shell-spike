@@ -307,6 +307,15 @@ jobs:
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/asc.mjs ensure-bundle-id "${args[@]}"
           node generator/asc.mjs app-id --bundle-id "$APP_ID"
+      # Xcode ties the development certificate it creates to the machine name, and the hosted
+      # Intel runners share one: a second run finds the first run's certificate without its key.
+      - name: Give this runner its own machine name
+        if: ${{ inputs.upload_testflight }}
+        run: |
+          name="ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sudo scutil --set ComputerName "$name"
+          sudo scutil --set LocalHostName "$name"
+          sudo scutil --set HostName "$name"
       - name: Archive with cloud signing
         if: ${{ inputs.upload_testflight }}
         working-directory: ${{ steps.gen.outputs.project_dir }}
