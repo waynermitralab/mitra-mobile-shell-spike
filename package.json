@@ -1,0 +1,27 @@
+{
+  "name": "mitra-mobile-shell",
+  "version": "0.1.0",
+  "description": "Capacitor shell generator and store pipeline for Mitra platform apps",
+  "scripts": {
+    "test": "for f in generator/*.mjs; do node --check \"$f\" || exit 1; done && node generator/asc.mjs selftest && node generator/play.mjs selftest && node generator/wellknown.mjs --selftest && node generator/generate.mjs --selftest"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "commonjs",
+  "private": true,
+  "dependencies": {
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/assets": "^4.0.0",
+    "@capacitor/browser": "^8.0.5",
+    "@capacitor/cli": "^8.6.0",
+    "@capacitor/core": "^8.6.0",
+    "@capacitor/haptics": "^8.0.2",
+    "@capacitor/ios": "^8.6.0",
+    "@capacitor/network": "^8.0.1",
+    "@capacitor/push-notifications": "^8.1.3",
+    "@capacitor/share": "^8.0.3",
+    "@capacitor/splash-screen": "^8.0.2",
+    "@capacitor/status-bar": "^8.0.4"
+  }
+}
