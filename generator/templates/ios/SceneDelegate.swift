@@ -19,6 +19,9 @@ import Capacitor
 //
 // The identity hosts come from capacitor.config.json (plugins.MitraShell.authHosts). Anything
 // else off-host keeps Capacitor's default and opens in the system browser.
+//
+// A third thing is cosmetic: the launch image is a plain color (a storyboard cannot animate), and
+// the mark of the app comes in over it, see SplashEntranceView.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -62,6 +65,8 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 }
 
 class ShellBridgeViewController: CAPBridgeViewController {
+    private var entranceShown = false
+
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(MitraShellPlugin())
     }
@@ -105,6 +110,119 @@ class ShellBridgeViewController: CAPBridgeViewController {
         DispatchQueue.main.async { [weak self] in
             self?.webView?.load(URLRequest(url: target))
         }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        showSplashEntrance()
+    }
+
+    // The overlay goes on the window, above the Capacitor splash view that lives inside the web
+    // view, and it only decorates: touches pass through and nothing waits for it. It stays as long
+    // as the Capacitor splash does, so the mark does not leave before the color behind it.
+    private func showSplashEntrance() {
+        // One attempt only: viewDidAppear comes back after the sign-in browser closes, and a splash
+        // over a running app would be wrong.
+        guard !entranceShown else { return }
+        entranceShown = true
+        guard let window = view.window,
+              let hex = bridge?.config.getPluginConfig("MitraShell").getString("splashBackground"),
+              let color = UIColor(hex: hex),
+              let image = UIImage(named: "SplashMark") else { return }
+
+        // The splash plugin starts its timer in load(), shortly before this runs, and fades out for a
+        // fixed 200 ms after launchShowDuration (its launchFadeOutDuration is not read). The overlay
+        // holds for the same duration and then fades the same way, so it can outlast the plugin's
+        // splash by the time between load() and here, which is hidden behind the same color.
+        let splash = bridge?.config.getPluginConfig("SplashScreen")
+        let hold = max(0.45, Double(splash?.getInt("launchShowDuration", 500) ?? 500) / 1000)
+        let fade = 0.2
+
+        let circle = CGFloat(bridge?.config.getPluginConfig("MitraShell").getDouble("splashMarkCircle", 0) ?? 0)
+        let overlay = SplashEntranceView(background: color, image: image, circle: circle)
+        overlay.frame = window.bounds
+        window.addSubview(overlay)
+        overlay.play(animated: !UIAccessibility.isReduceMotionEnabled, hold: hold, fade: fade) { [weak overlay] in
+            overlay?.removeFromSuperview()
+        }
+
+        // The status bar over the splash follows the splash color, and the style of the app (the
+        // StatusBar plugin, from the theme color) comes back when the overlay leaves. The plugin
+        // applies its style in a main-queue block queued by super.viewDidAppear, so this has to
+        // queue behind it or it would capture the Info.plist style and be overwritten at once.
+        let dark = bridge?.config.getPluginConfig("MitraShell").getBoolean("splashDark", false) ?? false
+        let splashStyle: UIStatusBarStyle = dark ? .lightContent : .darkContent
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let appStyle = self.statusBarStyle
+            self.setStatusBarStyle(splashStyle)
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold + fade) { [weak self] in
+                if self?.statusBarStyle == splashStyle { self?.setStatusBarStyle(appStyle) }
+            }
+        }
+    }
+}
+
+// The mark over the launch color: opacity 0 to 1 and size 80% to 100%, 0.45 s, ease-out. Its
+// size follows the same rule as the Android splash icon: the circle around the mark is 37.5% of
+// the short side of the screen.
+final class SplashEntranceView: UIView {
+    private let markView = UIImageView()
+
+    // The picture is drawn so that the circle around the mark itself (not the corners of the
+    // picture) is `circle` pixels wide; 0 means the corners are all there is to go by.
+    private let circle: CGFloat
+
+    init(background: UIColor, image: UIImage, circle: CGFloat) {
+        self.circle = circle
+        super.init(frame: .zero)
+        backgroundColor = background
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        isUserInteractionEnabled = false
+        markView.image = image
+        markView.contentMode = .scaleAspectFit
+        addSubview(markView)
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let image = markView.image, image.size.width > 0, image.size.height > 0 else { return }
+        let diameter = circle > 0 ? circle : hypot(image.size.width, image.size.height)
+        let factor = min(bounds.width, bounds.height) * 0.375 / diameter
+        markView.bounds = CGRect(x: 0, y: 0, width: image.size.width * factor, height: image.size.height * factor)
+        markView.center = CGPoint(x: bounds.midX, y: bounds.midY)
+    }
+
+    func play(animated: Bool, hold: TimeInterval, fade: TimeInterval, completion: @escaping () -> Void) {
+        if animated {
+            markView.alpha = 0
+            markView.transform = CGAffineTransform(scaleX: 0.8, y: 0.8)
+            UIView.animate(withDuration: 0.45, delay: 0, options: [.curveEaseOut]) {
+                self.markView.alpha = 1
+                self.markView.transform = .identity
+            }
+        }
+        UIView.animate(withDuration: fade, delay: hold, options: [.curveLinear], animations: {
+            self.alpha = 0
+        }, completion: { _ in
+            completion()
+        })
+    }
+}
+
+private extension UIColor {
+    convenience init?(hex: String) {
+        var digits = hex.trimmingCharacters(in: .whitespaces)
+        if digits.hasPrefix("#") { digits.removeFirst() }
+        guard digits.count == 6, let value = UInt32(digits, radix: 16) else { return nil }
+        self.init(red: CGFloat((value >> 16) & 0xff) / 255,
+                  green: CGFloat((value >> 8) & 0xff) / 255,
+                  blue: CGFloat(value & 0xff) / 255,
+                  alpha: 1)
     }
 }
 
