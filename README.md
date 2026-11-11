@@ -40,12 +40,60 @@ is `--api`, then the `MITRA_API_URL` environment variable, then `https://beta.mi
 An app without an icon gets one drawn by the generator: the initials of its name (the first
 letter of the first two words, or the first two letters of a single word) on the theme color.
 
+### Icon and splash
+
+The logo is kept as it came in `assets/logo.*`; what `@capacitor/assets` reads is composed from it
+(with `sharp`, which that package brings) in `assets/composed/`. A logo is often a complete icon
+already, an opaque rounded square with the mark in the middle, and shrinking that into the
+adaptive icon leaves a disc with cut edges. So the generator looks at the logo first (after trimming
+a transparent margin, which exports often leave), and the run prints which case it found:
+
+- Own background: the edges are opaque and of one color (sampled at several points and two
+  depths, so a thin outline is not taken for it), the corners agree or are transparent, and that
+  color covers a good part of the picture. It becomes the background of icon and splash, and the
+  mark is what differs from it, ignoring a 4% outer frame (a thin border is not the mark), cropped
+  with 2% of padding. The mark is centered so the circle around its own pixels fits the circle
+  Android guarantees to show, with a margin. iOS and legacy Android get the same mark over the background,
+  full bleed and without transparency.
+- Full-bleed: the edges are opaque but not one color all over (gradient, outline, picture). The
+  logo itself is the icon background and the iOS icon, the Android foreground is empty, the splash
+  color is the mean of the edge samples when they agree and otherwise the most common one, and the splash shows the logo as a rounded tile.
+- Transparent mark: anything else. The mark is what is not transparent, on the theme color. A wide
+  or tall logo with its own background lands here too (the picture is padded to a square with
+  transparency), so it shows as a card on the theme color.
+
+The splash takes that color, not the theme color, on both platforms and in
+`SplashScreen.backgroundColor`; the theme color stays the status bar color after load. Over the
+splash the status bar icons fit the splash color: the Android launch theme, and on iOS
+`UIStatusBarStyle` in `Info.plist` plus `SceneDelegate.swift` while the overlay is up. When the
+overlay leaves, the iOS status bar goes back to the style of the app.
+
+If the composition fails for any logo, the run warns and hands the plain logo to `capacitor-assets`
+on the theme color, without the splash entrance, instead of failing the generation.
+
+The logo comes from the app owner, so it is only rasterized: its bytes never go into a command or
+markup. Running `capacitor-assets` again by hand undoes part of this (the icon layers go back to
+48dp sizes, the iOS launch image to the logo); generate the project again instead.
+
+The mark comes in with a short entrance (opacity and size, ease-out):
+
+- Android 12+: the launch theme sets `windowSplashScreenBackground` and a frame animation
+  (`drawable-v31/splash_icon.xml`, 8 frames of 60 ms, 864 px in `drawable-xxhdpi`) as
+  `windowSplashScreenAnimatedIcon`. Older versions get its last frame on the same color, and
+  `splash.png` is sized so its mark is about as large.
+- iOS: the launch storyboard cannot animate, so the launch image is the plain background and
+  `SceneDelegate.swift` puts the mark (`SplashMark` in the asset catalog) over it for as long as
+  the Capacitor splash's `launchShowDuration`, then fades like it does (0.2 s); it can outlast the
+  plugin's splash by a moment, behind the same color. With Reduce Motion
+  on, the mark is shown without the animation. The overlay does not take touches and does not
+  hold up the web view.
+
 | Flag | Effect |
 |---|---|
 | `--name "..."` | App name (default: platform name or page title) |
 | `--app-id x.y.z` | Android application id and iOS bundle id |
 | `--icon <file\|url>` | SVG or PNG icon (default: login logo, page icon, then the initials of the name) |
-| `--theme "#0f172a"` | Splash and status bar color, as `#rgb` or `#rrggbb` |
+| `--theme "#0f172a"` | Status bar color, and the splash and icon background when the logo has none of its own, as `#rgb` or `#rrggbb` |
 | `--version 1.0`, `--build-number 1` | Marketing version and build number |
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |

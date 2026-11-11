@@ -51,3 +51,5 @@ jobs:
           test -f .github/workflows/mobile.yml
           test -f .gitignore
           grep -q '>CF</text>' assets/logo.svg
+          test -f assets/composed/icon-only.png
+          test -f android/app/src/main/res/drawable-v31/splash_icon.xml
