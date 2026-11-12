@@ -43,6 +43,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, readdirSync
 import { createRequire } from "node:module";
 import { dirname, join, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const templateRoot = resolve(here, "..");
@@ -97,7 +98,10 @@ const MIN_BACKGROUND_SHARE = 0.25;
 const MARK_PADDING = 0.02;
 // Names SceneDelegate.swift calls on its own types: the view controller members by receiver, plus
 // the ones that live in other types of the file. Definitions are var, func or init, never a local let.
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play"];
+// Robolectric 4.16 supports Android API 36 and needs JDK 17 or later.
+const ROBOLECTRIC_VERSION = "4.16";
+const ANDROIDX_TEST_CORE_VERSION = "1.7.0";
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
 
 if (flags.selftest) { selftest(); process.exit(0); }
 
@@ -221,6 +225,9 @@ const capPlugins = Object.keys(templatePkg.dependencies)
 const pluginsFor = (push) => capPlugins.filter((d) => push || d !== PUSH_PLUGIN);
 
 writeFileSync(join(projectDir, "www", "index.html"), offlinePage(appName, themeColor));
+// The bar probe travels in the bundle (public/shell-bars.js on both platforms) because the page
+// does not know the shell exists; the native side injects it, see templates/shared/shell-bars.js.
+cpSync(join(here, "templates", "shared", "shell-bars.js"), join(projectDir, "www", "shell-bars.js"));
 
 // Icon: the source logo is kept in assets/ as it came. The files capacitor-assets reads are
 // composed from it in assets/composed/ (see composeBrand), which needs sharp from npm ci.
@@ -246,8 +253,9 @@ writeJson(join(projectDir, "capacitor.config.json"), {
   ios: { contentInset, includePlugins: pluginsFor(pushIos) },
   android: { allowMixedContent: false, webContentsDebuggingEnabled: Boolean(flags.debug || descriptor.debug), includePlugins: pluginsFor(pushAndroid) },
   plugins: {
-    // The splash sits behind the mark, so it takes the color behind the mark; the theme color is
-    // the app chrome after load (status bar).
+    // The splash sits behind the mark, so it takes the color behind the mark; the theme color
+    // gives the status bar its first style, and a page that draws under the bar then corrects it
+    // at runtime from what it paints there (shell-bars.js).
     SplashScreen: { launchShowDuration: 1500, launchAutoHide: true, backgroundColor: brand.bg, showSpinner: false },
     // Android reads the live page's viewport-fit at runtime; the hint only spares the first layout
     // a shift when the page is known to declare cover.
@@ -708,7 +716,13 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
   writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
-  writeFileSync(join(javaDir, "ShellWebChromeClient.java"), shellWebChromeClientJava(appId, host));
+  for (const name of ["MediaPermissionGate.java", "ShellWebChromeClient.java", "ShellSystemBars.java"]) {
+    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host }));
+  }
+  // The unit test runs the client above on the real Capacitor classes (Robolectric).
+  const testDir = join(app, "src", "test", "java", ...appId.split("."));
+  mkdirSync(testDir, { recursive: true });
+  writeFileSync(join(testDir, "ShellWebChromeClientTest.java"), androidTemplate("ShellWebChromeClientTest.java", { appId, host }));
 
   // build.gradle: version and release signing from the environment.
   const gradlePath = join(app, "build.gradle");
@@ -737,6 +751,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
 `);
     if (!gradle.includes("signingConfigs {")) fail("build.gradle layout changed, signing patch did not apply");
   }
+  gradle = withUnitTestSupport(gradle);
   writeFileSync(gradlePath, gradle);
 
   // local.properties: point Gradle at the SDK on this machine (CI sets ANDROID_HOME itself).
@@ -836,6 +851,7 @@ function mainActivityJava(appId, callbackScheme) {
   return `package ${appId};
 
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Bundle;
 import android.webkit.WebView;
@@ -850,13 +866,23 @@ public class MainActivity extends BridgeActivity {
 
     // Replaces the bridge's own chrome client, once, to make media permission requests safe (see
     // ShellWebChromeClient). Done here, before the activity starts, because the client registers
-    // activity result launchers when it is created.
+    // activity result launchers when it is created. The same block registers the system bars
+    // listener (see ShellSystemBars), once, because it adds a listener to the bridge.
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         if (getBridge() != null && getBridge().getWebView() != null) {
             getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge()));
+            ShellSystemBars.install(getBridge());
         }
+    }
+
+    // The bridge re-applies the stored bar styles on a configuration change, which can undo the
+    // style the page asked for: see ShellSystemBars.recheck.
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        ShellSystemBars.recheck(getBridge());
     }
 
     // Capacitor only tells the web app about an incoming link (appUrlOpen); the app published
@@ -891,148 +917,38 @@ public class MainActivity extends BridgeActivity {
 `;
 }
 
-// BridgeWebChromeClient keeps one permission listener for the whole client and shares it between
-// media, geolocation and the camera of the file chooser: each overwrites it before launching its
-// dialog, never clears it, and answers the web request when the dialog closes (an interrupted dialog
-// comes back as "granted"). A second getUserMedia while the dialog is up leaves the first request
-// unanswered, and answering a request the WebView already resolved throws IllegalStateException on
-// the main thread, which ended the app ("Only this time" on Android 14+). This client keeps one
-// dialog in progress for all media requests and, when it closes, decides each request by the
-// permissions the app really holds, whatever the dialog reported. Everything else is the bridge's.
-function shellWebChromeClientJava(appId, host) {
-  return `package ${appId};
-
-import android.Manifest;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
-import android.net.Uri;
-import android.os.SystemClock;
-import android.webkit.PermissionRequest;
-
-import androidx.core.content.ContextCompat;
-
-import com.getcapacitor.Bridge;
-import com.getcapacitor.BridgeWebChromeClient;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-
-public class ShellWebChromeClient extends BridgeWebChromeClient {
-
-    // Only the page of the app itself may capture; frames from other hosts are denied.
-    private static final String APP_HOST = ${JSON.stringify(host.replace(/:\d+$/, ""))};
-    // No callback tells that a launch was abandoned (an interrupted dialog may never report back),
-    // so a launch older than this is treated as gone: the next request settles the queue by the
-    // permissions held and starts a fresh dialog, which makes a stuck queue impossible.
-    private static final long STALE_MS = 60_000;
-
-    private final Bridge shellBridge;
-    // Main thread only.
-    private final List<PermissionRequest> pending = new ArrayList<>();
-    private boolean inProgress = false;
-    private long launchedAt = 0;
-    private int launchId = 0;
-
-    public ShellWebChromeClient(Bridge bridge) {
-        super(bridge);
-        this.shellBridge = bridge;
-    }
-
-    @Override
-    public void onPermissionRequest(final PermissionRequest request) {
-        List<String> needs = needsOf(request);
-        if (needs.isEmpty()) {
-            super.onPermissionRequest(request);
-            return;
+// Robolectric runs the generated unit test on a JVM. The resources are needed so that the merged
+// manifest (declared permissions) and the Capacitor assets are visible to it. Patching twice
+// changes nothing.
+function withUnitTestSupport(gradle) {
+  if (!gradle.includes("org.robolectric:robolectric")) {
+    const anchored = gradle.replace(/(\n\s*)testImplementation "junit:junit:\$junitVersion"/,
+      (line, gap) => `${line}${gap}testImplementation "org.robolectric:robolectric:${ROBOLECTRIC_VERSION}"${gap}testImplementation "androidx.test:core:${ANDROIDX_TEST_CORE_VERSION}"`);
+    if (anchored === gradle) fail("build.gradle layout changed, the unit test dependencies were not added");
+    gradle = anchored;
+  }
+  if (!gradle.includes("includeAndroidResources")) {
+    const anchored = gradle.replace(/\n    buildTypes \{/, (head) => `
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
         }
-        Uri origin = request.getOrigin();
-        if (origin == null || origin.getHost() == null || !APP_HOST.equalsIgnoreCase(origin.getHost()) || !allDeclared(needs)) {
-            // A permission the manifest does not declare (CAMERA) can never be granted.
-            safeDeny(request);
-            return;
-        }
-        if (allHeld(needs)) {
-            safeGrant(request);
-            return;
-        }
-        if (inProgress && SystemClock.elapsedRealtime() - launchedAt > STALE_MS) settle();
-        pending.add(request);
-        if (inProgress) return;
-        inProgress = true;
-        launchedAt = SystemClock.elapsedRealtime();
-        final int id = ++launchId;
-        final String[] resources = request.getResources();
-        super.onPermissionRequest(new PermissionRequest() {
-            private boolean answered = false;
-
-            @Override public Uri getOrigin() { return request.getOrigin(); }
-            @Override public String[] getResources() { return resources; }
-            @Override public void grant(String[] ignored) { answer(); }
-            @Override public void deny() { answer(); }
-
-            private void answer() {
-                if (answered || id != launchId) return;
-                answered = true;
-                settle();
-            }
-        });
-    }
-
-    @Override
-    public void onPermissionRequestCanceled(PermissionRequest request) {
-        pending.remove(request);
-        super.onPermissionRequestCanceled(request);
-    }
-
-    private void settle() {
-        List<PermissionRequest> queued = new ArrayList<>(pending);
-        pending.clear();
-        inProgress = false;
-        for (PermissionRequest r : queued) {
-            if (allHeld(needsOf(r))) safeGrant(r); else safeDeny(r);
-        }
-    }
-
-    private List<String> needsOf(PermissionRequest request) {
-        List<String> resources = Arrays.asList(request.getResources());
-        List<String> needs = new ArrayList<>();
-        if (resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) needs.add(Manifest.permission.CAMERA);
-        if (resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
-            needs.add(Manifest.permission.RECORD_AUDIO);
-            needs.add(Manifest.permission.MODIFY_AUDIO_SETTINGS);
-        }
-        return needs;
-    }
-
-    private boolean allHeld(List<String> needs) {
-        for (String permission : needs) {
-            if (ContextCompat.checkSelfPermission(shellBridge.getContext(), permission) != PackageManager.PERMISSION_GRANTED) return false;
-        }
-        return true;
-    }
-
-    private boolean allDeclared(List<String> needs) {
-        try {
-            PackageInfo info = shellBridge.getContext().getPackageManager()
-                .getPackageInfo(shellBridge.getContext().getPackageName(), PackageManager.GET_PERMISSIONS);
-            List<String> declared = info.requestedPermissions == null ? new ArrayList<String>() : Arrays.asList(info.requestedPermissions);
-            return declared.containsAll(needs);
-        } catch (PackageManager.NameNotFoundException e) {
-            return false;
-        }
-    }
-
-    // The WebView may have resolved or cancelled the request already, and answering it throws.
-    private void safeGrant(PermissionRequest request) {
-        try { request.grant(request.getResources()); } catch (IllegalStateException ignored) { }
-    }
-
-    private void safeDeny(PermissionRequest request) {
-        try { request.deny(); } catch (IllegalStateException ignored) { }
-    }
+    }${head}`);
+    if (anchored === gradle) fail("build.gradle layout changed, testOptions was not added");
+    gradle = anchored;
+  }
+  return gradle;
 }
-`;
+
+// The Java the shell adds for media permissions lives in templates/android (MediaPermissionGate is
+// pure Java and has a JVM test in generator/test). The package and the app host are substituted
+// through a callback, so no character of them is read as a replacement pattern.
+function androidTemplate(name, { appId, host }) {
+  const text = readFileSync(join(here, "templates", "android", name), "utf8")
+    .replace(/__PACKAGE__/g, () => appId)
+    .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""));
+  if (/__[A-Z_]+__/.test(text)) fail(`${name} has a placeholder that was not substituted`);
+  return text;
 }
 
 // The return snippet of the published app. A sign-in the shell started ends in the system browser
@@ -1316,7 +1232,7 @@ function planMark(side, isMark, frame) {
 // Names SceneDelegate.swift calls on its own types, besides those called on the view controller by
 // receiver. Definitions are var, func or init, never a local let.
 function missingSwiftMembers(swift) {
-  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle", "setStatusBarStyle"]);
+  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle"]);
   const called = [...swift.matchAll(/\b(?:shell\??|ShellBridgeViewController\)\?)\.(\w+)/g)].map((m) => m[1]);
   const names = [...new Set([...called, ...SWIFT_MEMBERS])].filter((n) => !inherited.has(n));
   const missing = names.filter((n) => !new RegExp(`\\b(?:var|func) ${n}\\b`).test(swift));
@@ -1635,17 +1551,149 @@ function selftest() {
   assert(audio.includes('<uses-feature android:name="android.hardware.microphone" android:required="false" />'), "the microphone feature is optional");
   assert(!audio.includes("CAMERA"), "the camera permission is not declared");
   const mainJava = mainActivityJava("io.example.app", undefined);
-  const clientJava = shellWebChromeClientJava("io.example.app", "app.example.com:8443");
+  const clientJava = androidTemplate("ShellWebChromeClient.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  const gateJava = androidTemplate("MediaPermissionGate.java", { appId: "io.example.app", host: "app.example.com" });
   assert(mainJava.split("setWebChromeClient(new ShellWebChromeClient(").length === 2 && mainJava.includes("super.onCreate(savedInstanceState);"), "MainActivity installs the media-safe chrome client once, after super.onCreate");
-  assert(clientJava.startsWith("package io.example.app;") && clientJava.includes("class ShellWebChromeClient extends BridgeWebChromeClient")
-    && clientJava.includes("catch (IllegalStateException") && clientJava.includes("onPermissionRequestCanceled") && clientJava.includes("super.onPermissionRequest("), "the client extends the bridge's, answers once and catches the double answer");
-  assert(clientJava.includes('APP_HOST = "app.example.com";') && clientJava.includes("STALE_MS") && clientJava.includes("checkSelfPermission") && clientJava.includes("allDeclared(needs)"), "the client gates by the app host without the port, settles by held permissions and has a stale bound");
-  assert(!clientJava.includes("android.permission.CAMERA\"") && (clientJava.match(/super\.onPermissionRequest\(/g) || []).length === 2, "only non-media requests and the one dialog go to the bridge");
+  assert(clientJava.startsWith("package io.example.app;") && gateJava.startsWith("package io.example.app;"), "both classes are in the app package");
+  assert(clientJava.includes('APP_HOST = "app.example.com";') && clientJava.includes("class ShellWebChromeClient extends BridgeWebChromeClient") && clientJava.includes("super.onPermissionRequest(") && clientJava.includes("gate.cancel(request)"), "the client gates by the app host without the port and hands the rest to the bridge");
+  assert(!/^import (android|androidx|com\.getcapacitor)/m.test(gateJava), "the gate has no Android or Capacitor imports, so a plain JVM can test it");
+  assert(androidTemplate("ShellWebChromeClient.java", { appId: "io.a.b", host: "h.example.com" }).includes('"h.example.com"') && !clientJava.includes("__"), "the placeholders are substituted");
+  assert(androidTemplate("MediaPermissionGate.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the substitution is literal, not a replacement pattern");
   assert(mainActivityJava("io.example.app", undefined) === mainJava, "writing MainActivity twice gives the same file");
+  const unitTest = androidTemplate("ShellWebChromeClientTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(unitTest.startsWith("package io.example.app;") && unitTest.includes('Uri.parse("https://app.example.com")') && unitTest.includes("RobolectricTestRunner") && !unitTest.includes("__"), "the Robolectric test is written for the app package and host");
+  const barsJava = androidTemplate("ShellSystemBars.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsJava.startsWith("package io.example.app;") && barsJava.includes('APP_HOST = "app.example.com";') && !/__[A-Z_]+__/.test(barsJava), "the system bars class is in the app package and takes the host without the port");
+  assert(barsJava.includes('"public/shell-bars.js"') && barsJava.includes("onPageCommitVisible(WebView webView, String url)") && barsJava.includes("isAppPage(url)") && barsJava.includes("return null;"), "the system bars class runs the bundled script on app pages as they become visible and tolerates a missing asset");
+  assert(barsJava.includes("WEBVIEW_VERSION_WITH_SAFE_AREA_FIX = 140") && barsJava.includes("webViewMajorVersion() < WEBVIEW_VERSION_WITH_SAFE_AREA_FIX) return;") && barsJava.includes("WebView.getCurrentWebViewPackage()"), "the system bars class stays out below the WebView version Capacitor needs for edge to edge");
+  assert(mainJava.includes("public void onConfigurationChanged(Configuration newConfig)") && mainJava.split("ShellSystemBars.recheck(getBridge());").length === 2 && mainJava.indexOf("super.onConfigurationChanged(newConfig);") < mainJava.indexOf("ShellSystemBars.recheck("), "MainActivity asks the probe to report again after a configuration change");
+  assert(androidTemplate("ShellSystemBars.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the system bars substitution is literal");
+  assert(mainJava.split("ShellSystemBars.install(getBridge());").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSystemBars.install("), "MainActivity installs the system bars listener once, after super.onCreate");
+  assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes("contentInsetAdjustmentBehavior == .never"), "iOS injects the bar probe only for a page that draws under the bar");
+  probeSelftest(assert);
+  const gradleFixture = `android {
+    buildTypes {
+        release {
+        }
+    }
+}
+dependencies {
+    testImplementation "junit:junit:$junitVersion"
+}`;
+  const withTests = withUnitTestSupport(gradleFixture);
+  assert(withTests.includes(`org.robolectric:robolectric:${ROBOLECTRIC_VERSION}`) && withTests.includes("includeAndroidResources = true") && withTests.includes("androidx.test:core"), "build.gradle gets Robolectric and Android resources for unit tests");
+  assert(withUnitTestSupport(withTests) === withTests, "patching build.gradle for unit tests twice changes nothing");
+  assert(withUnitTestSupport(`// keep $& and $' as they are\n${gradleFixture}`).startsWith("// keep $& and $' as they are"), "the gradle patch does not read the existing text as a replacement pattern");
   const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
   assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
   assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");
   console.log("[generate] selftest ok");
+}
+// Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the
+// background-color the page reports for an element; the canvas fake reads "#rrggbb" and
+// "oklch(L ...)" (grey of lightness L) and ignores anything else, as a real one does.
+function probeSelftest(assert) {
+  const source = readFileSync(join(here, "templates", "shared", "shell-bars.js"), "utf8");
+  assert(!/[^\x00-\x7f]/.test(source), "shell-bars.js is ASCII");
+  const run = ({ platform = "ios", viewport = "width=device-width, viewport-fit=cover", top = [], bottom, body, html, theme = [], capacitor = true, framed = false, reject = false } = {}) => {
+    const el = (bg) => ({ bg });
+    const world = { body: el(body), html: el(html) };
+    // "body" and "html" in a stack stand for those elements, as elementsFromPoint returns them.
+    const stack = (list) => list.map((e) => (e === "body" ? world.body : e === "html" ? world.html : e));
+    world.top = stack(top);
+    world.bottom = stack(bottom || top);
+    const timers = [], listeners = [], calls = [];
+    const parse = (css) => {
+      const hex = /^#([0-9a-f]{6})$/i.exec(css), ok = /^oklch\(([\d.]+)/.exec(css);
+      if (hex) return [0, 2, 4].map((i) => parseInt(hex[1].slice(i, i + 2), 16));
+      if (ok) return [0, 0, 0].map(() => Math.round(parseFloat(ok[1]) * 255));
+      return null;
+    };
+    const ctx = {
+      cur: [0, 0, 0], pixel: [0, 0, 0, 0],
+      set fillStyle(css) { const c = parse(css); if (c) this.cur = c; },
+      clearRect() { this.pixel = [0, 0, 0, 0]; },
+      fillRect() { this.pixel = [...this.cur, 255]; },
+      getImageData() { return { data: this.pixel }; }
+    };
+    const metaOf = (list) => list.map((content) => ({ content, getAttribute: (n) => (n === "content" ? content : null) }));
+    const win = {
+      innerWidth: 400, innerHeight: 800, calls, listeners, timers,
+      setTimeout: (fn) => { timers.push(fn); return timers.length; },
+      clearTimeout: () => {},
+      addEventListener: (name) => listeners.push(["win", name]),
+      matchMedia: () => ({ matches: false, addEventListener: () => listeners.push(["win", "scheme"]) }),
+      getComputedStyle: (e) => ({ backgroundColor: e.bg || "rgba(0, 0, 0, 0)", opacity: e.opacity === undefined ? "1" : String(e.opacity) }),
+      MutationObserver: class { constructor(cb) { win.mutate = cb; } observe() { listeners.push(["mutation"]); } },
+      Capacitor: capacitor ? {
+        getPlatform: () => platform,
+        nativePromise: (plugin, method, options) => { calls.push({ plugin, method, ...options }); return reject ? Promise.reject(new Error("no")) : Promise.resolve(); }
+      } : undefined
+    };
+    win.window = win;
+    win.top = framed ? {} : win;
+    win.document = {
+      body: world.body, documentElement: world.html,
+      addEventListener: (name) => listeners.push(["doc", name]),
+      createElement: () => ({ getContext: () => ctx }),
+      elementsFromPoint: (x, y) => (y < 100 ? world.top : world.bottom),
+      querySelectorAll: (sel) => (sel === "meta[name=viewport]" ? metaOf(viewport === null ? [] : [viewport]) : sel === "meta[name=theme-color]" ? metaOf(theme) : [])
+    };
+    vm.createContext(win);
+    const load = () => vm.runInContext(source, win);
+    const flush = () => { while (timers.length) timers.shift()(); };
+    load();
+    flush();
+    return { win, world, calls, listeners, load, flush };
+  };
+  const styles = (r) => r.calls.map((c) => `${c.bar}:${c.style}`).join();
+  const page = (bg) => ({ top: [{ bg: "rgba(0, 0, 0, 0)" }], body: bg });
+
+  assert(styles(run(page("rgb(255, 255, 255)"))) === "StatusBar:LIGHT", "a light page gets dark bar content");
+  assert(styles(run(page("rgb(15, 23, 42)"))) === "StatusBar:DARK", "a dark page gets light bar content");
+  const call = run(page("rgb(15, 23, 42)")).calls[0];
+  assert(call.plugin === "SystemBars" && call.method === "setStyle", "the style goes to SystemBars.setStyle");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.6)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a translucent dark overlay over a light page reads as dark");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.2)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a faint overlay over a light page stays light");
+  assert(styles(run({ top: [{ bg: "rgb(255, 255, 255)" }, { bg: "rgb(0, 0, 0)" }], body: "rgb(0, 0, 0)" })) === "StatusBar:LIGHT", "an opaque layer hides what is under it");
+  assert(styles(run({ top: [{ bg: "oklch(0.2 0 0)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "an oklch() color is read through the canvas");
+  assert(styles(run({ top: [{ bg: "bogus(1)" }], body: "rgb(15, 23, 42)" })) === "StatusBar:DARK", "a color the canvas rejects is ignored");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "transparent", theme: ["#0f172a"] })) === "StatusBar:DARK", "a transparent page falls back to the theme color");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)", theme: ["#ffffff"] })) === "StatusBar:LIGHT", "a light theme color gives dark bar content");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)" })) === "", "nothing known reports nothing");
+  assert(run({ top: [], body: "rgb(255, 255, 255)", capacitor: false }).calls.length === 0, "a page without Capacitor is left alone");
+  assert(styles(run({ ...page("rgb(255, 255, 255)"), reject: true })) === "StatusBar:LIGHT", "a rejected call does not throw");
+  // body and html come back from elementsFromPoint too: a translucent body counts once.
+  assert(styles(run({ top: [{}, "body", "html"], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a translucent body already in the stack is not composited twice");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a body missing from the stack is still counted once");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0 }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a backdrop at opacity 0 is not an overlay");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0.8 }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a backdrop at opacity 0.8 is");
+  // The bottom sample must never reach iOS, where setStyle ignores `bar` and styles the status bar.
+  const sides = { top: [{ bg: "rgb(255, 255, 255)" }], bottom: [{ bg: "rgb(0, 0, 0)" }], body: "rgba(0, 0, 0, 0)" };
+  assert(styles(run(sides)) === "StatusBar:LIGHT", "iOS reports only the top edge");
+  assert(styles(run({ ...sides, platform: "android" })) === "StatusBar:LIGHT,NavigationBar:DARK", "Android reports both edges");
+  assert(run({ ...sides, platform: "android", viewport: "width=device-width" }).calls.length === 0 && run({ ...sides, platform: "android", viewport: null }).calls.length === 0, "Android does nothing without viewport-fit=cover");
+  assert(styles(run({ ...sides, platform: "ios", viewport: "width=device-width" })) === "StatusBar:LIGHT", "iOS leaves the decision to the native side");
+  assert(run({ ...page("rgb(15, 23, 42)"), framed: true }).listeners.length === 0, "a frame does nothing");
+  // Idempotence and change detection: a second load does nothing; a repeat check with the same
+  // color sends nothing; a changed color sends once.
+  const r = run(page("rgb(255, 255, 255)"));
+  const listening = r.listeners.length;
+  r.load();
+  r.flush();
+  assert(r.listeners.length === listening && r.calls.length === 1, "the probe runs once per document");
+  r.win.mutate();
+  r.flush();
+  assert(r.calls.length === 1, "an unchanged color is not sent again");
+  r.world.body.bg = "rgb(15, 23, 42)";
+  r.win.mutate();
+  r.win.mutate();
+  assert(r.win.timers.length === 1, "a burst of mutations queues one check");
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK", "a theme switch is reported once");
+  r.win.__mitraShellBars.recheck();
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK,StatusBar:DARK", "recheck sends the current style again");
 }
 function log(msg) { console.log(`[generate] ${msg}`); }
 function fail(msg) { console.error(`[generate] ERROR: ${msg}`); process.exit(1); }

@@ -14,6 +14,7 @@ to the stores.
 - `generator/play.mjs`: Google Play Developer API client (AAB upload to a track).
 - `generator/wellknown.mjs`: writes the app association files (`apple-app-site-association`,
   `assetlinks.json`) for a generated project.
+- `generator/test/`: tests that need a JVM (`MediaPermissionGateTest.java`, see Microphone and camera).
 - `generator/templates/`: files copied into every generated project (iOS `SceneDelegate.swift`,
   its CI workflow, its `.gitignore`).
 - `package.json` and `package-lock.json`: the pinned Capacitor dependencies. The generator copies
@@ -61,6 +62,38 @@ generation. When the page declares cover at generation time, the shell also pass
 `plugins.SystemBars.initialViewportFitValueHint: "cover"`, which only spares the first layout a
 shift.
 
+#### Status bar style
+
+A page that draws under the bars has to be readable there, and a style fixed at generation time
+cannot follow a theme the page switches at runtime (an in-app light/dark toggle, independent of the
+device theme, can leave a white clock on a white header). So the bundle carries `shell-bars.js`
+(`public/shell-bars.js`), which samples the color the page paints at the top center of the viewport
+(the element stack there, composited, then `body`, `html` and the theme color), maps it to light or
+dark with the same luminance rule as the generator, and calls `SystemBars.setStyle`. It re-checks
+when the DOM, the device color scheme, the size or the visibility change, and after CSS transitions.
+`plugins.StatusBar.style` from the theme color stays as the first style, until the page reports.
+
+- iOS: the script is a `WKUserScript` added by `SceneDelegate.swift` only when the config has
+  `ios.contentInset: "never"` (the page draws under the bar). `SystemBars.setStyle` on iOS styles
+  the status bar and ignores `bar`, so only the top edge is sampled. The splash overlay keeps the
+  bar on the splash style while it is up, and the style the page asked for in that time is applied
+  when it leaves.
+- Android: `ShellSystemBars` (added to `MainActivity`) runs the script after each page load on the
+  app host, and only when the live viewport meta has `viewport-fit=cover`, the same rule
+  `SystemBars` uses to go edge to edge. The bottom edge is sampled too and styles the navigation
+  bar.
+
+On iOS the probe is injected in any main-frame document of the web view; on Android it runs only
+for pages on the app host, and only on a WebView of major version 140 or newer, the version from
+which Capacitor lets the page under the bars (older ones keep the device-theme style, since the
+bars sit over the native window background). On Android the probe is also asked to report again
+after a configuration change, because the bridge re-applies the stored styles then.
+
+Known limit: background images and gradients are not read, so a top edge painted that way falls
+back to the color of `body`, `html` or the theme color. Elements with `pointer-events: none` are
+not seen either, and an element's own `opacity` counts but opacity inherited from an ancestor does
+not.
+
 ### Microphone and camera
 
 Every generated app declares microphone use, so a page can record audio with `getUserMedia`:
@@ -77,18 +110,41 @@ Every generated app declares microphone use, so a page can record audio with `ge
   without the key). The strings are in Portuguese and carry the app name, which is escaped (control
   characters are dropped).
 
-Only the app's own host can capture audio: a request from an iframe of another host is denied,
-and so is any request that needs `CAMERA`, which the manifest does not declare.
+On Android only the app's own host can capture audio: a request from an iframe of another host is
+denied, and so is any request that needs `CAMERA`, which the manifest does not declare. iOS has no
+such filter: Capacitor 8.6's `WebViewDelegationHandler` grants media capture to whatever is loaded
+in the web view, other hosts included, once the OS permission is granted.
 
 The Android shell installs its own web chrome client (`ShellWebChromeClient`, written next to
 `MainActivity`) for media permissions. Capacitor's `BridgeWebChromeClient` shares one permission
 listener between media, geolocation and the camera of the file chooser, so a second request while a
 dialog is up, or a request the WebView had already cancelled, was answered twice or not at all, and
-the double answer crashed the app. The shell keeps one dialog in progress, and when it closes
-decides each queued request by the permissions the app holds. A dialog with no answer for 60 s is
-treated as gone by the next request. Everything else stays Capacitor's. Compile coverage of this
-class is in the release pipeline (the Android build of `shell.yml`); the `ci.yml` build job runs no
-Gradle.
+the double answer crashed the app. The decision logic is `MediaPermissionGate`, pure Java: one dialog
+in progress for all media requests, and when it closes each queued request is decided by the
+permissions the app holds, whatever the dialog reported. A lost answer is detected by the lifecycle:
+the dialog pauses the activity and its result arrives before the activity resumes, so a request that
+arrives with a dialog in progress after the activity was paused for it and is resumed again means
+the answer is gone, and the queue is settled by the permissions held before a fresh dialog starts.
+Everything else stays Capacitor's. Both classes are templates in `generator/templates/android/`
+(package and app host are substituted); the gate has a behavioral test on a plain JVM,
+`generator/test/MediaPermissionGateTest.java`, which the `test` job of `ci.yml` compiles and runs
+with `javac` and `java`. It is not part of `npm test`, because Java is not guaranteed where that
+runs.
+
+The glue is tested on the real Capacitor classes. Every generated project carries
+`android/app/src/test/java/<package>/ShellWebChromeClientTest.java` (from
+`generator/templates/android/ShellWebChromeClientTest.java`) and the generator adds Robolectric to
+its `build.gradle`. The test starts `MainActivity` with the real Bridge, takes the client that
+`onCreate` installed, and sends it fake web requests. The dialog is played by Robolectric and its
+result goes through `Activity.dispatchRequestPermissionsResult`, `BridgeActivity` and Capacitor's
+own launcher callback and permission listener, so what runs is the path of production. It covers
+queuing, grant and deny, a request the WebView already resolved, a lost answer after another flow
+took Capacitor's listener, cancel, a foreign origin and held permissions. Only the service worker
+controller is replaced (Robolectric has no WebView provider), and the WebView itself is
+Robolectric's stub, so no page is loaded. Run it in a generated project with
+`./gradlew --no-daemon testDebugUnitTest` in its `android/` folder; the `build` job of `ci.yml`
+does that on its fixture project. `shell.yml` does not run it: it is the same code for every app,
+and a download of Robolectric should not be able to block a store release.
 
 The permission prompt appears only when the page asks for the microphone or camera. Once the OS
 permission is granted, Capacitor grants the page loaded in the web view access without asking
@@ -125,7 +181,8 @@ The splash takes that color, not the theme color, on both platforms and in
 `SplashScreen.backgroundColor`; the theme color stays the status bar color after load. Over the
 splash the status bar icons fit the splash color: the Android launch theme, and on iOS
 `UIStatusBarStyle` in `Info.plist` plus `SceneDelegate.swift` while the overlay is up. When the
-overlay leaves, the iOS status bar goes back to the style of the app.
+overlay leaves, the iOS status bar goes to the latest style the app asked for (see Status bar
+style above).
 
 If the composition fails for any logo, the run warns and hands the plain logo to `capacitor-assets`
 on the theme color, without the splash entrance, instead of failing the generation.
@@ -261,9 +318,10 @@ notification with `simctl push`; the run fails when the page does not receive it
 ### CI (`ci.yml`)
 
 Runs on pull requests and on `main`. `test` runs `npm test` (syntax check of the generator
-scripts and their self-tests). `build` generates a shell from a local fixture page, without the
-platform API or any secret, and checks the generated project, including the icon drawn from the
-initials; it does not run Gradle.
+scripts and their self-tests) and the JVM test of the permission gate. `build` generates a shell
+from a local fixture page, without the platform API or any secret, checks the generated project,
+including the icon drawn from the initials, and runs the unit tests of the generated Android
+project (`testDebugUnitTest`); it builds no APK.
 
 ### Workflow of the generated project
 
