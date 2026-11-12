@@ -23,6 +23,15 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      # The permission gate of the Android shell is pure Java: this runs its interleavings on a JVM.
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961  # v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Test the media permission gate
+        run: |
+          javac -d "$RUNNER_TEMP/gate" generator/templates/android/MediaPermissionGate.java generator/test/MediaPermissionGateTest.java
+          java -cp "$RUNNER_TEMP/gate" __PACKAGE__.MediaPermissionGateTest
 
   build:
     runs-on:
@@ -39,14 +48,27 @@ jobs:
           cache: npm
       - run: npm ci
       # --url mode reads only the published page, so a local page stands in for it and the run
-      # needs neither the platform API nor a secret. The page has no icon, which also exercises
+      # needs neither the platform API nor a secret. /cover serves the same page with a viewport-fit=cover meta. The page has no icon, which also exercises
       # the icon drawn from the initials of the name.
       - name: Serve the fixture page
         run: |
-          node -e 'require("http").createServer((req, res) => res.end("<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
+          node -e 'require("http").createServer((req, res) => res.end(req.url === "/cover" ? `<title>CI Fixture</title><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">` : "<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
           curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$FIXTURE_URL" > /dev/null
       - name: Generate a shell (Android only, no Gradle build)
         run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out"
+      # The generated project carries a Robolectric test of the media permission client on the real
+      # Capacitor classes; the build job has to run it because it is the one that generates a project.
+      # Java and the SDK are installed the way the Android job of shell.yml does it.
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961  # v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd  # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Run the unit tests of the generated Android project
+        working-directory: ${{ runner.temp }}/out/cifixture/android
+        run: ./gradlew --no-daemon testDebugUnitTest
       - name: Check the generated project
         working-directory: ${{ runner.temp }}/out/cifixture
         run: |
@@ -57,3 +79,40 @@ jobs:
           grep -q '>CF</text>' assets/logo.svg
           test -f assets/composed/icon-only.png
           test -f android/app/src/main/res/drawable-v31/splash_icon.xml
+          test -f www/shell-bars.js
+          test -f android/app/src/main/assets/public/shell-bars.js
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellSystemBars.java
+          test "$(grep -c 'ShellSystemBars.install(getBridge())' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
+      # The fixture page has no viewport meta, so detection gives "automatic" and nothing is recorded
+      # in mitra-shell.json (only a forced value is).
+      - name: Check the safe area and microphone reach the artifacts
+        working-directory: ${{ runner.temp }}/out/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "automatic" ? 0 : 1)'
+          node -e 'process.exit("iosContentInset" in require("./mitra-shell.json") ? 1 : 0)'
+          grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.hardware.microphone" android:required="false"' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml
+      - name: Generate a shell from a page that declares viewport-fit=cover, no override
+        run: node generator/generate.mjs --url "$FIXTURE_URL/cover" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-cover"
+      - name: Check the detected cover reaches the config
+        working-directory: ${{ runner.temp }}/out-cover/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "never" ? 0 : 1)'
+          node -e 'process.exit(require("./capacitor.config.json").plugins.SystemBars.initialViewportFitValueHint === "cover" ? 0 : 1)'
+          node -e 'process.exit("iosContentInset" in require("./mitra-shell.json") ? 1 : 0)'
+      # With iOS and the opposite of the detected value. The CLI skips CocoaPods and xcodebuild with
+      # a warning when they are missing, so this needs no macOS tooling.
+      - name: Generate a shell with iOS and a forced inset
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --ios-content-inset never --out "$RUNNER_TEMP/out-ios"
+      - name: Check the forced inset and the iOS usage strings
+        working-directory: ${{ runner.temp }}/out-ios/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "never" ? 0 : 1)'
+          node -e 'process.exit(require("./mitra-shell.json").iosContentInset === "never" ? 0 : 1)'
+          test "$(grep -c '<key>NSMicrophoneUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          test "$(grep -c '<key>NSCameraUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          grep -q 'CI Fixture usa o microfone' ios/App/App/Info.plist
+          test -f ios/App/App/public/shell-bars.js
+

@@ -22,6 +22,9 @@ import Capacitor
 //
 // A third thing is cosmetic: the launch image is a plain color (a storyboard cannot animate), and
 // the mark of the app comes in over it, see SplashEntranceView.
+//
+// A fourth keeps the status bar readable: a page that draws under the bar (contentInset never) gets
+// shell-bars.js, which reports the color the page paints behind the bar so its content can contrast.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -66,9 +69,48 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
 class ShellBridgeViewController: CAPBridgeViewController {
     private var entranceShown = false
+    private var barsProbeInstalled = false
 
+    // Set only while the splash overlay is up: the style it shows, and the style to apply when it
+    // leaves, which starts as the one the app had and is replaced by each style asked for meanwhile.
+    private var overlayStyle: UIStatusBarStyle?
+    private var requestedStyle: UIStatusBarStyle?
+
+    // Runs from loadView, before viewDidLoad loads the page, so the user script is in place for
+    // the first document.
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(MitraShellPlugin())
+        installBarsProbe()
+    }
+
+    // Under the bar means the page owns what is behind it, and a fixed style chosen at generation
+    // time cannot follow a theme the page switches at runtime. With any other inset the web view
+    // starts below the bar, over the native background, and the configured style stays right.
+    // A missing file leaves the configured style in place instead of failing the launch.
+    private func installBarsProbe() {
+        guard let webView = webView,
+              webView.scrollView.contentInsetAdjustmentBehavior == .never,
+              let root = bridge?.config.appLocation,
+              let source = try? String(contentsOf: root.appendingPathComponent("shell-bars.js"), encoding: .utf8) else { return }
+        webView.configuration.userContentController.addUserScript(
+            WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        barsProbeInstalled = true
+    }
+
+    // The overlay owns the status bar while it is up: a style the app asks for in that time (the
+    // StatusBar plugin from the config, shell-bars.js from the page) is kept and applied when the
+    // overlay leaves, so it neither shows over the splash nor is lost.
+    override func setStatusBarStyle(_ statusBarStyle: UIStatusBarStyle) {
+        if let held = overlayStyle {
+            requestedStyle = statusBarStyle
+            super.setStatusBarStyle(held)
+        } else {
+            super.setStatusBarStyle(statusBarStyle)
+        }
+    }
+
+    private func applyStatusBarStyle(_ style: UIStatusBarStyle) {
+        super.setStatusBarStyle(style)
     }
 
     // With server.url this is the published host; it is the only host the shell claims.
@@ -115,6 +157,11 @@ class ShellBridgeViewController: CAPBridgeViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         showSplashEntrance()
+        // The StatusBar plugin put its configured style back when the view appeared again (for
+        // example after the sign-in browser closed); the page reports its own once more.
+        if barsProbeInstalled {
+            webView?.evaluateJavaScript("window.__mitraShellBars && window.__mitraShellBars.recheck && window.__mitraShellBars.recheck()")
+        }
     }
 
     // The overlay goes on the window, above the Capacitor splash view that lives inside the web
@@ -146,18 +193,24 @@ class ShellBridgeViewController: CAPBridgeViewController {
             overlay?.removeFromSuperview()
         }
 
-        // The status bar over the splash follows the splash color, and the style of the app (the
-        // StatusBar plugin, from the theme color) comes back when the overlay leaves. The plugin
-        // applies its style in a main-queue block queued by super.viewDidAppear, so this has to
-        // queue behind it or it would capture the Info.plist style and be overwritten at once.
+        // The status bar over the splash follows the splash color, and the style the app asked for
+        // comes back when the overlay leaves. The StatusBar plugin applies its style in a main-queue
+        // block queued by super.viewDidAppear; setStatusBarStyle keeps whatever arrives while the
+        // overlay is up, so the order of that block against this one does not matter, but this
+        // has to queue behind it to capture the style it set and not the Info.plist one.
         let dark = bridge?.config.getPluginConfig("MitraShell").getBoolean("splashDark", false) ?? false
         let splashStyle: UIStatusBarStyle = dark ? .lightContent : .darkContent
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let appStyle = self.statusBarStyle
-            self.setStatusBarStyle(splashStyle)
+            self.requestedStyle = self.statusBarStyle
+            self.overlayStyle = splashStyle
+            self.applyStatusBarStyle(splashStyle)
             DispatchQueue.main.asyncAfter(deadline: .now() + hold + fade) { [weak self] in
-                if self?.statusBarStyle == splashStyle { self?.setStatusBarStyle(appStyle) }
+                guard let self = self else { return }
+                let latest = self.requestedStyle
+                self.overlayStyle = nil
+                self.requestedStyle = nil
+                if let latest = latest { self.applyStatusBarStyle(latest) }
             }
         }
     }

@@ -10,6 +10,7 @@
 //          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
+//          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
 // (public, no token) gives name, published origins, accent color and the login logo. The page
@@ -42,6 +43,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, readdirSync
 import { createRequire } from "node:module";
 import { dirname, join, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const templateRoot = resolve(here, "..");
@@ -96,7 +98,10 @@ const MIN_BACKGROUND_SHARE = 0.25;
 const MARK_PADDING = 0.02;
 // Names SceneDelegate.swift calls on its own types: the view controller members by receiver, plus
 // the ones that live in other types of the file. Definitions are var, func or init, never a local let.
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play"];
+// Robolectric 4.16 supports Android API 36 and needs JDK 17 or later.
+const ROBOLECTRIC_VERSION = "4.16";
+const ANDROIDX_TEST_CORE_VERSION = "1.7.0";
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
 
 if (flags.selftest) { selftest(); process.exit(0); }
 
@@ -114,6 +119,15 @@ if (!url) fail("Missing --app <uuid> (platform app) or --url <published URL>, or
 if (info && !info.origins?.length) fail(`App ${appUuid} has no published origin yet; publish it first or pass --url.`);
 const page = await fetchText(url);
 const scraped = scrape(page, url);
+// The page is already in hand in every mode, so the decision costs no extra request.
+const pageOwnsSafeArea = pageHandlesSafeArea(page);
+// The caller can force the value: the choice is frozen at generation, and a page that later adds or
+// drops viewport-fit=cover is otherwise out of step with the shell until it is generated again.
+const insetOverride = flags["ios-content-inset"] ?? descriptor.iosContentInset ?? undefined;
+let contentInset;
+try {
+  contentInset = resolveContentInset(insetOverride, pageOwnsSafeArea);
+} catch (e) { fail(e.message); }
 const appName = clean(flags.name || descriptor.name || info?.name || scraped.title || new URL(url).hostname);
 const slug = slugify(appName);
 const appId = flags["app-id"] || descriptor.appId || `cloud.${brandSegment(info?.brand)}.${packageSegment(slug)}`;
@@ -162,6 +176,7 @@ log(`slug     ${slug}`);
 log(`appId    ${appId}`);
 log(`url      ${url}`);
 log(`theme    ${themeColor}`);
+log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
 log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
@@ -210,6 +225,9 @@ const capPlugins = Object.keys(templatePkg.dependencies)
 const pluginsFor = (push) => capPlugins.filter((d) => push || d !== PUSH_PLUGIN);
 
 writeFileSync(join(projectDir, "www", "index.html"), offlinePage(appName, themeColor));
+// The bar probe travels in the bundle (public/shell-bars.js on both platforms) because the page
+// does not know the shell exists; the native side injects it, see templates/shared/shell-bars.js.
+cpSync(join(here, "templates", "shared", "shell-bars.js"), join(projectDir, "www", "shell-bars.js"));
 
 // Icon: the source logo is kept in assets/ as it came. The files capacitor-assets reads are
 // composed from it in assets/composed/ (see composeBrand), which needs sharp from npm ci.
@@ -232,12 +250,16 @@ writeJson(join(projectDir, "capacitor.config.json"), {
   appName,
   webDir: "www",
   server: { url, cleartext: false },
-  ios: { contentInset: "automatic", includePlugins: pluginsFor(pushIos) },
+  ios: { contentInset, includePlugins: pluginsFor(pushIos) },
   android: { allowMixedContent: false, webContentsDebuggingEnabled: Boolean(flags.debug || descriptor.debug), includePlugins: pluginsFor(pushAndroid) },
   plugins: {
-    // The splash sits behind the mark, so it takes the color behind the mark; the theme color is
-    // the app chrome after load (status bar).
+    // The splash sits behind the mark, so it takes the color behind the mark; the theme color
+    // gives the status bar its first style, and a page that draws under the bar then corrects it
+    // at runtime from what it paints there (shell-bars.js).
     SplashScreen: { launchShowDuration: 1500, launchAutoHide: true, backgroundColor: brand.bg, showSpinner: false },
+    // Android reads the live page's viewport-fit at runtime; the hint only spares the first layout
+    // a shift when the page is known to declare cover.
+    ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
     MitraShell: { authHosts, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
@@ -247,7 +269,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, version: versionName, buildNumber, associatedDomains, authHosts, callback,
+  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -261,7 +283,7 @@ if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand });
 
 // ---------- 5. iOS patches ----------
-if (wantIos) patchIos(projectDir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
+if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
 
 // ---------- 6. Assets, sync, CI ----------
@@ -307,6 +329,37 @@ githubOutputs(summary);
 log("done");
 
 // ======================================================================
+// The caller's value when there is one (null counts as none), else what the page asks for.
+function resolveContentInset(override, pageOwnsSafeArea) {
+  if (override == null) return pageOwnsSafeArea ? "never" : "automatic";
+  if (!["never", "automatic"].includes(override)) throw new Error(`--ios-content-inset must be never or automatic, got ${JSON.stringify(override)}`);
+  return override;
+}
+// Whether the page reserves the safe area itself: its viewport meta carries viewport-fit=cover.
+// Then the native scroll view must not add the inset too, or the status bar height shows up twice
+// on iOS. The text is third-party and only matched, never evaluated. Comments, scripts and
+// noscript blocks are dropped first (a viewport meta inside a string or a fallback block is not the
+// page's), and the meta is read attribute by attribute, so viewport-fit inside the content of some
+// other meta does not count either. An unterminated block runs to the end of the text, which keeps
+// every pattern linear: tag patterns exclude "<", so a run of unclosed tags is not rescanned from
+// each start. Only the first 256 KB are looked at, which also bounds the work.
+function pageHandlesSafeArea(html) {
+  const head = html.slice(0, 262144).replace(
+    /<!--(?:-?>|[\s\S]*?(?:-->|$))|<script\b[^<>]*>[\s\S]*?(?:<\/script\s*>|$)|<noscript\b[^<>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, "");
+  let content = null;
+  for (const [tag] of head.matchAll(/<meta\b[^<>]*>/gi)) {
+    const attrs = {};
+    for (const m of tag.slice(5).matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+      const key = m[1].toLowerCase();
+      if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
+    }
+    // Browsers apply the last viewport meta.
+    if ((attrs.name || "").trim().toLowerCase() === "viewport") content = attrs.content ?? "";
+  }
+  if (content === null) return false;
+  return content.split(/[,;]/).some((part) => /^viewport-fit\s*=\s*cover$/i.test(part.trim()));
+}
+
 function scrape(html, baseUrl) {
   const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
   const themeColor = (html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i) || [])[1];
@@ -569,6 +622,46 @@ function withLaunchStatusBar(plist, dark) {
 \t<key>LSRequiresIPhoneOS</key>`);
 }
 
+// Every app can record voice and take photos through the page (getUserMedia, a file input), and
+// iOS terminates an app that touches the microphone or camera without these strings. The app name
+// comes from a third party and lands in XML, hence the escaping. Keys already present are kept.
+function withUsageDescriptions(plist, appName) {
+  // Control characters other than tab and line feed, and U+FFFE and U+FFFF, are not valid in XML 1.0, even escaped.
+  const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
+  const wanted = [
+    ["NSMicrophoneUsageDescription", `${name} usa o microfone para gravar \u00e1udio que voc\u00ea envia.`],
+    ["NSCameraUsageDescription", `${name} usa a c\u00e2mera para tirar fotos que voc\u00ea envia.`]
+  ];
+  for (const [key, text] of wanted) {
+    if (plist.includes(`<key>${key}</key>`)) continue;
+    // A callback, not a replacement string: "$&" or "$'" in the app name must stay literal.
+    const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>${key}</key>\n\t<string>${text}</string>\n\t<key>LSRequiresIPhoneOS</key>`);
+    if (anchored === plist) fail(`Info.plist layout changed, ${key} was not added`);
+    plist = anchored;
+  }
+  return plist;
+}
+
+// Capacitor's BridgeWebChromeClient asks for these two at runtime when the page calls
+// getUserMedia({ audio: true }), but only a declared permission can be requested. CAMERA is left
+// out on purpose: declaring it makes the camera capture of a file input require the runtime grant,
+// while without it the system camera app handles the capture. RECORD_AUDIO alone implies a required
+// microphone feature, which would make Play hide the app from devices without one.
+function withAudioPermissions(manifest) {
+  for (const [name, element] of [
+    ["android.permission.RECORD_AUDIO", `<uses-permission android:name="android.permission.RECORD_AUDIO" />`],
+    ["android.permission.MODIFY_AUDIO_SETTINGS", `<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />`],
+    ["android.hardware.microphone", `<uses-feature android:name="android.hardware.microphone" android:required="false" />`]
+  ]) {
+    if (manifest.includes(`android:name="${name}"`)) continue;
+    const anchored = manifest.replace(/([ \t]*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+      `$&\n$1${element}`);
+    if (anchored === manifest) fail(`AndroidManifest layout changed, ${name} was not added`);
+    manifest = anchored;
+  }
+  return manifest;
+}
+
 // The mark SceneDelegate animates in over the launch image (see templates/ios/SceneDelegate.swift).
 function patchIosSplash(appDir, brand) {
   if (!brand.iosMark) return;
@@ -605,7 +698,8 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
                 <data android:scheme="${callbackScheme}" />
             </intent-filter>` : ""}
         </activity>`;
-  manifest = manifest.replace(/\s*<\/activity>/, filter);
+  manifest = manifest.replace(/\s*<\/activity>/, () => filter);
+  manifest = withAudioPermissions(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
     // PushNotifications.requestPermissions().
@@ -622,6 +716,15 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
   writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
+  for (const name of ["MediaPermissionGate.java", "ShellWebChromeClient.java", "ShellSystemBars.java"]) {
+    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host }));
+  }
+  // The unit test runs the client above on the real Capacitor classes (Robolectric).
+  const testDir = join(app, "src", "test", "java", ...appId.split("."));
+  mkdirSync(testDir, { recursive: true });
+  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java"]) {
+    writeFileSync(join(testDir, name), androidTemplate(name, { appId, host }));
+  }
 
   // build.gradle: version and release signing from the environment.
   const gradlePath = join(app, "build.gradle");
@@ -650,6 +753,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
 `);
     if (!gradle.includes("signingConfigs {")) fail("build.gradle layout changed, signing patch did not apply");
   }
+  gradle = withUnitTestSupport(gradle);
   writeFileSync(gradlePath, gradle);
 
   // local.properties: point Gradle at the SDK on this machine (CI sets ANDROID_HOME itself).
@@ -660,7 +764,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   if (sdk) writeFileSync(join(dir, "android", "local.properties"), `sdk.dir=${sdk}\n`);
 }
 
-function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
+function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
   const appDir = join(dir, "ios", "App", "App");
   patchIosSplash(appDir, brand);
   const plistPath = join(appDir, "Info.plist");
@@ -668,7 +772,7 @@ function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomain
   if (callbackScheme && !plist.includes("CFBundleURLTypes")) {
     // The sign-in return by scheme. ASWebAuthenticationSession catches it by itself; registering it
     // also brings a tap on the fallback link of the app page back to the shell.
-    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", `\t<key>CFBundleURLTypes</key>
+    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>CFBundleURLTypes</key>
 \t<array>
 \t\t<dict>
 \t\t\t<key>CFBundleURLName</key>
@@ -682,6 +786,7 @@ function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomain
 \t<key>LSRequiresIPhoneOS</key>`);
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
+  plist = withUsageDescriptions(plist, appName);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
     plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t<false/>\n\t<key>LSRequiresIPhoneOS</key>");
   }
@@ -718,7 +823,7 @@ ${entitlements.join("\n")}
 </plist>
 `);
     pbx = pbx.replace(new RegExp(`(\\t+)PRODUCT_BUNDLE_IDENTIFIER = ${appId.replace(/\./g, "\\.")};`, "g"),
-      `$1CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n$1PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
+      (_, indent) => `${indent}CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n${indent}PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
   }
   if (push) {
     // The push plugin learns the device token (or the failure) from these two AppDelegate calls.
@@ -748,7 +853,9 @@ function mainActivityJava(appId, callbackScheme) {
   return `package ${appId};
 
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.net.Uri;
+import android.os.Bundle;
 import android.webkit.WebView;
 
 import com.getcapacitor.BridgeActivity;
@@ -758,6 +865,27 @@ public class MainActivity extends BridgeActivity {
     private static final String SHELL_LINK_PARAM = "shellLink";
     // Sign-in return by URL scheme (null when the shell relies on the App Link alone).
     private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+
+    // Replaces the bridge's own chrome client, once, to make media permission requests safe (see
+    // ShellWebChromeClient). Done here, before the activity starts, because the client registers
+    // activity result launchers when it is created. The same block registers the system bars
+    // listener (see ShellSystemBars), once, because it adds a listener to the bridge.
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getBridge() != null && getBridge().getWebView() != null) {
+            getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge()));
+            ShellSystemBars.install(getBridge());
+        }
+    }
+
+    // The bridge re-applies the stored bar styles on a configuration change, which can undo the
+    // style the page asked for: see ShellSystemBars.recheck.
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        ShellSystemBars.recheck(getBridge());
+    }
 
     // Capacitor only tells the web app about an incoming link (appUrlOpen); the app published
     // by the platform does not know the shell exists. So when the link is on the app's own host,
@@ -789,6 +917,40 @@ public class MainActivity extends BridgeActivity {
     }
 }
 `;
+}
+
+// Robolectric runs the generated unit test on a JVM. The resources are needed so that the merged
+// manifest (declared permissions) and the Capacitor assets are visible to it. Patching twice
+// changes nothing.
+function withUnitTestSupport(gradle) {
+  if (!gradle.includes("org.robolectric:robolectric")) {
+    const anchored = gradle.replace(/(\n\s*)testImplementation "junit:junit:\$junitVersion"/,
+      (line, gap) => `${line}${gap}testImplementation "org.robolectric:robolectric:${ROBOLECTRIC_VERSION}"${gap}testImplementation "androidx.test:core:${ANDROIDX_TEST_CORE_VERSION}"`);
+    if (anchored === gradle) fail("build.gradle layout changed, the unit test dependencies were not added");
+    gradle = anchored;
+  }
+  if (!gradle.includes("includeAndroidResources")) {
+    const anchored = gradle.replace(/\n    buildTypes \{/, (head) => `
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }${head}`);
+    if (anchored === gradle) fail("build.gradle layout changed, testOptions was not added");
+    gradle = anchored;
+  }
+  return gradle;
+}
+
+// The Java the shell adds for media permissions lives in templates/android (MediaPermissionGate is
+// pure Java and has a JVM test in generator/test). The package and the app host are substituted
+// through a callback, so no character of them is read as a replacement pattern.
+function androidTemplate(name, { appId, host }) {
+  const text = readFileSync(join(here, "templates", "android", name), "utf8")
+    .replace(/__PACKAGE__/g, () => appId)
+    .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""));
+  if (/__[A-Z_]+__/.test(text)) fail(`${name} has a placeholder that was not substituted`);
+  return text;
 }
 
 // The return snippet of the published app. A sign-in the shell started ends in the system browser
@@ -1072,7 +1234,7 @@ function planMark(side, isMark, frame) {
 // Names SceneDelegate.swift calls on its own types, besides those called on the view controller by
 // receiver. Definitions are var, func or init, never a local let.
 function missingSwiftMembers(swift) {
-  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle", "setStatusBarStyle"]);
+  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle"]);
   const called = [...swift.matchAll(/\b(?:shell\??|ShellBridgeViewController\)\?)\.(\w+)/g)].map((m) => m[1]);
   const names = [...new Set([...called, ...SWIFT_MEMBERS])].filter((n) => !inherited.has(n));
   const missing = names.filter((n) => !new RegExp(`\\b(?:var|func) ${n}\\b`).test(swift));
@@ -1323,7 +1485,219 @@ function selftest() {
   const plainTheme = patchLaunchTheme(capacitorStyles, asIs);
   assert(plainTheme.includes("windowSplashScreenBackground") && !plainTheme.includes("windowSplashScreenAnimatedIcon"), "the fallback theme has the color and no animated icon");
   assert(capacitorAssetsArgs(asIs).includes("--splashBackgroundColor") && !capacitorAssetsArgs({ branch: "own-background" }).includes("--splashBackgroundColor"), "only the fallback gives capacitor-assets the colors");
+  const viewport = (content, extra = "") => `<html><head><meta charset="utf-8">${extra}<meta name="viewport" content="${content}"></head></html>`;
+  for (const [html, expected, why] of [
+    [viewport("width=device-width, initial-scale=1, viewport-fit=cover"), true, "the usual cover viewport"],
+    ['<meta content="width=device-width,viewport-fit=cover" name="viewport">', true, "content before name"],
+    ["<meta name='viewport' content='width=device-width, viewport-fit=cover'>", true, "single quotes"],
+    ['<META  NAME = "Viewport"   CONTENT = "viewport-fit = COVER" />', true, "case and extra spaces"],
+    ['<meta name=viewport content="viewport-fit=cover">', true, "unquoted name"],
+    ['<meta name="viewport" content="width=device-width; viewport-fit=cover">', true, "semicolon separator"],
+    [viewport("width=device-width, viewport-fit=contain"), false, "contain"],
+    [viewport("width=device-width, viewport-fit=auto"), false, "auto"],
+    [viewport("width=device-width, initial-scale=1"), false, "no viewport-fit"],
+    [viewport("width=device-width, x-viewport-fit=cover"), false, "a longer key is not viewport-fit"],
+    ["<html><head><title>x</title></head></html>", false, "no viewport meta"],
+    ['<!-- <meta name="viewport" content="viewport-fit=cover"> --><meta name="viewport" content="width=device-width">', false, "a commented meta"],
+    ['<!-- never closed <meta name="viewport" content="viewport-fit=cover">', false, "an unterminated comment"],
+    ['<meta name="description" content="try viewport-fit=cover">', false, "viewport-fit in another meta"],
+    ['<meta name="description" content=\'name="viewport" content="viewport-fit=cover"\'>', false, "a viewport meta quoted inside another attribute"],
+    [viewport("width=device-width", '<meta name="x" content="viewport-fit=cover">'), false, "another meta before the viewport"],
+    [`${viewport("viewport-fit=cover")}${viewport("width=device-width")}`, false, "the last viewport meta wins"],
+    ["", false, "empty page"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  assert(pageHandlesSafeArea(`${"<!--".repeat(50000)}${viewport("viewport-fit=cover")}`) === false, "many unterminated comments finish and hide the meta");
+  assert(resolveContentInset(undefined, true) === "never" && resolveContentInset(null, false) === "automatic" && resolveContentInset(null, true) === "never", "a null or missing override falls back to detection");
+  assert(resolveContentInset("automatic", true) === "automatic" && throws(() => resolveContentInset("always", true)), "an override wins and must be never or automatic");
+  for (const [html, expected, why] of [
+    [`<!-->${viewport("viewport-fit=cover")}`, true, "an empty comment <!--> does not swallow the meta"],
+    [`<!--->${viewport("viewport-fit=cover")}`, true, "an empty comment <!---> does not swallow the meta"],
+    [`<!--x-->${viewport("viewport-fit=cover")}`, true, "a normal comment still ends at -->"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why}`);
+  }
+  assert(withUsageDescriptions("<dict>\n\t<key>LSRequiresIPhoneOS</key>\n</dict>", "A\ufffeB\uffffC").includes("<string>ABC usa o microfone"), "U+FFFE and U+FFFF are dropped from the name");
+  const hostile = `${"<meta ".repeat(50000)}${viewport("viewport-fit=cover")}`;
+  const started = Date.now();
+  pageHandlesSafeArea(hostile);
+  pageHandlesSafeArea(`${"<script ".repeat(40000)}${"<noscript ".repeat(40000)}${"<!--".repeat(40000)}`);
+  assert(Date.now() - started < 1000, `a page of unclosed tags is scanned in linear time (${Date.now() - started} ms)`);
+  for (const [html, expected, why] of [
+    [`<script>var s = '<meta name="viewport" content="viewport-fit=cover">';</script>${viewport("width=device-width")}`, false, "a meta inside a script string"],
+    [`<script type="module">x</script><noscript><meta name="viewport" content="viewport-fit=cover"></noscript>`, false, "a meta inside noscript"],
+    [`<noscript><meta name="viewport" content="viewport-fit=cover">`, false, "an unterminated noscript"],
+    [`<SCRIPT src=a></SCRIPT>${viewport("viewport-fit=cover")}`, true, "a real meta after an empty script"],
+    [`<script>${viewport("viewport-fit=cover")}`, false, "an unterminated script"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  for (const hostileName of ["Caixa $& Co", "A$'B", "A$`B", "A$1B", "A$$B", "$&$'$`$1$$"]) {
+    const out = withUsageDescriptions("<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>", hostileName);
+    const once = (needle) => out.split(needle).length === 2;
+    assert(out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa o microfone`) && out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa a c\u00e2mera`), `the name ${hostileName} stays literal in the usage strings`);
+    assert(once("<key>NSMicrophoneUsageDescription</key>") && once("<key>NSCameraUsageDescription</key>") && once("<key>LSRequiresIPhoneOS</key>") && once("<key>CFBundleName</key>"), `the plist keeps one of each key with the name ${hostileName}`);
+  }
+  const usagePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  const usage = withUsageDescriptions(usagePlist, `Caf\u00e9 & <Co> "x" 'y'`);
+  assert(usage.includes("<key>NSMicrophoneUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o microfone para gravar \u00e1udio que voc\u00ea envia.</string>"), "the microphone string names the escaped app");
+  assert(withUsageDescriptions(usagePlist, "A\u0000B\u0007\u001fC\tD").includes("<string>ABC\tD usa o microfone"), "control characters are dropped from the name");
+  assert(usage.includes("<key>NSCameraUsageDescription</key>") && usage.includes("usa a c\u00e2mera para tirar fotos que voc\u00ea envia."), "the camera string is added");
+  assert(withUsageDescriptions(usage, "Other") === usage, "adding the usage strings twice changes nothing");
+  const ownMic = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSMicrophoneUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
+  assert(withUsageDescriptions(ownMic, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownMic, "A").split("NSMicrophoneUsageDescription").length === 2, "an existing microphone string is kept");
+  const androidManifest = `<manifest>\n    <application/>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
+  const audio = withAudioPermissions(androidManifest);
+  assert(audio.includes('android.permission.RECORD_AUDIO" />') && audio.includes('android.permission.MODIFY_AUDIO_SETTINGS" />'), "the audio permissions are declared");
+  assert(audio.includes('<uses-feature android:name="android.hardware.microphone" android:required="false" />'), "the microphone feature is optional");
+  assert(!audio.includes("CAMERA"), "the camera permission is not declared");
+  const mainJava = mainActivityJava("io.example.app", undefined);
+  const clientJava = androidTemplate("ShellWebChromeClient.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  const gateJava = androidTemplate("MediaPermissionGate.java", { appId: "io.example.app", host: "app.example.com" });
+  assert(mainJava.split("setWebChromeClient(new ShellWebChromeClient(").length === 2 && mainJava.includes("super.onCreate(savedInstanceState);"), "MainActivity installs the media-safe chrome client once, after super.onCreate");
+  assert(clientJava.startsWith("package io.example.app;") && gateJava.startsWith("package io.example.app;"), "both classes are in the app package");
+  assert(clientJava.includes('APP_HOST = "app.example.com";') && clientJava.includes("class ShellWebChromeClient extends BridgeWebChromeClient") && clientJava.includes("super.onPermissionRequest(") && clientJava.includes("gate.cancel(request)"), "the client gates by the app host without the port and hands the rest to the bridge");
+  assert(!/^import (android|androidx|com\.getcapacitor)/m.test(gateJava), "the gate has no Android or Capacitor imports, so a plain JVM can test it");
+  assert(androidTemplate("ShellWebChromeClient.java", { appId: "io.a.b", host: "h.example.com" }).includes('"h.example.com"') && !clientJava.includes("__"), "the placeholders are substituted");
+  assert(androidTemplate("MediaPermissionGate.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the substitution is literal, not a replacement pattern");
+  assert(mainActivityJava("io.example.app", undefined) === mainJava, "writing MainActivity twice gives the same file");
+  const unitTest = androidTemplate("ShellWebChromeClientTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(unitTest.startsWith("package io.example.app;") && unitTest.includes('Uri.parse("https://app.example.com")') && unitTest.includes("RobolectricTestRunner") && !unitTest.includes("__"), "the Robolectric test is written for the app package and host");
+  const barsJava = androidTemplate("ShellSystemBars.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsJava.startsWith("package io.example.app;") && barsJava.includes('APP_HOST = "app.example.com";') && !/__[A-Z_]+__/.test(barsJava), "the system bars class is in the app package and takes the host without the port");
+  assert(barsJava.includes('"public/shell-bars.js"') && barsJava.includes("onPageCommitVisible(WebView webView, String url)") && barsJava.includes("isAppPage(url)") && barsJava.includes("return null;"), "the system bars class runs the bundled script on app pages as they become visible and tolerates a missing asset");
+  assert(barsJava.includes("WEBVIEW_VERSION_WITH_SAFE_AREA_FIX = 140") && barsJava.includes("webViewMajorVersion() < WEBVIEW_VERSION_WITH_SAFE_AREA_FIX) return;") && barsJava.includes("WebView.getCurrentWebViewPackage()"), "the system bars class stays out below the WebView version Capacitor needs for edge to edge");
+  assert(mainJava.includes("public void onConfigurationChanged(Configuration newConfig)") && mainJava.split("ShellSystemBars.recheck(getBridge());").length === 2 && mainJava.indexOf("super.onConfigurationChanged(newConfig);") < mainJava.indexOf("ShellSystemBars.recheck("), "MainActivity asks the probe to report again after a configuration change");
+  assert(androidTemplate("ShellSystemBars.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the system bars substitution is literal");
+  assert(mainJava.split("ShellSystemBars.install(getBridge());").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSystemBars.install("), "MainActivity installs the system bars listener once, after super.onCreate");
+  assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes("contentInsetAdjustmentBehavior == .never"), "iOS injects the bar probe only for a page that draws under the bar");
+  probeSelftest(assert);
+  const barsTest = androidTemplate("ShellSystemBarsTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsTest.startsWith("package io.example.app;") && barsTest.includes('"https://app.example.com/home"') && barsTest.includes("RobolectricTestRunner") && barsTest.includes("onPageCommitVisible") && barsTest.includes("onConfigurationChanged") && !/__[A-Z_]+__/.test(barsTest), "the system bars Robolectric test is written for the app package and host");
+  const gradleFixture = `android {
+    buildTypes {
+        release {
+        }
+    }
+}
+dependencies {
+    testImplementation "junit:junit:$junitVersion"
+}`;
+  const withTests = withUnitTestSupport(gradleFixture);
+  assert(withTests.includes(`org.robolectric:robolectric:${ROBOLECTRIC_VERSION}`) && withTests.includes("includeAndroidResources = true") && withTests.includes("androidx.test:core"), "build.gradle gets Robolectric and Android resources for unit tests");
+  assert(withUnitTestSupport(withTests) === withTests, "patching build.gradle for unit tests twice changes nothing");
+  assert(withUnitTestSupport(`// keep $& and $' as they are\n${gradleFixture}`).startsWith("// keep $& and $' as they are"), "the gradle patch does not read the existing text as a replacement pattern");
+  const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
+  assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
+  assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");
   console.log("[generate] selftest ok");
+}
+// Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the
+// background-color the page reports for an element; the canvas fake reads "#rrggbb" and
+// "oklch(L ...)" (grey of lightness L) and ignores anything else, as a real one does.
+function probeSelftest(assert) {
+  const source = readFileSync(join(here, "templates", "shared", "shell-bars.js"), "utf8");
+  assert(!/[^\x00-\x7f]/.test(source), "shell-bars.js is ASCII");
+  const run = ({ platform = "ios", viewport = "width=device-width, viewport-fit=cover", top = [], bottom, body, html, theme = [], capacitor = true, framed = false, reject = false } = {}) => {
+    const el = (bg) => ({ bg });
+    const world = { body: el(body), html: el(html) };
+    // "body" and "html" in a stack stand for those elements, as elementsFromPoint returns them.
+    const stack = (list) => list.map((e) => (e === "body" ? world.body : e === "html" ? world.html : e));
+    world.top = stack(top);
+    world.bottom = stack(bottom || top);
+    const timers = [], listeners = [], calls = [];
+    const parse = (css) => {
+      const hex = /^#([0-9a-f]{6})$/i.exec(css), ok = /^oklch\(([\d.]+)/.exec(css);
+      if (hex) return [0, 2, 4].map((i) => parseInt(hex[1].slice(i, i + 2), 16));
+      if (ok) return [0, 0, 0].map(() => Math.round(parseFloat(ok[1]) * 255));
+      return null;
+    };
+    const ctx = {
+      cur: [0, 0, 0], pixel: [0, 0, 0, 0],
+      set fillStyle(css) { const c = parse(css); if (c) this.cur = c; },
+      clearRect() { this.pixel = [0, 0, 0, 0]; },
+      fillRect() { this.pixel = [...this.cur, 255]; },
+      getImageData() { return { data: this.pixel }; }
+    };
+    const metaOf = (list) => list.map((content) => ({ content, getAttribute: (n) => (n === "content" ? content : null) }));
+    const win = {
+      innerWidth: 400, innerHeight: 800, calls, listeners, timers,
+      setTimeout: (fn) => { timers.push(fn); return timers.length; },
+      clearTimeout: () => {},
+      addEventListener: (name) => listeners.push(["win", name]),
+      matchMedia: () => ({ matches: false, addEventListener: () => listeners.push(["win", "scheme"]) }),
+      getComputedStyle: (e) => ({ backgroundColor: e.bg || "rgba(0, 0, 0, 0)", opacity: e.opacity === undefined ? "1" : String(e.opacity) }),
+      MutationObserver: class { constructor(cb) { win.mutate = cb; } observe() { listeners.push(["mutation"]); } },
+      Capacitor: capacitor ? {
+        getPlatform: () => platform,
+        nativePromise: (plugin, method, options) => { calls.push({ plugin, method, ...options }); return reject ? Promise.reject(new Error("no")) : Promise.resolve(); }
+      } : undefined
+    };
+    win.window = win;
+    win.top = framed ? {} : win;
+    win.document = {
+      body: world.body, documentElement: world.html,
+      addEventListener: (name) => listeners.push(["doc", name]),
+      createElement: () => ({ getContext: () => ctx }),
+      elementsFromPoint: (x, y) => (y < 100 ? world.top : world.bottom),
+      querySelectorAll: (sel) => (sel === "meta[name=viewport]" ? metaOf(viewport === null ? [] : [viewport]) : sel === "meta[name=theme-color]" ? metaOf(theme) : [])
+    };
+    vm.createContext(win);
+    const load = () => vm.runInContext(source, win);
+    const flush = () => { while (timers.length) timers.shift()(); };
+    load();
+    flush();
+    return { win, world, calls, listeners, load, flush };
+  };
+  const styles = (r) => r.calls.map((c) => `${c.bar}:${c.style}`).join();
+  const page = (bg) => ({ top: [{ bg: "rgba(0, 0, 0, 0)" }], body: bg });
+
+  assert(styles(run(page("rgb(255, 255, 255)"))) === "StatusBar:LIGHT", "a light page gets dark bar content");
+  assert(styles(run(page("rgb(15, 23, 42)"))) === "StatusBar:DARK", "a dark page gets light bar content");
+  const call = run(page("rgb(15, 23, 42)")).calls[0];
+  assert(call.plugin === "SystemBars" && call.method === "setStyle", "the style goes to SystemBars.setStyle");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.6)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a translucent dark overlay over a light page reads as dark");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.2)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a faint overlay over a light page stays light");
+  assert(styles(run({ top: [{ bg: "rgb(255, 255, 255)" }, { bg: "rgb(0, 0, 0)" }], body: "rgb(0, 0, 0)" })) === "StatusBar:LIGHT", "an opaque layer hides what is under it");
+  assert(styles(run({ top: [{ bg: "oklch(0.2 0 0)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "an oklch() color is read through the canvas");
+  assert(styles(run({ top: [{ bg: "bogus(1)" }], body: "rgb(15, 23, 42)" })) === "StatusBar:DARK", "a color the canvas rejects is ignored");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "transparent", theme: ["#0f172a"] })) === "StatusBar:DARK", "a transparent page falls back to the theme color");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)", theme: ["#ffffff"] })) === "StatusBar:LIGHT", "a light theme color gives dark bar content");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)" })) === "", "nothing known reports nothing");
+  assert(run({ top: [], body: "rgb(255, 255, 255)", capacitor: false }).calls.length === 0, "a page without Capacitor is left alone");
+  assert(styles(run({ ...page("rgb(255, 255, 255)"), reject: true })) === "StatusBar:LIGHT", "a rejected call does not throw");
+  // body and html come back from elementsFromPoint too: a translucent body counts once.
+  assert(styles(run({ top: [{}, "body", "html"], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a translucent body already in the stack is not composited twice");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a body missing from the stack is still counted once");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0 }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a backdrop at opacity 0 is not an overlay");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0.8 }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a backdrop at opacity 0.8 is");
+  // The bottom sample must never reach iOS, where setStyle ignores `bar` and styles the status bar.
+  const sides = { top: [{ bg: "rgb(255, 255, 255)" }], bottom: [{ bg: "rgb(0, 0, 0)" }], body: "rgba(0, 0, 0, 0)" };
+  assert(styles(run(sides)) === "StatusBar:LIGHT", "iOS reports only the top edge");
+  assert(styles(run({ ...sides, platform: "android" })) === "StatusBar:LIGHT,NavigationBar:DARK", "Android reports both edges");
+  assert(run({ ...sides, platform: "android", viewport: "width=device-width" }).calls.length === 0 && run({ ...sides, platform: "android", viewport: null }).calls.length === 0, "Android does nothing without viewport-fit=cover");
+  assert(styles(run({ ...sides, platform: "ios", viewport: "width=device-width" })) === "StatusBar:LIGHT", "iOS leaves the decision to the native side");
+  assert(run({ ...page("rgb(15, 23, 42)"), framed: true }).listeners.length === 0, "a frame does nothing");
+  // Idempotence and change detection: a second load does nothing; a repeat check with the same
+  // color sends nothing; a changed color sends once.
+  const r = run(page("rgb(255, 255, 255)"));
+  const listening = r.listeners.length;
+  r.load();
+  r.flush();
+  assert(r.listeners.length === listening && r.calls.length === 1, "the probe runs once per document");
+  r.win.mutate();
+  r.flush();
+  assert(r.calls.length === 1, "an unchanged color is not sent again");
+  r.world.body.bg = "rgb(15, 23, 42)";
+  r.win.mutate();
+  r.win.mutate();
+  assert(r.win.timers.length === 1, "a burst of mutations queues one check");
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK", "a theme switch is reported once");
+  r.win.__mitraShellBars.recheck();
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK,StatusBar:DARK", "recheck sends the current style again");
 }
 function log(msg) { console.log(`[generate] ${msg}`); }
 function fail(msg) { console.error(`[generate] ERROR: ${msg}`); process.exit(1); }
