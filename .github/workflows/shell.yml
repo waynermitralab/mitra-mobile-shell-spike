@@ -44,6 +44,10 @@ on:
         description: "Declare applinks and webcredentials for the host on iOS (the host must serve the AASA file for sign-in to return to the app)"
         type: boolean
         default: true
+      background_audio:
+        description: "Declare the audio background mode on iOS so a live voice conversation keeps the microphone with the screen locked (only for apps that use it, App Review rejects the mode otherwise)"
+        type: boolean
+        default: false
       push:
         description: "Push notifications: aps entitlement on iOS; on Android only when the GOOGLE_SERVICES_JSON_B64 secret has this app (else Android is built without the push plugin)"
         type: boolean
@@ -83,6 +87,7 @@ env:
   INPUT_VERSION: ${{ inputs.version }}
   INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
   INPUT_ASSOCIATED_DOMAINS: ${{ inputs.associated_domains }}
+  INPUT_BACKGROUND_AUDIO: ${{ inputs.background_audio }}
   INPUT_PUSH: ${{ inputs.push }}
 
 jobs:
@@ -277,6 +282,7 @@ jobs:
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
           [ "$INPUT_ASSOCIATED_DOMAINS" = "true" ] && args+=(--associated-domains)
+          [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/generate.mjs "${args[@]}"
       - name: Unsigned device build
@@ -379,5 +385,6 @@ jobs:
             echo "- build: $INPUT_VERSION ($BUILD_NUMBER)"
             echo "- iOS: $IOS_RESULT"
             echo "- associated domains: $INPUT_ASSOCIATED_DOMAINS"
+            echo "- background audio: $INPUT_BACKGROUND_AUDIO"
             echo "- push: $INPUT_PUSH"
           } >> "$GITHUB_STEP_SUMMARY"

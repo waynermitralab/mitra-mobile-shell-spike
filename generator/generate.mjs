@@ -7,7 +7,7 @@
 //   node generator/generate.mjs --selftest
 //
 //   flags: [--name "..."] [--app-id x.y.z] [--icon <file|url>] [--theme "#0f172a"] [--version 1.0]
-//          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
+//          [--build-number 1] [--associated-domains] [--background-audio] [--auth-hosts a.com,b.com] [--out out]
 //          [--consent-hosts a.com,b.com] [--return-path /oauth/]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
@@ -157,6 +157,7 @@ if (!isVersionName(versionName)) fail(`--version must look like 1, 1.2 or 1.2.3,
 const buildNumber = Number(flags["build-number"] || descriptor.buildNumber || 1);
 if (!Number.isInteger(buildNumber) || buildNumber < 1) fail("--build-number must be a positive integer");
 const associatedDomains = Boolean(flags["associated-domains"] || descriptor.associatedDomains);
+const backgroundAudio = wantIos && Boolean(flags["background-audio"] || descriptor.backgroundAudio);
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
@@ -213,6 +214,7 @@ log(`url      ${url}`);
 log(`theme    ${themeColor}`);
 log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
 log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
+log(`audio    ios background audio ${backgroundAudio ? "on" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
 
@@ -304,7 +306,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, consentHosts, returnPath, callback,
+  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -318,7 +320,7 @@ if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath });
 
 // ---------- 5. iOS patches ----------
-if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
+if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
 
 // ---------- 6. Assets, sync, CI ----------
@@ -327,7 +329,7 @@ if (brand.branch !== "fallback") await finishIcons(projectDir, brand, wantIos);
 run("npx", ["cap", "sync"], projectDir);
 mkdirSync(join(projectDir, ".github", "workflows"), { recursive: true });
 cpSync(join(here, "templates", "github", "mobile.yml"), join(projectDir, ".github", "workflows", "mobile.yml"));
-writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }));
+writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }));
 if (wantPush) {
   mkdirSync(join(projectDir, "app-snippet"), { recursive: true });
   writeFileSync(join(projectDir, "app-snippet", "push-example.html"), pushExampleSnippet());
@@ -677,6 +679,23 @@ function withUsageDescriptions(plist, appName) {
   return plist;
 }
 
+// WebKit mutes microphone capture in a WKWebView app once the screen locks or the app goes to the
+// background, unless Info.plist declares the audio background mode (WebKit bugs 226620 and 233419).
+// It is opt-in because App Review rejects apps that declare the mode without playing or recording in
+// the background (guideline 2.5.4). An existing UIBackgroundModes array is extended, never replaced.
+function withBackgroundAudio(plist, enabled) {
+  if (!enabled) return plist;
+  const existing = /(<key>UIBackgroundModes<\/key>\s*<array>)([\s\S]*?)(<\/array>)/;
+  if (existing.test(plist)) {
+    return plist.replace(existing, (whole, open, items, close) =>
+      /<string>audio<\/string>/.test(items) ? whole : `${open}${items.replace(/\s*$/, "")}\n\t\t<string>audio</string>\n\t${close}`);
+  }
+  if (plist.includes("<key>UIBackgroundModes</key>")) fail("Info.plist has a UIBackgroundModes that is not an array with items, audio was not added");
+  const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  if (anchored === plist) fail("Info.plist layout changed, UIBackgroundModes was not added");
+  return anchored;
+}
+
 // Capacitor's BridgeWebChromeClient asks for these two at runtime when the page calls
 // getUserMedia({ audio: true }), but only a declared permission can be requested. CAMERA is left
 // out on purpose: declaring it makes the camera capture of a file input require the runtime grant,
@@ -789,7 +808,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   if (sdk) writeFileSync(join(dir, "android", "local.properties"), `sdk.dir=${sdk}\n`);
 }
 
-function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
+function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push, brand }) {
   const appDir = join(dir, "ios", "App", "App");
   patchIosSplash(appDir, brand);
   const plistPath = join(appDir, "Info.plist");
@@ -812,6 +831,7 @@ function patchIos(dir, { appName, appId, host, versionName, buildNumber, associa
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
   plist = withUsageDescriptions(plist, appName);
+  plist = withBackgroundAudio(plist, backgroundAudio);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
     plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t<false/>\n\t<key>LSRequiresIPhoneOS</key>");
   }
@@ -1158,7 +1178,7 @@ function offlinePage(name, color) {
 `;
 }
 
-function readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }) {
+function readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }) {
   return `# ${appName} (mobile shell)
 
 Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: change
@@ -1174,6 +1194,7 @@ Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: 
   \`app-snippet/shell-return.html\` in the head of its index.html, and for Android App Links its
   \`public/.well-known/assetlinks.json\` (from \`generator/wellknown.mjs\`).` : `by https callback on the app host (Universal Link),
   which needs the host to serve the apple-app-site-association file.`}
+- Background audio: iOS ${backgroundAudio ? "ON (UIBackgroundModes audio, so a live voice conversation keeps the microphone with the screen locked)" : "off (pass --background-audio only for apps that keep audio going in the background)"}; Android not implemented.
 - Push: iOS ${pushIos ? "on (aps-environment entitlement, AppDelegate hooks)" : "off"}, Android ${pushAndroid ? "on (Firebase config in android/app/google-services.json, not to be committed)" : "off"}.${pushIos || pushAndroid ? " The page uses Capacitor's PushNotifications plugin through the bridge, see \`app-snippet/push-example.html\`." : ""}
 - CI: \`.github/workflows/mobile.yml\` (secrets: Android keystore, App Store Connect API key).
 
@@ -1577,6 +1598,23 @@ function selftest() {
   assert(withBar.includes("UIStatusBarStyleDarkContent") && withBar.split("<key>UIStatusBarStyle</key>").length === 2, "the launch status bar style is added once");
   assert(withLaunchStatusBar(withBar, true) === withBar, "an Info.plist that has the style is left alone");
   assert(withLaunchStatusBar(plist, true).includes("UIStatusBarStyleLightContent"), "a dark splash gets light status bar content");
+  const modesPlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  assert(withBackgroundAudio(modesPlist, false) === modesPlist, "background audio off leaves the Info.plist untouched");
+  const modes = withBackgroundAudio(modesPlist, true);
+  assert(modes.includes("<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>"), "background audio on declares the audio mode before the anchor");
+  assert(withBackgroundAudio(modes, true) === modes, "declaring background audio twice changes nothing");
+  const pushModes = modesPlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>remote-notification</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  const merged = withBackgroundAudio(pushModes, true);
+  assert(merged.includes("<string>remote-notification</string>\n\t\t<string>audio</string>\n\t</array>") && merged.split("<key>UIBackgroundModes</key>").length === 2, "audio joins an existing UIBackgroundModes array and keeps its entries");
+  assert(withBackgroundAudio(merged, true) === merged, "merging into an existing array is idempotent");
+  // fail() exits the process, so it is swapped for a throw while the missing anchor is tried.
+  const realExit = process.exit, realError = console.error;
+  let anchorMissing = false;
+  process.exit = () => { throw new Error("fail() called"); };
+  console.error = () => {};
+  try { withBackgroundAudio("<dict>\n\t<key>CFBundleName</key>\n</dict>", true); } catch (e) { anchorMissing = e.message === "fail() called"; }
+  finally { process.exit = realExit; console.error = realError; }
+  assert(anchorMissing, "a plist without the anchor fails loudly");
   // Nothing compiles the Swift here, so check that every member the file calls is still defined in
   // it (a past edit dropped four of them). The check itself is tried on a mutated copy per name.
   const swift = readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8");

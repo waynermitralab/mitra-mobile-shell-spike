@@ -154,6 +154,18 @@ trusted with it. The store privacy answers (App Privacy in App Store Connect, Da
 Console) are about data collected or shared, not about access: what changes them is whether
 recorded audio or photos leave the device, which depends on what the published app does with them.
 
+### Background audio (`--background-audio`)
+
+WebKit mutes microphone capture in a WKWebView app when the phone is locked or the app goes to the
+background, so a page holding a live voice conversation loses the microphone (WebKit bugs 226620 and
+233419). With `--background-audio` (descriptor key `backgroundAudio`, workflow input
+`background_audio`) the generator adds `audio` to `UIBackgroundModes` in `Info.plist`, merging into
+an array that is already there. It is off by default: Apple rejects apps that declare the audio
+background mode without using it (guideline 2.5.4), so turn it on only for an app that really keeps
+audio going in the background. Android is not covered yet; it needs a foreground service of type
+`microphone`, which is not implemented. Only a real device with the screen locked proves the
+behavior; the selftests and CI check the plist, not WebKit.
+
 ### Account connections in a popup
 
 A page that connects an account (Google, GitHub, Notion, Slack) uses the popup contract of the
@@ -331,6 +343,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
+| `--background-audio` | iOS only: declare the `audio` background mode, see Background audio |
 | `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session on iOS |
 | `--consent-hosts a.com,b.com` | Extra hosts whose `window.open` is an account connection, see Account connections in a popup |
 | `--return-path /oauth/` | Path prefix on the app host where a connection comes back (default `/oauth/`) |
@@ -399,6 +412,7 @@ cannot be read stops, unless `build_number` is given.
 | `version` | `1.0` | Marketing version |
 | `build_number` | empty | Override the build number |
 | `associated_domains` | `true` | Declare `applinks` and `webcredentials` on iOS |
+| `background_audio` | `false` | Generate with `--background-audio` (iOS) |
 | `push` | `false` | Generate with `--push` |
 | `upload_testflight` | `false` | Archive, upload to TestFlight and add the build to the group |
 | `testflight_group` | `Mitra shell testers` | TestFlight group that receives the build |
