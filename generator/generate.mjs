@@ -8,6 +8,7 @@
 //
 //   flags: [--name "..."] [--app-id x.y.z] [--icon <file|url>] [--theme "#0f172a"] [--version 1.0]
 //          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
+//          [--consent-hosts a.com,b.com] [--return-path /oauth/]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
 //          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
@@ -31,6 +32,12 @@
 // bounces the fragment to the scheme (the snippet in app-snippet/, which the app must include).
 // "https" is the Universal Link callback, which needs the host to serve the
 // apple-app-site-association file and --associated-domains.
+//
+// Popup contract (--consent-hosts, --return-path): a page that connects an account calls
+// window.open(consent url) and waits on the window it gets. The shell gives it a real child window,
+// sends the consent to the system browser (hosts: the sign-in hosts, the common providers and the
+// extras given) and loads the return (a path under --return-path, default /oauth/, on the app host)
+// in the child. See the README, "Account connections in a popup".
 //
 // Push (--push): off by default, and then the push plugin is left out of the native projects, so a
 // page that calls it gets "not implemented". iOS needs only the flag (aps-environment entitlement
@@ -101,6 +108,15 @@ const MARK_PADDING = 0.02;
 // Robolectric 4.16 supports Android API 36 and needs JDK 17 or later.
 const ROBOLECTRIC_VERSION = "4.16";
 const ANDROIDX_TEST_CORE_VERSION = "1.7.0";
+// The Auth Tab (AuthTabIntent with an https redirect host and path) first shipped in 1.9. The
+// browser plugin of Capacitor brings the same version, but only as an implementation detail of its
+// own module, so the app declares it for the code it writes itself.
+const ANDROIDX_BROWSER_VERSION = "1.9.0";
+// Hosts that ask for consent when a page of the app connects an account. The platform API host and
+// the auth page host of the sign-in are not here: a window.open to them is not a consent and must
+// keep opening in the system browser.
+const DEFAULT_CONSENT_HOSTS = ["accounts.google.com", "login.microsoftonline.com", "login.live.com", "appleid.apple.com", "github.com", "api.notion.com", "slack.com"];
+const DEFAULT_RETURN_PATH = "/oauth/";
 const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
 
 if (flags.selftest) { selftest(); process.exit(0); }
@@ -164,6 +180,25 @@ const authHosts = [...new Set([
   ...String(flags["auth-hosts"] || "").split(",").map((s) => s.trim()).filter(Boolean),
   ...DEFAULT_AUTH_HOSTS
 ].map((h) => h.toLowerCase()))];
+// Popup contract (see templates/android/ShellPopups.java): a window.open to one of these hosts, made
+// from a page of the app, gets a real child window and its consent goes to the system browser. The
+// list is the default providers plus what the descriptor and the flag add; the app host never is
+// (a window.open to it is the app talking to itself), and the sign-in hosts of --auth-hosts are a
+// different list.
+const appHostName = host.replace(/:\d+$/, "");
+if (descriptor.consentHosts !== undefined && !Array.isArray(descriptor.consentHosts)) fail("consentHosts in the descriptor must be an array of host names");
+const consentHosts = [...new Set([
+  ...DEFAULT_CONSENT_HOSTS,
+  ...(descriptor.consentHosts || []),
+  ...String(flags["consent-hosts"] || "").split(",").map((s) => s.trim()).filter(Boolean)
+].map((h) => String(h).toLowerCase()))].filter((h) => h !== appHostName);
+for (const h of consentHosts) if (!isConsentHost(h)) fail(`consent hosts must be plain host names without port or path, got ${JSON.stringify(h)}`);
+// Where the consent comes back on the app host, and what the App Link of the shell covers.
+const returnPath = String(flags["return-path"] || descriptor.returnPath || DEFAULT_RETURN_PATH);
+// "/" would give the shell the App Link of the whole host again, which takes the return of the sign-in
+// away from an app already in the stores once the host serves assetlinks.json.
+if (returnPath === "/") fail("--return-path must not be /: it would make the App Link cover the whole host, including the return of the sign-in");
+if (!isReturnPath(returnPath)) fail(`--return-path must be a path prefix that starts and ends with / (letters, digits, . _ ~ -), got ${JSON.stringify(returnPath)}`);
 const projectDir = join(outRoot, slug);
 
 validateAppId(appId);
@@ -261,7 +296,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
     // a shift when the page is known to declare cover.
     ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
-    MitraShell: { authHosts, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
+    MitraShell: { authHosts, consentHosts, returnPath, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
   }
 });
@@ -269,7 +304,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, callback,
+  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -280,7 +315,7 @@ run("npx", ["cap", "add", "android"], projectDir);
 if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 
 // ---------- 4. Android patches ----------
-patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand });
+patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath });
 
 // ---------- 5. iOS patches ----------
 if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
@@ -674,32 +709,22 @@ function patchIosSplash(appDir, brand) {
   });
 }
 
-function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand }) {
+function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath }) {
   const app = join(dir, "android", "app");
   patchAndroidSplash(join(app, "src", "main", "res"), brand);
 
-  // Manifest: App Link for the published host, so the sign-in that ends on this host comes
-  // back to the shell instead of staying in Chrome.
+  // Manifest: App Link on the published host, so what ends there in the system browser comes back
+  // to the shell instead of staying in Chrome. With the https sign-in return (no URL scheme) that
+  // is the whole host, because the sign-in ends on any path of it. Otherwise only the return path
+  // of the account connections is claimed, so a link to any other page of the site still opens in
+  // the browser.
   const manifestPath = join(app, "src", "main", "AndroidManifest.xml");
   let manifest = readFileSync(manifestPath, "utf8");
-  const filter = `
-            <!-- App Link for the published app host (needs /.well-known/assetlinks.json there) -->
-            <intent-filter android:autoVerify="true">
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="${host}" />
-            </intent-filter>${callbackScheme ? `
-            <!-- Sign-in return by URL scheme: the app page bounces the SDK fragment here (see app-snippet/) -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="${callbackScheme}" />
-            </intent-filter>` : ""}
+  const filter = `${intentFilters({ host, callbackScheme, returnPath })}
         </activity>`;
   manifest = manifest.replace(/\s*<\/activity>/, () => filter);
   manifest = withAudioPermissions(manifest);
+  manifest = withBrowserQueries(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
     // PushNotifications.requestPermissions().
@@ -716,13 +741,15 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
   writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
-  for (const name of ["MediaPermissionGate.java", "ShellWebChromeClient.java", "ShellSystemBars.java"]) {
-    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host }));
+  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellWebChromeClient.java", "ShellSystemBars.java"]) {
+    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
   }
   // The unit test runs the client above on the real Capacitor classes (Robolectric).
   const testDir = join(app, "src", "test", "java", ...appId.split("."));
   mkdirSync(testDir, { recursive: true });
-  writeFileSync(join(testDir, "ShellWebChromeClientTest.java"), androidTemplate("ShellWebChromeClientTest.java", { appId, host }));
+  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java"]) {
+    writeFileSync(join(testDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
+  }
 
   // build.gradle: version and release signing from the environment.
   const gradlePath = join(app, "build.gradle");
@@ -751,7 +778,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
 `);
     if (!gradle.includes("signingConfigs {")) fail("build.gradle layout changed, signing patch did not apply");
   }
-  gradle = withUnitTestSupport(gradle);
+  gradle = withBrowserDependency(withUnitTestSupport(gradle));
   writeFileSync(gradlePath, gradle);
 
   // local.properties: point Gradle at the SDK on this machine (CI sets ANDROID_HOME itself).
@@ -864,17 +891,27 @@ public class MainActivity extends BridgeActivity {
     // Sign-in return by URL scheme (null when the shell relies on the App Link alone).
     private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
 
-    // Replaces the bridge's own chrome client, once, to make media permission requests safe (see
-    // ShellWebChromeClient). Done here, before the activity starts, because the client registers
-    // activity result launchers when it is created. The same block registers the system bars
-    // listener (see ShellSystemBars), once, because it adds a listener to the bridge.
+    // The popup contract for the pages that connect an account (see ShellPopups).
+    private ShellPopups popups;
+
+    // Replaces the bridge's own chrome client, once, to make media permission requests safe and to
+    // give window.open a real child window (see ShellWebChromeClient and ShellPopups). Done here,
+    // before the activity starts, because both register activity result launchers when they are
+    // created. The same block registers the system bars listener (see ShellSystemBars), once,
+    // because it adds a listener to the bridge.
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         if (getBridge() != null && getBridge().getWebView() != null) {
-            getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge()));
+            popups = new ShellPopups(getBridge());
+            getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge(), popups));
             ShellSystemBars.install(getBridge());
         }
+    }
+
+    // Lets the unit test replace the system browser, which it cannot run.
+    ShellPopups popups() {
+        return popups;
     }
 
     // The bridge re-applies the stored bar styles on a configuration change, which can undo the
@@ -894,6 +931,9 @@ public class MainActivity extends BridgeActivity {
         if (intent == null || getBridge() == null) return;
         Uri data = intent.getData();
         if (data == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        // The return of an account connection the shell sent to the system browser belongs to the
+        // child window of the page, not to the page itself, which must not reload.
+        if (popups != null && popups.onReturnLink(data)) return;
 
         String serverUrl = getBridge().getServerUrl();
         Uri app = Uri.parse(serverUrl != null ? serverUrl : getBridge().getAppUrl());
@@ -915,6 +955,68 @@ public class MainActivity extends BridgeActivity {
     }
 }
 `;
+}
+
+// The intent filters after the launcher one. Only a return path of the app host is claimed when the
+// sign-in returns by URL scheme; the https sign-in return needs the whole host.
+function intentFilters({ host, callbackScheme, returnPath }) {
+  const appLink = callbackScheme
+    ? `
+            <!-- App Link for the return of an account connection (needs /.well-known/assetlinks.json on the host) -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${host}" android:pathPrefix="${returnPath}" />
+            </intent-filter>`
+    : `
+            <!-- App Link for the published app host (needs /.well-known/assetlinks.json there) -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${host}" />
+            </intent-filter>`;
+  return `${appLink}${callbackScheme ? `
+            <!-- Sign-in return by URL scheme: the app page bounces the SDK fragment here (see app-snippet/) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="${callbackScheme}" />
+            </intent-filter>` : ""}`;
+}
+
+// Auth Tab and Custom Tab are found through the package manager, which on Android 11+ only shows
+// what the manifest declares: a browser that handles https and the Custom Tabs service. The browser
+// plugin of Capacitor already merges the second; declared here too so the app does not depend on it.
+function withBrowserQueries(manifest) {
+  if (manifest.includes("android.support.customtabs.action.CustomTabsService") && manifest.includes("<queries>")) return manifest;
+  const queries = `
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+`;
+  const anchored = manifest.replace(/\s*<\/manifest>\s*$/, (tail) => `\n${queries}</manifest>${tail.endsWith("\n") ? "\n" : ""}`);
+  if (anchored === manifest) fail("AndroidManifest layout changed, the browser queries were not added");
+  return anchored;
+}
+
+// The app compiles ShellPopups against androidx.browser, which Capacitor's browser plugin only
+// brings as an implementation detail of its own module. Patching twice changes nothing.
+function withBrowserDependency(gradle) {
+  if (gradle.includes("androidx.browser:browser")) return gradle;
+  const anchored = gradle.replace(/(\n\s*)implementation project\(':capacitor-android'\)/,
+    (line, gap) => `${line}${gap}implementation "androidx.browser:browser:${ANDROIDX_BROWSER_VERSION}"`);
+  if (anchored === gradle) fail("build.gradle layout changed, the browser dependency was not added");
+  return anchored;
 }
 
 // Robolectric runs the generated unit test on a JVM. The resources are needed so that the merged
@@ -943,10 +1045,13 @@ function withUnitTestSupport(gradle) {
 // The Java the shell adds for media permissions lives in templates/android (MediaPermissionGate is
 // pure Java and has a JVM test in generator/test). The package and the app host are substituted
 // through a callback, so no character of them is read as a replacement pattern.
-function androidTemplate(name, { appId, host }) {
+function androidTemplate(name, { appId, host, consentHosts = DEFAULT_CONSENT_HOSTS, returnPath = DEFAULT_RETURN_PATH }) {
   const text = readFileSync(join(here, "templates", "android", name), "utf8")
     .replace(/__PACKAGE__/g, () => appId)
-    .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""));
+    .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""))
+    // Both are validated plain names (isConsentHost, isReturnPath), so JSON.stringify gives valid Java string literals.
+    .replace(/__CONSENT_HOSTS__/g, () => consentHosts.map((h) => JSON.stringify(h)).join(", "))
+    .replace(/__RETURN_PATH__/g, () => returnPath);
   if (/__[A-Z_]+__/.test(text)) fail(`${name} has a placeholder that was not substituted`);
   return text;
 }
@@ -1125,6 +1230,10 @@ function packageSegment(seg) {
   return seg;
 }
 function isVersionName(v) { return /^\d+(\.\d+){0,2}$/.test(v); }
+function isConsentHost(h) { return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(h); }
+// A path prefix of plain segments, so it is safe in the manifest and in a Java string, and the
+// App Link prefix cannot match a sibling ("/oauth/" does not cover "/oauthx").
+function isReturnPath(p) { return /^\/([A-Za-z0-9._~-]+\/)+$/.test(p) && !p.split("/").some((seg) => seg === "." || seg === ".."); }
 function isPlainHost(h) { return /^[a-z0-9.-]+(:\d+)?$/.test(h); }
 function validateAppId(id) {
   const parts = id.split(".");
@@ -1571,6 +1680,8 @@ function selftest() {
   assert(mainJava.split("ShellSystemBars.install(getBridge());").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSystemBars.install("), "MainActivity installs the system bars listener once, after super.onCreate");
   assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes("contentInsetAdjustmentBehavior == .never"), "iOS injects the bar probe only for a page that draws under the bar");
   probeSelftest(assert);
+  const barsTest = androidTemplate("ShellSystemBarsTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsTest.startsWith("package io.example.app;") && barsTest.includes('"https://app.example.com/home"') && barsTest.includes("RobolectricTestRunner") && barsTest.includes("onPageCommitVisible") && barsTest.includes("onConfigurationChanged") && !/__[A-Z_]+__/.test(barsTest), "the system bars Robolectric test is written for the app package and host");
   const gradleFixture = `android {
     buildTypes {
         release {
@@ -1587,6 +1698,28 @@ dependencies {
   const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
   assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
   assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");
+  // Popup contract: options, manifest, dependency, templates.
+  assert(isReturnPath("/oauth/") && !isReturnPath("/") && isReturnPath("/a-b/c_d.e/"), "plain path prefixes are accepted");
+  assert(!isReturnPath("/oauth") && !isReturnPath("oauth/") && !isReturnPath("/a//b/") && !isReturnPath("/../") && !isReturnPath("/a/./") && !isReturnPath('/a"b/') && !isReturnPath("/a b/") && !isReturnPath("/a?x=1/"), "a return path must be a clean prefix that ends with /");
+  assert(isConsentHost("github.com") && isConsentHost("api.notion.com") && !isConsentHost("github.com:443") && !isConsentHost("github.com/x") && !isConsentHost('a"b.com') && !isConsentHost("") && !isConsentHost("-a.com"), "consent hosts are plain names");
+  assert(DEFAULT_CONSENT_HOSTS.includes("github.com") && DEFAULT_CONSENT_HOSTS.includes("api.notion.com") && DEFAULT_CONSENT_HOSTS.includes("slack.com") && DEFAULT_RETURN_PATH === "/oauth/", "the defaults are the common providers and /oauth/");
+  const byScheme = intentFilters({ host: "app.example.com", callbackScheme: "io.example.app", returnPath: "/oauth/" });
+  assert(byScheme.includes('<data android:scheme="https" android:host="app.example.com" android:pathPrefix="/oauth/" />') && !byScheme.includes('android:host="app.example.com" />'), "with the scheme return only the return path is an App Link");
+  assert(byScheme.includes('<data android:scheme="io.example.app" />') && byScheme.split('android:autoVerify="true"').length === 2, "the scheme return stays, and one filter is verified");
+  const byHttps = intentFilters({ host: "app.example.com", callbackScheme: undefined, returnPath: "/oauth/" });
+  assert(byHttps.includes('<data android:scheme="https" android:host="app.example.com" />') && !byHttps.includes("pathPrefix") && !byHttps.includes("io.example.app"), "the https sign-in return keeps the whole host");
+  const queries = withBrowserQueries(androidManifest);
+  assert(queries.includes("<queries>") && queries.includes('<data android:scheme="https" />') && queries.includes("android.support.customtabs.action.CustomTabsService") && queries.trimEnd().endsWith("</manifest>"), "the manifest declares the browser queries");
+  assert(withBrowserQueries(queries) === queries, "adding the browser queries twice changes nothing");
+  const withBrowser = withBrowserDependency(withTests.replace("dependencies {", "dependencies {\n    implementation project(':capacitor-android')"));
+  assert(withBrowser.includes(`androidx.browser:browser:${ANDROIDX_BROWSER_VERSION}`) && withBrowserDependency(withBrowser) === withBrowser, "the app depends on androidx.browser, once");
+  const popupsJava = androidTemplate("ShellPopups.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com", "github.com"], returnPath: "/oauth/" });
+  assert(popupsJava.includes('APP_HOST = "app.example.com";') && popupsJava.includes('CONSENT_HOSTS = { "accounts.google.com", "github.com" };') && popupsJava.includes('RETURN_PATH = "/oauth/";') && !/__[A-Z_]+__/.test(popupsJava), "the popup class takes the host, the consent hosts and the return path");
+  assert(androidTemplate("PopupPolicy.java", { appId: "io.example.app", host: "app.example.com" }).startsWith("package io.example.app;") && !/^import (android|androidx|com\.getcapacitor)/m.test(androidTemplate("PopupPolicy.java", { appId: "io.example.app", host: "app.example.com" })), "the policy has no Android or Capacitor imports, so a plain JVM can test it");
+  assert(mainJava.indexOf("popups = new ShellPopups(getBridge());") > mainJava.indexOf("super.onCreate(savedInstanceState);") && mainJava.indexOf("popups = new ShellPopups(getBridge());") < mainJava.indexOf("setWebChromeClient(new ShellWebChromeClient(getBridge(), popups))"), "MainActivity creates the popups before the chrome client that uses them, after super.onCreate");
+  assert(mainJava.split("popups.onReturnLink(data)").length === 2 && mainJava.indexOf("popups.onReturnLink(data)") < mainJava.indexOf("CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())"), "a return of the popup is taken before the sign-in return logic, which is left as it was");
+  assert(androidTemplate("ShellPopupsTest.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com"], returnPath: "/oauth/" }).includes('RETURN_PATH = "/oauth/";'), "the popup Robolectric test is written for the app");
+  assert(swift.includes("createWebViewWith") && swift.includes("Callback.https(host:"), "the iOS template implements the popup contract");
   console.log("[generate] selftest ok");
 }
 // Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the

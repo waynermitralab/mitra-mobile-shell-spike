@@ -4,7 +4,9 @@ import android.Manifest;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Message;
 import android.webkit.PermissionRequest;
+import android.webkit.WebView;
 
 import androidx.core.content.ContextCompat;
 import androidx.lifecycle.Lifecycle;
@@ -17,7 +19,7 @@ import java.util.Arrays;
 import java.util.List;
 
 // The Android side of MediaPermissionGate (see its comment for why the shell replaces the bridge's
-// chrome client). Everything not about media capture stays the bridge's.
+// chrome client). Besides media it forwards window.open to ShellPopups; everything else stays the bridge's.
 public class ShellWebChromeClient extends BridgeWebChromeClient {
 
     // Only the page of the app itself may capture; frames from other hosts are denied.
@@ -25,10 +27,12 @@ public class ShellWebChromeClient extends BridgeWebChromeClient {
 
     private final Bridge shellBridge;
     private final MediaPermissionGate<PermissionRequest> gate;
+    private final ShellPopups popups;
 
-    public ShellWebChromeClient(Bridge bridge) {
+    public ShellWebChromeClient(Bridge bridge, ShellPopups popups) {
         super(bridge);
         this.shellBridge = bridge;
+        this.popups = popups;
         this.gate = new MediaPermissionGate<>(new MediaPermissionGate.Host<PermissionRequest>() {
             @Override public List<String> needs(PermissionRequest request) { return needsOf(request); }
             @Override public boolean allDeclared(List<String> permissions) { return declared(permissions); }
@@ -71,6 +75,12 @@ public class ShellWebChromeClient extends BridgeWebChromeClient {
     @Override
     public void onPermissionRequest(PermissionRequest request) {
         if (!gate.handle(request)) super.onPermissionRequest(request);
+    }
+
+    // The bridge leaves multiple windows off; the shell turns them on for the popup contract (see ShellPopups).
+    @Override
+    public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+        return popups.onCreateWindow(view, isUserGesture, resultMsg);
     }
 
     @Override

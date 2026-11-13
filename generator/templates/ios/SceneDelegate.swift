@@ -20,10 +20,17 @@ import Capacitor
 // The identity hosts come from capacitor.config.json (plugins.MitraShell.authHosts). Anything
 // else off-host keeps Capacitor's default and opens in the system browser.
 //
-// A third thing is cosmetic: the launch image is a plain color (a storyboard cannot animate), and
+// A third is the popup contract of the browser for the pages that connect an account (Google, GitHub,
+// Notion, Slack): window.open(url) gets a real child window, so the page keeps a window it can watch
+// (.closed) and hear from (postMessage from window.opener). The consent never runs in a web view: it
+// goes to an ASWebAuthenticationSession with an https callback on the app host (iOS 17.4 and later,
+// see ShellPopups), and what comes back loads in the child, whose own page posts to its opener and
+// closes. Below 17.4 Capacitor's behavior stays: window.open goes to the system browser.
+//
+// A fourth thing is cosmetic: the launch image is a plain color (a storyboard cannot animate), and
 // the mark of the app comes in over it, see SplashEntranceView.
 //
-// A fourth keeps the status bar readable: a page that draws under the bar (contentInset never) gets
+// A fifth keeps the status bar readable: a page that draws under the bar (contentInset never) gets
 // shell-bars.js, which reports the color the page paints behind the bar so its content can contrast.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
@@ -81,6 +88,18 @@ class ShellBridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(MitraShellPlugin())
         installBarsProbe()
+        installPopups()
+    }
+
+    // The popup contract needs the https callback of ASWebAuthenticationSession, from iOS 17.4.
+    // Held here because the web view only keeps its UI delegate weakly.
+    private var popups: AnyObject?
+
+    private func installPopups() {
+        guard #available(iOS 17.4, *), let webView = webView else { return }
+        let popups = ShellPopups(shell: self, base: webView.uiDelegate as? NSObject)
+        self.popups = popups
+        webView.uiDelegate = popups
     }
 
     // Under the bar means the page owns what is behind it, and a fixed style chosen at generation
@@ -116,6 +135,17 @@ class ShellBridgeViewController: CAPBridgeViewController {
     // With server.url this is the published host; it is the only host the shell claims.
     var appHost: String? {
         return bridge?.config.serverURL.host?.lowercased()
+    }
+
+    // Hosts whose window.open is a consent for an account connection (plugins.MitraShell.consentHosts).
+    var consentHosts: [String] {
+        return (bridge?.config.getPluginConfig("MitraShell").getArray("consentHosts") ?? [])
+            .compactMap { ($0 as? String)?.lowercased() }
+    }
+
+    // The path prefix on the app host where a connection comes back (plugins.MitraShell.returnPath).
+    var returnPath: String {
+        return bridge?.config.getPluginConfig("MitraShell").getString("returnPath") ?? "/oauth/"
     }
 
     // The URL scheme the sign-in comes back by, when the shell is not relying on the host.
@@ -276,6 +306,199 @@ private extension UIColor {
                   green: CGFloat((value >> 8) & 0xff) / 255,
                   blue: CGFloat(value & 0xff) / 255,
                   alpha: 1)
+    }
+}
+
+// The Android twin is ShellPopups.java and PopupPolicy.java. Only the rules that fit iOS are here:
+// WebKit already refuses a window.open without a user gesture (javaScriptCanOpenWindowsAutomatically
+// stays off), so what is checked is the frame, the host of the page and the host of the URL.
+// The code in the return URL is passed on as is: it is not read, stored or logged here.
+@available(iOS 17.4, *)
+final class ShellPopups: NSObject, WKUIDelegate, WKNavigationDelegate, ASWebAuthenticationPresentationContextProviding {
+    private weak var shell: ShellBridgeViewController?
+    // Capacitor's own UI delegate: everything but window.open stays its.
+    private let base: NSObject?
+    // One child at a time.
+    private var child: WKWebView?
+    private var session: ASWebAuthenticationSession?
+    private var returned = false
+    // The one path this consent comes back on, from the redirect_uri of its URL. The https callback of
+    // the session is not known to match a path prefix (Apple does not say), so it only gets this.
+    private var sessionPath: String?
+
+    // A child that does not close itself after the return would hold the only slot for the rest of the run.
+    private static let reapAfter: TimeInterval = 15
+    private static let closeWait: TimeInterval = 2
+
+    init(shell: ShellBridgeViewController, base: NSObject?) {
+        self.shell = shell
+        self.base = base
+        super.init()
+    }
+
+    // MARK: Forwarding to Capacitor's delegate
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        return super.responds(to: aSelector) || (base?.responds(to: aSelector) ?? false)
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let base = base, base.responds(to: aSelector) { return base }
+        return super.forwardingTarget(for: aSelector)
+    }
+
+    // MARK: window.open
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        // Without a valid redirect_uri there is no exact callback path to hand the session, so the
+        // window opens outside as before instead of registering the prefix and hoping it matches.
+        guard child == nil, let url = navigationAction.request.url, isPopupConsent(navigationAction, url: url),
+              let exactPath = exactReturnPath(in: url) else {
+            return openAsBefore(webView, configuration, navigationAction, windowFeatures)
+        }
+        // The child gets no native bridge: it only has to run the page of the return. A fresh content
+        // controller drops the Capacitor scripts and message handlers the opener's configuration carries.
+        configuration.userContentController = WKUserContentController()
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.navigationDelegate = self
+        popup.uiDelegate = self
+        child = popup
+        returned = false
+        sessionPath = exactPath
+        // After this callback returns: presenting from inside it is not safe.
+        DispatchQueue.main.async { [weak self] in self?.start(url, popup: popup) }
+        return popup
+    }
+
+    // What Capacitor did with a window.open before: the system opens it and the page gets no window.
+    private func openAsBefore(_ webView: WKWebView, _ configuration: WKWebViewConfiguration, _ navigationAction: WKNavigationAction, _ windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard let base = base as? WKUIDelegate else { return nil }
+        return base.webView?(webView, createWebViewWith: configuration, for: navigationAction, windowFeatures: windowFeatures) ?? nil
+    }
+
+    // From the main frame of a page of the app, to a consent host over https.
+    private func isPopupConsent(_ action: WKNavigationAction, url: URL) -> Bool {
+        guard let shell = shell, let appHost = shell.appHost,
+              action.sourceFrame.isMainFrame,
+              let opener = action.sourceFrame.request.url, isAppPage(opener, appHost: appHost),
+              url.scheme?.lowercased() == "https", url.user == nil,
+              let host = url.host?.lowercased() else { return false }
+        return shell.consentHosts.contains(host)
+    }
+
+    private func isAppPage(_ url: URL, appHost: String) -> Bool {
+        return url.scheme?.lowercased() == "https" && url.user == nil && url.host?.lowercased() == appHost
+            && (url.port == nil || url.port == 443)
+    }
+
+    // The return: the app host, inside the return prefix, and the exact path of the session. The
+    // WebView resolves dot segments, so a path that has one could leave the prefix.
+    private func isReturn(_ url: URL) -> Bool {
+        guard let path = returnPath(of: url), path == sessionPath else { return false }
+        return true
+    }
+
+    // The path of a URL of the app host inside the return prefix, made of plain characters (no percent
+    // escape, so no encoded dot, slash or backslash), or nil.
+    private func returnPath(of url: URL) -> String? {
+        guard let shell = shell, let appHost = shell.appHost, isAppPage(url, appHost: appHost),
+              let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath,
+              path.hasPrefix(shell.returnPath),
+              path.range(of: "^[A-Za-z0-9._~/-]+$", options: .regularExpression) != nil,
+              !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        return path
+    }
+
+    // The exact return path of a consent URL: its single redirect_uri parameter, when that is a URL of
+    // the app host inside the return prefix. A repeated parameter is ambiguous, so it gives nil.
+    private func exactReturnPath(in consent: URL) -> String? {
+        let items = (URLComponents(url: consent, resolvingAgainstBaseURL: false)?.queryItems ?? []).filter { $0.name == "redirect_uri" }
+        guard items.count == 1, let value = items[0].value, let redirect = URL(string: value), redirect.fragment == nil else { return nil }
+        return returnPath(of: redirect)
+    }
+
+    // MARK: The consent in the system browser
+
+    private func start(_ url: URL, popup: WKWebView) {
+        guard child === popup, let appHost = shell?.appHost, let exactPath = sessionPath else { return }
+        let callback = ASWebAuthenticationSession.Callback.https(host: appHost, path: exactPath)
+        let session = ASWebAuthenticationSession(url: url, callback: callback) { [weak self] callbackURL, error in
+            guard let self = self, self.child === popup else { return }
+            self.session = nil
+            if let callbackURL = callbackURL, self.isReturn(callbackURL) {
+                self.deliver(callbackURL, to: popup)
+                return
+            }
+            // A URL that is not the return (a browser that matched the path another way) only closes
+            // the window: sending the user back to the consent would be wrong.
+            let cancelled = (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin
+            if callbackURL == nil && !cancelled {
+                // The session could not run, for example because the host is not an associated
+                // domain yet: the system browser, as Capacitor would have done.
+                UIApplication.shared.open(url)
+            }
+            self.close(popup)
+        }
+        session.prefersEphemeralWebBrowserSession = false
+        session.presentationContextProvider = self
+        self.session = session
+        if !session.start() {
+            self.session = nil
+            UIApplication.shared.open(url)
+            close(popup)
+        }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return shell?.view.window ?? ASPresentationAnchor()
+    }
+
+    private func deliver(_ url: URL, to popup: WKWebView) {
+        returned = true
+        popup.load(URLRequest(url: url))
+        DispatchQueue.main.asyncAfter(deadline: .now() + ShellPopups.reapAfter) { [weak self] in
+            if self?.child === popup { self?.discard(popup) }
+        }
+    }
+
+    // The session ended without a return: the child closes itself, so the page sees .closed.
+    private func close(_ popup: WKWebView) {
+        popup.evaluateJavaScript("window.close()") { [weak self] _, _ in self?.discard(popup) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + ShellPopups.closeWait) { [weak self] in self?.discard(popup) }
+    }
+
+    private func discard(_ popup: WKWebView) {
+        if child === popup {
+            child = nil
+            returned = false
+            sessionPath = nil
+            session?.cancel()
+            session = nil
+        }
+        popup.stopLoading()
+        popup.navigationDelegate = nil
+        popup.uiDelegate = nil
+    }
+
+    // MARK: The child window
+
+    func webViewDidClose(_ webView: WKWebView) {
+        if webView === child {
+            discard(webView)
+        } else if let base = base as? WKUIDelegate {
+            base.webViewDidClose?(webView)
+        }
+    }
+
+    // Before the return nothing loads in the child, its own first load included: the consent is not
+    // for a web view. After it, only the app host over https.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === child, returned, let url = navigationAction.request.url,
+              let appHost = shell?.appHost, isAppPage(url, appHost: appHost) else {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
     }
 }
 
