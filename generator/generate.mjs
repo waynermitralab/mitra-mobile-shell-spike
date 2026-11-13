@@ -46,7 +46,9 @@
 // because the plugin crashes the app on register() when Firebase is not configured.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, cpSync, readdirSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, join, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,6 +101,21 @@ const MARK_FRAME = 0.04;
 const BACKGROUND_TOLERANCE = 12;
 const MARK_TOLERANCE = 28;
 const MARK_ALPHA = 40;
+// Below this side a raster logo is upscaled enough to look soft on the 1024 px store icon.
+const SOFT_ICON_PX = 512;
+// A web manifest is a few KB; the cap only keeps a hostile host from filling the memory of the run.
+// Declared up here because the manifest is read during the top-level resolution of the identity.
+const MANIFEST_MAX_BYTES = 1048576;
+const ICON_MAX_BYTES = 10485760;
+// Each attempt is a round trip of up to 15 s, and past the first few the candidates are small
+// variants of the same artwork, so a page with many links cannot hold the generation for minutes.
+const MAX_ICON_ATTEMPTS = 6;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// A failure that is the remote's, as opposed to a bug here: it carries the category to log. The
+// message of a raw error can quote the body or the URL, so it is never logged.
+// Declared with the constants because a class is not hoisted and the downloads run in the
+// top-level flow above the functions that throw it.
+class FetchReason extends Error {}
 // A background that covers less of the picture than this is a gradient or a picture, not a color.
 const MIN_BACKGROUND_SHARE = 0.25;
 // Fringes and soft shadows around the mark are too faint to count as mark, but cut off they leave a hard edge.
@@ -119,7 +136,7 @@ const DEFAULT_CONSENT_HOSTS = ["accounts.google.com", "login.microsoftonline.com
 const DEFAULT_RETURN_PATH = "/oauth/";
 const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
 
-if (flags.selftest) { selftest(); process.exit(0); }
+if (flags.selftest) { selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
 const descriptor = flags.descriptor ? JSON.parse(readFileSync(resolve(flags.descriptor), "utf8")) : {};
 const appUuid = flags.app || descriptor.app;
@@ -160,7 +177,13 @@ const associatedDomains = Boolean(flags["associated-domains"] || descriptor.asso
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
-const iconSource = flags.icon || descriptor.icon || info?.logoUrl || scraped.icon;
+if (descriptor.iconBackground !== undefined && !HEX_COLOR.test(descriptor.iconBackground)) fail(`iconBackground in the descriptor must be a hex color, got ${JSON.stringify(descriptor.iconBackground)}`);
+let iconSource = flags.icon || descriptor.icon || info?.logoUrl;
+// Only the icons of the page (or its manifest) are paired with the manifest's background color: the
+// other sources carry no promise about what sits behind them.
+let pageIcons = [];
+let manifestBackground;
+if (!iconSource && !flags.identity) ({ icons: pageIcons, backgroundColor: manifestBackground } = await pageIcon(scraped));
 const host = new URL(url).host;
 // The host is written into AndroidManifest.xml and the iOS entitlements as is.
 if (!isPlainHost(host)) fail(`Unsupported host in the app URL: ${JSON.stringify(host)}`);
@@ -212,7 +235,13 @@ log(`appId    ${appId}`);
 log(`url      ${url}`);
 log(`theme    ${themeColor}`);
 log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
-log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
+if (!flags.identity) {
+  let iconLine;
+  if (iconSource) iconLine = describe(iconSource);
+  else if (pageIcons.length) iconLine = `${describe(pageIcons[0]).slice(0, 120)} (first of ${pageIcons.length} from the page and its manifest)`;
+  else iconLine = `(none, drawing the initials ${initials(appName, slug)})`;
+  log(`icon     ${iconLine}`);
+}
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
 
@@ -266,19 +295,35 @@ cpSync(join(here, "templates", "shared", "shell-bars.js"), join(projectDir, "www
 
 // Icon: the source logo is kept in assets/ as it came. The files capacitor-assets reads are
 // composed from it in assets/composed/ (see composeBrand), which needs sharp from npm ci.
-const logoPath = await materializeIcon(iconSource, join(projectDir, "assets"), initialsLogoSvg(initials(appName, slug), themeColor));
+const initialsSvg = initialsLogoSvg(initials(appName, slug), themeColor);
+let logoPath;
+if (iconSource) {
+  logoPath = await materializeIcon(iconSource, join(projectDir, "assets"), initialsSvg);
+} else {
+  const used = await materializePageIcon(pageIcons, join(projectDir, "assets"));
+  if (used) {
+    logoPath = used.path;
+    iconSource = used.url;
+  } else {
+    // No page icon worked, so the manifest color has no logo to sit behind.
+    manifestBackground = undefined;
+    logoPath = await materializeIcon(undefined, join(projectDir, "assets"), initialsSvg);
+  }
+}
+const logoBackground = resolveLogoBackground(flags.theme, descriptor.iconBackground, descriptor.themeColor, manifestBackground, themeColor);
+if (logoBackground !== themeColor) log(`backdrop ${logoBackground} (${!flags.theme && descriptor.iconBackground ? "iconBackground of the descriptor" : "manifest background_color"}, behind a logo with no background of its own)`);
 log(`logo     ${logoPath}`);
 run("npm", ["ci", "--no-audit", "--no-fund", "--loglevel=error"], projectDir);
 // Logos are third-party input and any logo used to generate an app, so a composition that fails
 // falls back to handing the plain logo to capacitor-assets, without the entrance.
 let brand;
 try {
-  brand = await composeBrand(projectDir, logoPath, normalizeHex(themeColor));
+  brand = await composeBrand(projectDir, logoPath, normalizeHex(logoBackground));
 } catch (e) {
-  log(`WARNING  the icon could not be composed (${e.message}); using the logo as it is on the theme color, without the splash entrance`);
-  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(themeColor));
+  log(`WARNING  the icon could not be composed (${e.message}); using the logo as it is on ${logoBackground}, without the splash entrance`);
+  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(logoBackground));
 }
-log(`brand    ${{ "fallback": "plain logo on the theme color", "own-background": "the logo has its own background", "transparent-mark": "transparent mark on the theme color", "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
+log(`brand    ${{ "fallback": `plain logo on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "own-background": "the logo has its own background", "transparent-mark": `transparent mark on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
 
 writeJson(join(projectDir, "capacitor.config.json"), {
   appId,
@@ -304,7 +349,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, consentHosts, returnPath, callback,
+  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -378,16 +423,15 @@ function resolveContentInset(override, pageOwnsSafeArea) {
 // other meta does not count either. An unterminated block runs to the end of the text, which keeps
 // every pattern linear: tag patterns exclude "<", so a run of unclosed tags is not rescanned from
 // each start. Only the first 256 KB are looked at, which also bounds the work.
-function pageHandlesSafeArea(html) {
-  const head = html.slice(0, 262144).replace(
+function withoutInertBlocks(html, limit = html.length) {
+  return html.slice(0, limit).replace(
     /<!--(?:-?>|[\s\S]*?(?:-->|$))|<script\b[^<>]*>[\s\S]*?(?:<\/script\s*>|$)|<noscript\b[^<>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, "");
+}
+function pageHandlesSafeArea(html) {
+  const head = withoutInertBlocks(html, 262144);
   let content = null;
   for (const [tag] of head.matchAll(/<meta\b[^<>]*>/gi)) {
-    const attrs = {};
-    for (const m of tag.slice(5).matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
-      const key = m[1].toLowerCase();
-      if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
-    }
+    const attrs = tagAttrs(tag);
     // Browsers apply the last viewport meta.
     if ((attrs.name || "").trim().toLowerCase() === "viewport") content = attrs.content ?? "";
   }
@@ -395,21 +439,195 @@ function pageHandlesSafeArea(html) {
   return content.split(/[,;]/).some((part) => /^viewport-fit\s*=\s*cover$/i.test(part.trim()));
 }
 
+// Attributes of one tag, lowercase names, first occurrence wins (as in a browser).
+function tagAttrs(tag) {
+  const attrs = {};
+  for (const m of tag.replace(/^<[^\s>]*/, "").matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+    const key = m[1].toLowerCase();
+    if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
+  }
+  return attrs;
+}
+
+// Only http(s) and data: leave the page or the manifest; materializeIcon would refuse the rest anyway.
+function resolveIconUrl(href, base) {
+  const h = decodeEntities(String(href).trim());
+  if (/^data:/i.test(h)) return `data:${h.slice(5)}`;
+  try {
+    const u = new URL(h, base);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.toString() : undefined;
+  } catch { return undefined; }
+}
+
+// kind is "svg" or "png", the formats materializeIcon takes, "" for anything that says it is
+// something else, or "unknown" when nothing says (no type, no extension): materializeIcon then
+// decides from the content-type. A declared type wins over the extension, and a data: URI carries
+// its own mime.
+function iconCandidate({ href, type, sizes, base, touch }) {
+  if (!href) return null;
+  const url = resolveIconUrl(href, base);
+  if (!url) return null;
+  const declared = String(type || "").toLowerCase();
+  const label = declared || (url.startsWith("data:") ? (url.match(/^data:([^;,]*)/) || [])[1] : extname(new URL(url).pathname).slice(1).toLowerCase());
+  const kind = !label ? "unknown" : declared || url.startsWith("data:") ? mimeToExt(label) : ["svg", "png"].includes(label) ? label : "";
+  const side = Math.max(0, ...[...String(sizes || "").matchAll(/(\d+)x(\d+)/gi)].map((m) => Math.max(Number(m[1]), Number(m[2]))));
+  return { url, kind, size: side || (touch ? 180 : 32), touch };
+}
+
 function scrape(html, baseUrl) {
   const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
   const themeColor = (html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i) || [])[1];
-  // Prefer the apple-touch-icon (square, no transparency expected), then any rel=icon.
-  const links = [...html.matchAll(/<link\s+[^>]*>/gi)].map((m) => m[0]);
-  const pick = (test) => {
-    for (const tag of links) {
-      const rel = (tag.match(/rel=["']([^"']+)["']/i) || [])[1] || "";
-      if (!test(rel.toLowerCase())) continue;
-      const href = (tag.match(/href=["']([^"']+)["']/i) || [])[1];
-      if (href) return href.startsWith("data:") ? href : new URL(href, baseUrl).toString();
+  const iconCandidates = [];
+  let manifestUrl;
+  for (const [tag] of withoutInertBlocks(html).matchAll(/<link\s+[^>]*>/gi)) {
+    const attrs = tagAttrs(tag);
+    const rel = (attrs.rel || "").toLowerCase();
+    const tokens = rel.split(/\s+/);
+    if (tokens.includes("manifest") && attrs.href && !manifestUrl) {
+      const m = resolveIconUrl(attrs.href, baseUrl);
+      if (m && !m.startsWith("data:")) manifestUrl = m;
     }
+    const touch = rel.includes("apple-touch-icon");
+    // A media-bound icon (a dark scheme variant) is not the app's icon.
+    if ((!touch && !tokens.includes("icon")) || attrs.media) continue;
+    const c = iconCandidate({ href: attrs.href, type: attrs.type, sizes: attrs.sizes, base: baseUrl, touch });
+    if (c) iconCandidates.push(c);
+  }
+  return { title: title && decodeEntities(title.trim()), themeColor, iconCandidates, manifestUrl };
+}
+
+// Maskable and monochrome entries are left out: the generator composes its own safe zone.
+function manifestIconCandidates(manifest, manifestUrl) {
+  const icons = manifest?.icons;
+  if (!Array.isArray(icons)) return [];
+  return icons.flatMap((icon) => {
+    if (!icon || typeof icon.src !== "string") return [];
+    const purposes = typeof icon.purpose === "string" ? icon.purpose.toLowerCase().split(/\s+/).filter(Boolean) : [];
+    if (purposes.length && purposes.every((p) => p === "maskable" || p === "monochrome")) return [];
+    const c = iconCandidate({ href: icon.src, type: icon.type, sizes: icon.sizes, base: manifestUrl, touch: false });
+    return c ? [c] : [];
+  });
+}
+
+// Timeout and size cap for third-party downloads. Any failure of the request or of the body read
+// comes out as a FetchReason; anything else is a bug and propagates.
+async function fetchCapped(url, maxBytes) {
+  let res;
+  const chunks = [];
+  let total = 0;
+  try {
+    res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new FetchReason(`HTTP ${res.status}`);
+    if (Number(res.headers.get("content-length")) > maxBytes) throw new FetchReason(`over ${maxBytes / 1048576} MB`);
+    if (!res.body) throw new FetchReason("no body");
+    for await (const chunk of res.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new FetchReason(`over ${maxBytes / 1048576} MB`);
+      chunks.push(chunk);
+    }
+  } catch (e) {
+    throw e instanceof FetchReason ? e : new FetchReason(`network error (${e.name})`);
+  }
+  return { res, bytes: Buffer.concat(chunks) };
+}
+
+async function pageIcon(scraped) {
+  const manifest = await fetchManifest(scraped.manifestUrl);
+  return { icons: rankIcons([...scraped.iconCandidates, ...manifest.icons]), backgroundColor: manifest.backgroundColor };
+}
+
+// Only a hex color counts: the value ends up in the icon and splash, and a named color would need
+// resolving. The explicit theme of the caller wins, as it does for the theme color itself.
+function manifestBackgroundColor(manifest) {
+  const c = typeof manifest?.background_color === "string" ? manifest.background_color.trim() : "";
+  return HEX_COLOR.test(c) ? c : undefined;
+}
+// --theme, then the iconBackground a previous run recorded, then a themeColor given by the
+// descriptor, then what the manifest asked for, then the resolved theme.
+function resolveLogoBackground(flagTheme, descriptorBackdrop, descriptorTheme, manifestBackground, theme) {
+  if (flagTheme) return theme;
+  if (descriptorBackdrop) return descriptorBackdrop;
+  return descriptorTheme ? theme : manifestBackground || theme;
+}
+
+// The manifest is third-party input and only a better source for the icon, so any failure
+// leaves the page icons to decide.
+async function fetchManifest(manifestUrl) {
+  const none = { icons: [], backgroundColor: undefined };
+  if (!manifestUrl) return none;
+  const note = (why) => log(`manifest ignored (${describe(manifestUrl).slice(0, 120)}): ${why}`);
+  let fetched;
+  try {
+    fetched = await fetchCapped(manifestUrl, MANIFEST_MAX_BYTES);
+  } catch (e) {
+    if (!(e instanceof FetchReason)) throw e;
+    note(e.message);
+    return none;
+  }
+  let json;
+  try { json = JSON.parse(fetched.bytes.toString("utf8")); } catch { note("not JSON"); return none; }
+  if (!Array.isArray(json?.icons)) note("no icons array");
+  return { icons: manifestIconCandidates(json, fetched.res.url || manifestUrl), backgroundColor: manifestBackgroundColor(json) };
+}
+
+// The icon is scaled to 1024 px for the store, so resolution decides how it looks: a vector never
+// goes soft, and among rasters the largest has the least to upscale. The apple-touch-icon wins a
+// tie because it is meant to be an opaque square. The caller tries the list in order, since a
+// candidate can still fail to download or turn out to be something else; a page whose only icons
+// are neither SVG nor PNG (a favicon.ico) has an empty list and gets the drawn initials.
+function rankIcons(candidates) {
+  const byQuality = (a, b) => {
+    if (a.kind === "svg" || b.kind === "svg") return (b.kind === "svg") - (a.kind === "svg");
+    return b.size - a.size
+      || (a.kind === "unknown") - (b.kind === "unknown")
+      || b.touch - a.touch;
   };
-  const icon = pick((r) => r.includes("apple-touch-icon")) || pick((r) => r.split(/\s+/).includes("icon"));
-  return { title: title && decodeEntities(title.trim()), themeColor, icon };
+  return [...new Set(candidates.filter((c) => c.kind).sort(byQuality).map((c) => c.url))];
+}
+
+// What the bytes are, not what the server or the page said.
+// An SVG must have <svg> as its root: an HTML page that merely embeds one (a single-page app
+// answering 200 with its index for a missing icon) is not an icon.
+function sniffIcon(bytes) {
+  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "png";
+  const text = bytes.subarray(0, 65536).toString("utf8").replace(/^\uFEFF/, "");
+  const root = text.replace(/^(?:\s+|<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE\s+svg\b[^>\[]*(?:\[[\s\S]*?\])?\s*>)*/i, "");
+  return /^<svg[\s>/]/i.test(root) ? "svg" : "";
+}
+
+// data: and http(s) sources. The extension comes from the mime or the URL, which is enough for a
+// caller-given source and is checked against the bytes for the icons of the page.
+async function loadIcon(source) {
+  if (source.startsWith("data:")) {
+    const m = source.match(/^data:([^;,]+)(;base64)?,(.*)$/s);
+    if (!m) throw new FetchReason("unreadable data: URI");
+    let bytes;
+    try { bytes = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]), "utf8"); } catch { throw new FetchReason("unreadable data: URI"); }
+    return { bytes, ext: mimeToExt(m[1]) };
+  }
+  const { res, bytes } = await fetchCapped(source, ICON_MAX_BYTES);
+  return { bytes, ext: mimeToExt(res.headers.get("content-type") || "") || extname(new URL(source).pathname).slice(1) || "png" };
+}
+
+// Tries the ranked icons of the page in order and keeps the first that downloads and really is an
+// SVG or a PNG, so one dead link (a stock manifest pointing at a missing logo512.png) does not cost
+// the generation. null when none works.
+async function materializePageIcon(urls, assetsDir) {
+  if (urls.length > MAX_ICON_ATTEMPTS) log(`icon     ${urls.length - MAX_ICON_ATTEMPTS} more candidates will not be tried`);
+  for (const url of urls.slice(0, MAX_ICON_ATTEMPTS)) {
+    try {
+      const { bytes } = await loadIcon(url);
+      const ext = sniffIcon(bytes);
+      if (!ext) throw new FetchReason("not an SVG or a PNG");
+      const target = join(assetsDir, `logo.${ext}`);
+      writeFileSync(target, bytes);
+      return { path: target, url };
+    } catch (e) {
+      if (!(e instanceof FetchReason)) throw e;
+      log(`icon     skipped ${describe(url).slice(0, 120)}: ${e.message}`);
+    }
+  }
+  return null;
 }
 
 async function materializeIcon(source, assetsDir, fallbackSvg) {
@@ -419,16 +637,13 @@ async function materializeIcon(source, assetsDir, fallbackSvg) {
   }
   let bytes;
   let ext;
-  if (String(source).startsWith("data:")) {
-    const m = String(source).match(/^data:([^;,]+)(;base64)?,(.*)$/s);
-    if (!m) fail("Unreadable data: URI in the icon");
-    ext = mimeToExt(m[1]);
-    bytes = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]), "utf8");
-  } else if (/^https?:/.test(source)) {
-    const res = await fetch(source);
-    if (!res.ok) fail(`Icon download failed: ${res.status} ${source}`);
-    ext = mimeToExt(res.headers.get("content-type") || "") || extname(new URL(source).pathname).slice(1) || "png";
-    bytes = Buffer.from(await res.arrayBuffer());
+  if (/^(data:|https?:)/.test(source)) {
+    try {
+      ({ bytes, ext } = await loadIcon(source));
+    } catch (e) {
+      if (e instanceof FetchReason) fail(`Icon download failed: ${e.message}${source.startsWith("data:") ? "" : ` ${describe(source)}`}`);
+      throw e;
+    }
   } else {
     // A path is only read when the caller gave it; the platform and the page are third parties.
     if (source !== (flags.icon || descriptor.icon)) fail(`Icon must be an http(s) or data: URL, got ${JSON.stringify(source)}`);
@@ -456,6 +671,13 @@ async function composeBrand(dir, logoPath, theme) {
     data = await rasterizeLogo(sharp, logoPath, side);
   } catch (e) {
     throw new Error(`the icon could not be read as an image: ${e.message}`);
+  }
+  // Only a warning: a failure here must not send a readable image to the fallback.
+  if (extname(logoPath) !== ".svg") {
+    try {
+      const { width, height } = await sharp(readFileSync(logoPath)).metadata();
+      if (Math.min(width, height) < SOFT_ICON_PX) log(`WARNING  the icon is ${width}x${height} px and will look soft on the store icon and the splash; give an SVG or a PNG of 1024 px (--icon)`);
+    } catch { /* size unknown, no warning */ }
   }
   let px = pixels(data);
   let kind = analyzeLogo(side, px);
@@ -1434,7 +1656,7 @@ function mimeToExt(mime) {
   if (/png/.test(mime)) return "png";
   return "";
 }
-function describe(src) { return String(src).startsWith("data:") ? "inline data: URI from the page" : String(src); }
+function describe(src) { return String(src).startsWith("data:") ? "inline data: URI" : String(src); }
 function decodeEntities(s) { return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'"); }
 function escapeHtml(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function writeJson(p, obj) { writeFileSync(p, JSON.stringify(obj, null, 2) + "\n"); }
@@ -1470,6 +1692,54 @@ function selftest() {
   const svg = initialsLogoSvg("MC", "#ffffff");
   assert(svg.includes(">MC</text>") && svg.includes('fill="#ffffff"') && svg.includes('fill="#0f172a"'), "light logo has dark letters");
   assert(initialsLogoSvg("MC", "#000").includes('fill="#ffffff"'), "dark logo has light letters");
+  const base = "https://crew.mitralab.io/";
+  const pick = (html, manifest) => {
+    const sc = scrape(html, base);
+    return rankIcons([...sc.iconCandidates, ...(manifest ? manifestIconCandidates(manifest, "https://crew.mitralab.io/assets/manifest.webmanifest") : [])])[0];
+  };
+  const PNG180 = "data:image/png;base64,iVBORw0KGgo=";
+  const crew = `<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" sizes="180x180" href="${PNG180}"><link rel="manifest" href="/assets/manifest.webmanifest">`;
+  assert(scrape(crew, base).manifestUrl === "https://crew.mitralab.io/assets/manifest.webmanifest", "the manifest link is found");
+  const crewManifest = { icons: [{ src: "/icone.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }, { src: "/icone-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" }] };
+  assert(pick(crew, crewManifest) === "https://crew.mitralab.io/assets/favicon.svg", "a vector beats the 180 px apple-touch-icon, page before manifest");
+  assert(pick(`<link rel="apple-touch-icon" href="/t.png"><link rel="icon" href="/f.png" sizes="32x32">`) === "https://crew.mitralab.io/t.png", "apple-touch 180 beats icon 32");
+  assert(pick(`<link rel="apple-touch-icon" sizes="180x180" href="/t.png">`, { icons: [{ src: "i512.png", sizes: "512x512", type: "image/png" }] }) === "https://crew.mitralab.io/assets/i512.png", "manifest PNG 512 beats apple-touch 180, resolved against the manifest");
+  assert(pick(`<link rel="icon" href="/f.png" sizes="32x32">`, { icons: [{ src: "/m.svg", purpose: "maskable" }, { src: "/m.png", sizes: "512x512", purpose: "monochrome" }] }) === "https://crew.mitralab.io/f.png", "maskable-only and monochrome-only icons are ignored");
+  assert(pick(`<link rel="shortcut icon" href="/favicon.ico"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/f.png", "an .ico is not chosen over a PNG");
+  assert(pick(`<link rel="icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/t.ico">`) === undefined, "without SVG or PNG there is no candidate");
+  assert(pick(`<link rel="icon" href="/favicon.ico">`) === undefined, "an .ico-only page has no usable icon, so the initials are drawn");
+  assert(pick(`<link rel="icon" type="image/png" sizes="192x192 512x512 48x48" href="/a.png"><link rel="icon" type="image/png" sizes="256x256" href="/b.png">`) === "https://crew.mitralab.io/a.png", "the largest of several sizes in one attribute counts");
+  assert(pick(`<link rel="apple-touch-icon" href="${PNG180}">`) === PNG180, "a data: URI is kept as is");
+  assert(pick(`<link rel='icon' href='img/f.png?v=1&amp;x=2'>`) === "https://crew.mitralab.io/img/f.png?v=1&x=2", "a relative href is resolved against the base and entities decoded");
+  assert(pick(`<link rel="icon" href="javascript:alert(1)"><link rel="icon" href="file:///etc/x.png">`) === undefined, "only http(s) and data: hrefs are taken");
+  assert(pick(`<link rel="icon" type="image/svg+xml" href="/v"><link rel="icon" href="/big.png" sizes="1024x1024">`) === "https://crew.mitralab.io/v", "a typed vector without extension wins over any raster");
+  assert(pick(`<link rel="apple-touch-icon" href="/apple-icon"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/apple-icon", "a link with no type and no extension ranks as a raster of its default size");
+  assert(pick(`<link rel="icon" href="/u" sizes="64x64"><link rel="icon" href="/k.png" sizes="64x64">`) === "https://crew.mitralab.io/k.png", "an unknown kind loses a tie to a known one");
+  assert(pick(`<link rel="icon" type="image/jpeg" href="/a"><link rel="icon" href="/b.jpg">`) === undefined, "a declared other type or extension is unusable");
+  assert(pick(`<!-- <link rel="icon" type="image/svg+xml" href="/dead.svg"> --><script>var x='<link rel="icon" type="image/svg+xml" href="/js.svg">'</script><link rel="icon" href="/live.png" sizes="32x32">`) === "https://crew.mitralab.io/live.png", "links in comments and scripts are not candidates");
+  assert(pick(`<link rel="icon" href="DATA:image/png;base64,AAAA">`) === "data:image/png;base64,AAAA", "an uppercase DATA: scheme is accepted and normalized");
+  assert(pick(`<link rel="icon" href="HTTPS://crew.mitralab.io/u.png">`) === "https://crew.mitralab.io/u.png", "an uppercase HTTPS: scheme is accepted");
+  assert(scrape(`<link rel="manifest" href="data:application/json,{}">`, base).manifestUrl === undefined, "only an http(s) manifest link is followed");
+  assert(manifestIconCandidates({ icons: [{ src: "/p.png", sizes: "512x512", purpose: "any maskable" }] }, base).length === 1, "purpose any maskable is kept");
+  assert(manifestBackgroundColor({ background_color: "#ffffff" }) === "#ffffff" && manifestBackgroundColor({ background_color: " #FFF " }) === "#FFF", "a valid hex manifest background is kept");
+  assert(["white", "rgb(1,2,3)", "#12345", "", 7, null].every((v) => manifestBackgroundColor({ background_color: v }) === undefined) && manifestBackgroundColor({}) === undefined && manifestBackgroundColor(null) === undefined, "a named color, garbage or a missing key is ignored");
+  assert(resolveLogoBackground(undefined, undefined, undefined, "#ffffff", "#009a86") === "#ffffff", "the manifest background beats the resolved theme");
+  assert(resolveLogoBackground("#123456", "#abcdef", "#123456", "#ffffff", "#123456") === "#123456", "--theme beats everything");
+  assert(resolveLogoBackground(undefined, undefined, "#123456", "#ffffff", "#123456") === "#123456", "a descriptor themeColor beats the manifest background");
+  assert(resolveLogoBackground(undefined, "#ffffff", "#009a86", undefined, "#009a86") === "#ffffff", "a recorded iconBackground beats the descriptor themeColor it was recorded with");
+  assert(resolveLogoBackground(undefined, undefined, undefined, undefined, "#009a86") === "#009a86", "no manifest background keeps the theme");
+  assert(manifestIconCandidates({ icons: "x" }, base).length === 0 && manifestIconCandidates(null, base).length === 0, "a manifest without an icons array gives no candidates");
+  const ranked = rankIcons(scrape(`<link rel="icon" href="/f.png" sizes="32x32"><link rel="apple-touch-icon" href="/t.png"><link rel="icon" type="image/svg+xml" href="/v.svg"><link rel="icon" href="/u">`, base).iconCandidates
+    .concat(manifestIconCandidates({ icons: [{ src: "/m512.png", sizes: "512x512" }, { src: "/m.svg", type: "image/svg+xml" }] }, base)));
+  assert(ranked.join(" ") === ["/v.svg", "/m.svg", "/m512.png", "/t.png", "/f.png", "/u"].map((x) => base.slice(0, -1) + x).join(" "), `ranked order is ${ranked.join(" ")}`);
+  assert(sniffIcon(Buffer.from("<?xml version='1.0'?><svg xmlns='x'/>")) === "svg" && sniffIcon(Buffer.concat([PNG_SIGNATURE, Buffer.alloc(4)])) === "png" && sniffIcon(Buffer.from([0, 0, 1, 0, 1, 0])) === "", "the bytes decide whether an icon is SVG or PNG");
+  const sniff = (t) => sniffIcon(Buffer.from(t));
+  assert(sniff("<html><body><svg width='1'></svg></body></html>") === "" && sniff("<!doctype html><svg></svg>") === "", "an HTML page with an embedded svg is not an icon");
+  assert(sniff("<svg xmlns='x'/>") === "svg" && sniff("\uFEFF  \n<?xml version='1.0'?>\n<svg xmlns='x'/>") === "svg" && sniff("<!-- made by x --><svg/>") === "svg" && sniff("<?xml version='1.0'?><!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg/>") === "svg", "a plain svg, with a prolog, a comment or a doctype, is an icon");
+  assert(rankIcons(scrape(`<link rel="icon" href="/a.png" sizes="64x64"><link rel="icon" href="/a.png" sizes="64x64"><link rel="icon" href="/b.png" sizes="32x32">`, base).iconCandidates).length === 2, "the ranked list has no duplicate URLs");
+  assert(pick(`<link rel="icon" href="/dark.svg" type="image/svg+xml" media="(prefers-color-scheme: dark)"><link rel="icon" href="/l.png" sizes="32x32">`) === "https://crew.mitralab.io/l.png", "a media-bound icon is ignored");
+  assert(pick(`<style>${"a{}".repeat(100000)}</style><link rel="icon" href="/late.png">`) === "https://crew.mitralab.io/late.png", "a link after more than 256 KB of markup is still found");
+  assert(manifestIconCandidates({ icons: [null, { src: 3 }, { src: "/ok.png" }] }, base).length === 1, "malformed manifest entries are skipped");
   assert(resolveThemeColor("#ABC", ["#111111"]) === "#ABC", "own color wins");
   assert(throws(() => resolveThemeColor("red", [])), "own color must be hex");
   assert(throws(() => resolveThemeColor("#12345", [])), "5 hex digits are refused");
@@ -1720,7 +1990,6 @@ dependencies {
   assert(mainJava.split("popups.onReturnLink(data)").length === 2 && mainJava.indexOf("popups.onReturnLink(data)") < mainJava.indexOf("CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())"), "a return of the popup is taken before the sign-in return logic, which is left as it was");
   assert(androidTemplate("ShellPopupsTest.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com"], returnPath: "/oauth/" }).includes('RETURN_PATH = "/oauth/";'), "the popup Robolectric test is written for the app");
   assert(swift.includes("createWebViewWith") && swift.includes("Callback.https(host:"), "the iOS template implements the popup contract");
-  console.log("[generate] selftest ok");
 }
 // Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the
 // background-color the page reports for an element; the canvas fake reads "#rrggbb" and
@@ -1827,6 +2096,98 @@ function probeSelftest(assert) {
   r.win.__mitraShellBars.recheck();
   r.flush();
   assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK,StatusBar:DARK", "recheck sends the current style again");
+}
+// The asynchronous icon flow on its real path (fetchManifest, materializePageIcon, pageIcon and the
+// ranking wired as the call site does it) against a server on loopback.
+async function selftestIconFlow() {
+  const assert = (cond, msg) => { if (!cond) fail(`selftest: ${msg}`); };
+  const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const SVG = "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>";
+  const hits = {};
+  const manifest = JSON.stringify({ background_color: "#ffffff", icons: [{ src: "/i/m.png", sizes: "512x512" }, { src: "/i/m.svg", type: "image/svg+xml" }] });
+  const routes = {
+    "/m/ok.json": (res) => res.writeHead(200, { "content-type": "application/manifest+json" }).end(manifest),
+    "/m/text.json": (res) => res.writeHead(200).end("<html>not json"),
+    "/m/big.json": (res) => res.writeHead(200).end(`{"icons":[],"pad":"${"a".repeat(MANIFEST_MAX_BYTES)}"}`),
+    "/i/spa.png": (res) => res.writeHead(200, { "content-type": "text/html" }).end("<html><body><svg width='1'></svg></body></html>"),
+    "/i/fake.png": (res) => res.writeHead(200, { "content-type": "image/png" }).end(Buffer.from("GIF89a not a png")),
+    "/i/real.png": (res) => res.writeHead(200, { "content-type": "image/png" }).end(PNG),
+    "/i/m.svg": (res) => res.writeHead(200, { "content-type": "image/svg+xml" }).end(SVG),
+    // No content-length, so only the capped read can stop it.
+    "/i/huge.png": (res) => {
+      res.on("error", () => {});
+      res.writeHead(200, { "content-type": "image/png" });
+      const chunk = Buffer.alloc(1048576);
+      for (let i = 0; i <= ICON_MAX_BYTES / chunk.length && !res.destroyed; i++) res.write(chunk);
+      res.end();
+    }
+  };
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, "http://x").pathname;
+    hits[path] = (hits[path] || 0) + 1;
+    (routes[path] || ((r) => r.writeHead(404).end("missing")))(res);
+  });
+  const logs = [];
+  const realLog = console.log;
+  const dir = mkdtempSync(join(tmpdir(), "mitra-icon-selftest-"));
+  try {
+    await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    console.log = (m) => logs.push(String(m));
+
+    const ok = await fetchManifest(`${base}/m/ok.json`);
+    assert(ok.backgroundColor === "#ffffff" && ok.icons.length === 2, "a served manifest gives its icons and its background color");
+    for (const bad of ["/m/missing.json", "/m/text.json", "/m/big.json"]) {
+      const r = await fetchManifest(`${base}${bad}`);
+      assert(r.icons.length === 0 && r.backgroundColor === undefined, `${bad} is ignored`);
+    }
+    assert(logs.some((l) => l.includes("HTTP 404")) && logs.some((l) => l.includes("not JSON")) && logs.some((l) => l.includes("over 1 MB")), "each ignored manifest logs its reason");
+
+    // The call site: scrape, then pageIcon, then materializePageIcon.
+    const scraped = scrape(`<link rel="manifest" href="/m/ok.json"><link rel="apple-touch-icon" href="/i/real.png" sizes="180x180">`, base);
+    const wired = await pageIcon(scraped);
+    assert(wired.backgroundColor === "#ffffff" && wired.icons[0] === `${base}/i/m.svg`, "the manifest vector ranks first and its color comes along");
+    const wiredDir = join(dir, "wired");
+    mkdirSync(wiredDir);
+    const used = await materializePageIcon(wired.icons, wiredDir);
+    assert(used && used.url === `${base}/i/m.svg` && readFileSync(used.path, "utf8") === SVG && used.path.endsWith("logo.svg"), "the first usable icon is written as logo.svg");
+
+    // 404, an HTML page with an svg in it, a wrong-bytes png, then the real one.
+    const links = ["404", "spa", "fake", "real"].map((n, i) => `<link rel="icon" href="/i/${n}.png" sizes="${512 >> i}x${512 >> i}">`).join("");
+    const ranked = rankIcons(scrape(links, base).iconCandidates);
+    assert(ranked.length === 4 && ranked[0].endsWith("/404.png") && ranked[3].endsWith("/real.png"), "the bigger declared sizes come first");
+    const skipDir = join(dir, "skip");
+    mkdirSync(skipDir);
+    const fourth = await materializePageIcon(ranked, skipDir);
+    assert(fourth && fourth.url === ranked[3] && fourth.path === join(skipDir, "logo.png") && readFileSync(fourth.path).equals(PNG), "failing candidates are skipped until the real PNG");
+    assert(["/i/404.png", "/i/spa.png", "/i/fake.png", "/i/real.png"].every((x) => hits[x] === 1), "each candidate is requested once, in order");
+    assert(logs.some((l) => l.includes("HTTP 404")) && logs.filter((l) => l.includes("not an SVG or a PNG")).length === 2, "each skipped icon logs its reason");
+
+    // Nothing usable: null, so the caller draws the initials.
+    const noneDir = join(dir, "none");
+    mkdirSync(noneDir);
+    assert(await materializePageIcon(ranked.slice(0, 3), noneDir) === null && readdirSync(noneDir).length === 0, "no usable icon returns null and writes nothing");
+    assert(await materializePageIcon([], noneDir) === null, "an empty list returns null");
+
+    // Attempts are capped.
+    const many = Array.from({ length: MAX_ICON_ATTEMPTS + 3 }, (_, i) => `${base}/i/gone${i}.png`);
+    logs.length = 0;
+    assert(await materializePageIcon(many, noneDir) === null, "candidates that all fail return null");
+    const reached = Object.keys(hits).filter((k) => k.startsWith("/i/gone")).length;
+    assert(reached === MAX_ICON_ATTEMPTS, `only ${MAX_ICON_ATTEMPTS} candidates are requested, got ${reached}`);
+    assert(logs.some((l) => l.includes("3 more candidates will not be tried")), "the untried candidates are logged");
+
+    // The size cap stops a body larger than an icon, and the next candidate is used.
+    const capDir = join(dir, "cap");
+    mkdirSync(capDir);
+    const afterHuge = await materializePageIcon([`${base}/i/huge.png`, `${base}/i/real.png`], capDir);
+    assert(afterHuge && afterHuge.url === `${base}/i/real.png` && logs.some((l) => l.includes("over 10 MB")), "an icon over the size cap is skipped");
+  } finally {
+    console.log = realLog;
+    server.closeAllConnections();
+    await new Promise((done) => server.close(done));
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 function log(msg) { console.log(`[generate] ${msg}`); }
 function fail(msg) { console.error(`[generate] ERROR: ${msg}`); process.exit(1); }

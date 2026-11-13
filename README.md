@@ -36,11 +36,21 @@ node generator/generate.mjs --descriptor path/to/app.json [flags override the fi
 With `--app` the identity comes from the platform:
 `GET {api}/code-studio/api/v1/apps/{app}/info` (public, no token) gives the name, the published
 origins, the accent color and the login logo. With `--url` the name, theme color and icon are
-read from the published page. The app id defaults to `cloud.<brand>.<slug>`. The API base URL
-is `--api`, then the `MITRA_API_URL` environment variable, then `https://beta.mitralab.io`.
+read from the published page. The page icon is the SVG if there is one, else the largest PNG,
+among its `<link rel=icon>`, `apple-touch-icon` and the icons of the web manifest it links
+(maskable and monochrome entries are skipped; an unreachable manifest is ignored). When the page's
+icon is used and that manifest declares a hex `background_color`, it is the color behind a logo
+with no background of its own, unless `--theme` (or the descriptor's `themeColor`) is given. An SVG
+is preferred even over a larger PNG, so to use a specific artwork pass `--icon`. An icon that
+fails to download, or is not an SVG or a PNG, is skipped for the next one (at most 6 are tried).
+The manifest and icon downloads time out at 15 s and are capped at 1 MB (manifest) and 10 MB (icons).
+The app id
+defaults to `cloud.<brand>.<slug>`. The API base URL is `--api`, then the `MITRA_API_URL`
+environment variable, then `https://beta.mitralab.io`.
 
-An app without an icon gets one drawn by the generator: the initials of its name (the first
-letter of the first two words, or the first two letters of a single word) on the theme color.
+An app without an icon, or whose page icons are all unusable (an `.ico` only), gets one drawn by
+the generator: the initials of its name (the first letter of the first two words, or the first two
+letters of a single word) on the theme color.
 
 ### Safe area
 
@@ -323,8 +333,9 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 |---|---|
 | `--name "..."` | App name (default: platform name or page title) |
 | `--app-id x.y.z` | Android application id and iOS bundle id |
-| `--icon <file\|url>` | SVG or PNG icon (default: login logo, page icon, then the initials of the name) |
+| `--icon <file\|url>` | SVG or PNG icon (default: login logo, page icon as above, then the initials of the name). Any raster icon used (page, manifest, login logo or this flag) under 512 px logs a warning, as it will look soft; give an SVG or a 1024 px PNG |
 | `--theme "#0f172a"` | Status bar color, and the splash and icon background when the logo has none of its own, as `#rgb` or `#rrggbb` |
+| `iconBackground` (descriptor only) | Icon and splash background for a logo with none of its own, as a hex color. `mitra-shell.json` records it when the manifest `background_color` was used, so regenerating from that file keeps the color; `--theme` still wins |
 | `--version 1.0`, `--build-number 1` | Marketing version and build number |
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |
