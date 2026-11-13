@@ -32,6 +32,11 @@ jobs:
         run: |
           javac -d "$RUNNER_TEMP/gate" generator/templates/android/MediaPermissionGate.java generator/test/MediaPermissionGateTest.java
           java -cp "$RUNNER_TEMP/gate" __PACKAGE__.MediaPermissionGateTest
+      # The popup policy is pure Java too: the same JVM runs its phases and the URL checks.
+      - name: Test the popup policy
+        run: |
+          javac -d "$RUNNER_TEMP/popup" generator/templates/android/PopupPolicy.java generator/test/PopupPolicyTest.java
+          java -cp "$RUNNER_TEMP/popup" __PACKAGE__.PopupPolicyTest
 
   build:
     runs-on:
@@ -94,6 +99,20 @@ jobs:
           grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' android/app/src/main/AndroidManifest.xml
           grep -q 'android.hardware.microphone" android:required="false"' android/app/src/main/AndroidManifest.xml
           ! grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml
+      # The App Link of the shell is the return path of the account connections, not the whole host:
+      # a link to any other page of the site keeps opening in the browser (--callback scheme, the default).
+      - name: Check the App Link is limited to the return path
+        working-directory: ${{ runner.temp }}/out/cifixture
+        run: |
+          grep -q 'android:pathPrefix="/oauth/"' android/app/src/main/AndroidManifest.xml
+          test "$(grep -c 'android:autoVerify="true"' android/app/src/main/AndroidManifest.xml)" = 1
+          ! grep -q 'android:host="[^"]*" />' android/app/src/main/AndroidManifest.xml
+          node -e 'const c = require("./capacitor.config.json").plugins.MitraShell; process.exit(c.returnPath === "/oauth/" && c.consentHosts.includes("accounts.google.com") && c.consentHosts.includes("github.com") && c.consentHosts.includes("slack.com") && !c.consentHosts.includes("beta.mitralab.io") ? 0 : 1)'
+          node -e 'const d = require("./mitra-shell.json"); process.exit(d.returnPath === "/oauth/" && d.consentHosts.includes("api.notion.com") ? 0 : 1)'
+          grep -q 'androidx.browser:browser' android/app/build.gradle
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellPopups.java
+          test -f android/app/src/main/java/cloud/mitra/cifixture/PopupPolicy.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellPopupsTest.java
       - name: Generate a shell from a page that declares viewport-fit=cover, no override
         run: node generator/generate.mjs --url "$FIXTURE_URL/cover" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-cover"
       - name: Check the detected cover reaches the config
