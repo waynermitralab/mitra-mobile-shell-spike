@@ -101,6 +101,9 @@ const MARK_TOLERANCE = 28;
 const MARK_ALPHA = 40;
 // Below this side a raster logo is upscaled enough to look soft on the 1024 px store icon.
 const SOFT_ICON_PX = 512;
+// A web manifest is a few KB; the cap only keeps a hostile host from filling the memory of the run.
+// Declared up here because the manifest is read during the top-level resolution of the identity.
+const MANIFEST_MAX_BYTES = 1048576;
 // A background that covers less of the picture than this is a gradient or a picture, not a color.
 const MIN_BACKGROUND_SHARE = 0.25;
 // Fringes and soft shadows around the mark are too faint to count as mark, but cut off they leave a hard edge.
@@ -163,7 +166,13 @@ const backgroundAudio = wantIos && Boolean(flags["background-audio"] || descript
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
-const iconSource = flags.icon || descriptor.icon || info?.logoUrl || (flags.identity ? undefined : await pageIcon(scraped));
+let iconSource = flags.icon || descriptor.icon || info?.logoUrl;
+// Only the icon of the page (or its manifest) is paired with the manifest's background color: the
+// other sources carry no promise about what sits behind them.
+let manifestBackground;
+if (!iconSource && !flags.identity) ({ icon: iconSource, backgroundColor: manifestBackground } = await pageIcon(scraped));
+const logoBackground = resolveLogoBackground(flags.theme || descriptor.themeColor, manifestBackground, themeColor);
+if (logoBackground !== themeColor) log(`backdrop ${logoBackground} (manifest background_color, behind a logo with no background of its own)`);
 const host = new URL(url).host;
 // The host is written into AndroidManifest.xml and the iOS entitlements as is.
 if (!isPlainHost(host)) fail(`Unsupported host in the app URL: ${JSON.stringify(host)}`);
@@ -277,12 +286,12 @@ run("npm", ["ci", "--no-audit", "--no-fund", "--loglevel=error"], projectDir);
 // falls back to handing the plain logo to capacitor-assets, without the entrance.
 let brand;
 try {
-  brand = await composeBrand(projectDir, logoPath, normalizeHex(themeColor));
+  brand = await composeBrand(projectDir, logoPath, normalizeHex(logoBackground));
 } catch (e) {
   log(`WARNING  the icon could not be composed (${e.message}); using the logo as it is on the theme color, without the splash entrance`);
-  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(themeColor));
+  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(logoBackground));
 }
-log(`brand    ${{ "fallback": "plain logo on the theme color", "own-background": "the logo has its own background", "transparent-mark": "transparent mark on the theme color", "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
+log(`brand    ${{ "fallback": `plain logo on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "own-background": "the logo has its own background", "transparent-mark": `transparent mark on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
 
 writeJson(join(projectDir, "capacitor.config.json"), {
   appId,
@@ -467,18 +476,28 @@ function manifestIconCandidates(manifest, manifestUrl) {
   });
 }
 
-const MANIFEST_MAX_BYTES = 1048576;
-
 async function pageIcon(scraped) {
-  return pickIcon([...scraped.iconCandidates, ...await fetchManifestIcons(scraped.manifestUrl)]);
+  const manifest = await fetchManifest(scraped.manifestUrl);
+  return { icon: pickIcon([...scraped.iconCandidates, ...manifest.icons]), backgroundColor: manifest.backgroundColor };
+}
+
+// Only a hex color counts: the value ends up in the icon and splash, and a named color would need
+// resolving. The explicit theme of the caller wins, as it does for the theme color itself.
+function manifestBackgroundColor(manifest) {
+  const c = typeof manifest?.background_color === "string" ? manifest.background_color.trim() : "";
+  return HEX_COLOR.test(c) ? c : undefined;
+}
+function resolveLogoBackground(explicitTheme, manifestBackground, theme) {
+  return explicitTheme ? theme : manifestBackground || theme;
 }
 
 // The manifest is third-party input and only a better source for the icon, so any failure
 // leaves the page icons to decide. The log carries the reason category only: an error message can
 // quote the body.
-async function fetchManifestIcons(manifestUrl) {
-  if (!manifestUrl) return [];
-  const skip = (why) => { log(`manifest ignored (${describe(manifestUrl).slice(0, 120)}): ${why}`); return []; };
+async function fetchManifest(manifestUrl) {
+  const none = { icons: [], backgroundColor: undefined };
+  if (!manifestUrl) return none;
+  const skip = (why) => { log(`manifest ignored (${describe(manifestUrl).slice(0, 120)}): ${why}`); return none; };
   let text;
   let res;
   try {
@@ -498,10 +517,12 @@ async function fetchManifestIcons(manifestUrl) {
   }
   let json;
   try { json = JSON.parse(text); } catch { return skip("not JSON"); }
+  const backgroundColor = manifestBackgroundColor(json);
   try {
-    return manifestIconCandidates(json, res.url || manifestUrl);
+    return { icons: manifestIconCandidates(json, res.url || manifestUrl), backgroundColor };
   } catch (e) {
-    return skip(e.message);
+    skip(e.message);
+    return { icons: [], backgroundColor };
   }
 }
 
@@ -1628,6 +1649,11 @@ function selftest() {
   assert(pick(`<link rel="icon" href="HTTPS://crew.mitralab.io/u.png">`) === "https://crew.mitralab.io/u.png", "an uppercase HTTPS: scheme is accepted");
   assert(scrape(`<link rel="manifest" href="data:application/json,{}">`, base).manifestUrl === undefined, "only an http(s) manifest link is followed");
   assert(manifestIconCandidates({ icons: [{ src: "/p.png", sizes: "512x512", purpose: "any maskable" }] }, base).length === 1, "purpose any maskable is kept");
+  assert(manifestBackgroundColor({ background_color: "#ffffff" }) === "#ffffff" && manifestBackgroundColor({ background_color: " #FFF " }) === "#FFF", "a valid hex manifest background is kept");
+  assert(["white", "rgb(1,2,3)", "#12345", "", 7, null].every((v) => manifestBackgroundColor({ background_color: v }) === undefined) && manifestBackgroundColor({}) === undefined && manifestBackgroundColor(null) === undefined, "a named color, garbage or a missing key is ignored");
+  assert(resolveLogoBackground(undefined, "#ffffff", "#009a86") === "#ffffff", "the manifest background beats the resolved theme");
+  assert(resolveLogoBackground("#123456", "#ffffff", "#123456") === "#123456", "an explicit theme beats the manifest background");
+  assert(resolveLogoBackground(undefined, undefined, "#009a86") === "#009a86", "no manifest background keeps the theme");
   assert(throws(() => manifestIconCandidates({ icons: "x" }, base)) && throws(() => manifestIconCandidates(null, base)), "a manifest without an icons array is refused");
   assert(manifestIconCandidates({ icons: [null, { src: 3 }, { src: "/ok.png" }] }, base).length === 1, "malformed manifest entries are skipped");
   assert(resolveThemeColor("#ABC", ["#111111"]) === "#ABC", "own color wins");

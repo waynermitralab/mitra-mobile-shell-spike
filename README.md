@@ -38,7 +38,9 @@ With `--app` the identity comes from the platform:
 origins, the accent color and the login logo. With `--url` the name, theme color and icon are
 read from the published page. The page icon is the SVG if there is one, else the largest PNG,
 among its `<link rel=icon>`, `apple-touch-icon` and the icons of the web manifest it links
-(maskable and monochrome entries are skipped; an unreachable manifest is ignored). The app id
+(maskable and monochrome entries are skipped; an unreachable manifest is ignored). When the page's
+icon is used and that manifest declares a hex `background_color`, it is the color behind a logo
+with no background of its own, unless `--theme` is given. The app id
 defaults to `cloud.<brand>.<slug>`. The API base URL is `--api`, then the `MITRA_API_URL`
 environment variable, then `https://beta.mitralab.io`.
 
