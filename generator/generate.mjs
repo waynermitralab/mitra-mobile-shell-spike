@@ -7,7 +7,7 @@
 //   node generator/generate.mjs --selftest
 //
 //   flags: [--name "..."] [--app-id x.y.z] [--icon <file|url>] [--theme "#0f172a"] [--version 1.0]
-//          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
+//          [--build-number 1] [--associated-domains] [--background-audio] [--auth-hosts a.com,b.com] [--out out]
 //          [--consent-hosts a.com,b.com] [--return-path /oauth/]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
@@ -129,14 +129,20 @@ const ANDROIDX_TEST_CORE_VERSION = "1.7.0";
 // browser plugin of Capacitor brings the same version, but only as an implementation detail of its
 // own module, so the app declares it for the code it writes itself.
 const ANDROIDX_BROWSER_VERSION = "1.9.0";
+// The voice channel is a WebMessageListener on the main WebView. Capacitor uses the same artifact,
+// but as an implementation detail of its own module, so the app declares it for its own code.
+const ANDROIDX_WEBKIT_VERSION = "1.14.0";
 // Hosts that ask for consent when a page of the app connects an account. The platform API host and
 // the auth page host of the sign-in are not here: a window.open to them is not a consent and must
 // keep opening in the system browser.
 const DEFAULT_CONSENT_HOSTS = ["accounts.google.com", "login.microsoftonline.com", "login.live.com", "appleid.apple.com", "github.com", "api.notion.com", "slack.com"];
 const DEFAULT_RETURN_PATH = "/oauth/";
+// Shipped only with --background-audio, see withVoiceService.
+const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
+const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
 const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
 
-if (flags.selftest) { selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
+if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
 const descriptor = flags.descriptor ? JSON.parse(readFileSync(resolve(flags.descriptor), "utf8")) : {};
 const appUuid = flags.app || descriptor.app;
@@ -174,6 +180,8 @@ if (!isVersionName(versionName)) fail(`--version must look like 1, 1.2 or 1.2.3,
 const buildNumber = Number(flags["build-number"] || descriptor.buildNumber || 1);
 if (!Number.isInteger(buildNumber) || buildNumber < 1) fail("--build-number must be a positive integer");
 const associatedDomains = Boolean(flags["associated-domains"] || descriptor.associatedDomains);
+// Platform neutral: iOS gets its plist entry (patchIos) and Android its foreground service (patchAndroid).
+const backgroundAudio = Boolean(flags["background-audio"] || descriptor.backgroundAudio);
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
@@ -242,6 +250,7 @@ if (!flags.identity) {
   else iconLine = `(none, drawing the initials ${initials(appName, slug)})`;
   log(`icon     ${iconLine}`);
 }
+log(`audio    background audio ${backgroundAudio ? "on (ios audio mode, android microphone service)" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
 
@@ -292,6 +301,8 @@ writeFileSync(join(projectDir, "www", "index.html"), offlinePage(appName, themeC
 // The bar probe travels in the bundle (public/shell-bars.js on both platforms) because the page
 // does not know the shell exists; the native side injects it, see templates/shared/shell-bars.js.
 cpSync(join(here, "templates", "shared", "shell-bars.js"), join(projectDir, "www", "shell-bars.js"));
+// Only an app that asked for background audio ships the capture probe (see templates/android/shell-voice.js).
+if (backgroundAudio) cpSync(join(here, "templates", "android", "shell-voice.js"), join(projectDir, "www", "shell-voice.js"));
 
 // Icon: the source logo is kept in assets/ as it came. The files capacitor-assets reads are
 // composed from it in assets/composed/ (see composeBrand), which needs sharp from npm ci.
@@ -349,7 +360,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, authHosts, consentHosts, returnPath, callback,
+  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -360,10 +371,10 @@ run("npx", ["cap", "add", "android"], projectDir);
 if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 
 // ---------- 4. Android patches ----------
-patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath });
+patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath, backgroundAudio });
 
 // ---------- 5. iOS patches ----------
-if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
+if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
 
 // ---------- 6. Assets, sync, CI ----------
@@ -372,7 +383,7 @@ if (brand.branch !== "fallback") await finishIcons(projectDir, brand, wantIos);
 run("npx", ["cap", "sync"], projectDir);
 mkdirSync(join(projectDir, ".github", "workflows"), { recursive: true });
 cpSync(join(here, "templates", "github", "mobile.yml"), join(projectDir, ".github", "workflows", "mobile.yml"));
-writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }));
+writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }));
 if (wantPush) {
   mkdirSync(join(projectDir, "app-snippet"), { recursive: true });
   writeFileSync(join(projectDir, "app-snippet", "push-example.html"), pushExampleSnippet());
@@ -899,6 +910,23 @@ function withUsageDescriptions(plist, appName) {
   return plist;
 }
 
+// WebKit mutes microphone capture in a WKWebView app once the screen locks or the app goes to the
+// background, unless Info.plist declares the audio background mode (WebKit bugs 226620 and 233419).
+// It is opt-in because App Review rejects apps that declare the mode without playing or recording in
+// the background (guideline 2.5.4). An existing UIBackgroundModes array is extended, never replaced.
+function withBackgroundAudio(plist, enabled) {
+  if (!enabled) return plist;
+  const existing = /(<key>UIBackgroundModes<\/key>\s*<array>)([\s\S]*?)(<\/array>)/;
+  if (existing.test(plist)) {
+    return plist.replace(existing, (whole, open, items, close) =>
+      /<string>audio<\/string>/.test(items) ? whole : `${open}${items.replace(/\s*$/, "")}\n\t\t<string>audio</string>\n\t${close}`);
+  }
+  if (plist.includes("<key>UIBackgroundModes</key>")) fail("Info.plist has a UIBackgroundModes that is not an array with items, audio was not added");
+  const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  if (anchored === plist) fail("Info.plist layout changed, UIBackgroundModes was not added");
+  return anchored;
+}
+
 // Capacitor's BridgeWebChromeClient asks for these two at runtime when the page calls
 // getUserMedia({ audio: true }), but only a declared permission can be requested. CAMERA is left
 // out on purpose: declaring it makes the camera capture of a file input require the runtime grant,
@@ -919,6 +947,26 @@ function withAudioPermissions(manifest) {
   return manifest;
 }
 
+// Background audio on Android: a foreground service of type microphone, which Android 14 only
+// accepts with the two foreground service permissions declared, a wake lock so the device does
+// not sleep under the conversation, and POST_NOTIFICATIONS, without which Android 13+ lists the
+// service's notification only in the Task Manager, not in the shade. The service is declared only here, so an app without the option
+// has neither the permissions nor the class (see ShellVoiceService).
+function withVoiceService(manifest) {
+  for (const name of ["android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_MICROPHONE", "android.permission.WAKE_LOCK", "android.permission.POST_NOTIFICATIONS"]) {
+    if (manifest.includes(`android:name="${name}"`)) continue;
+    const anchored = manifest.replace(/([ \t]*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+      `$&\n$1<uses-permission android:name="${name}" />`);
+    if (anchored === manifest) fail(`AndroidManifest layout changed, ${name} was not added`);
+    manifest = anchored;
+  }
+  if (manifest.includes('android:name=".ShellVoiceService"')) return manifest;
+  const anchored = manifest.replace(/([ \t]*)<\/application>/,
+    (closing, indent) => `${indent}    <service android:name=".ShellVoiceService" android:foregroundServiceType="microphone" android:exported="false" />\n${closing}`);
+  if (anchored === manifest) fail("AndroidManifest layout changed, the voice service was not declared");
+  return anchored;
+}
+
 // The mark SceneDelegate animates in over the launch image (see templates/ios/SceneDelegate.swift).
 function patchIosSplash(appDir, brand) {
   if (!brand.iosMark) return;
@@ -931,9 +979,10 @@ function patchIosSplash(appDir, brand) {
   });
 }
 
-function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath }) {
+function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath, backgroundAudio }) {
   const app = join(dir, "android", "app");
   patchAndroidSplash(join(app, "src", "main", "res"), brand);
+  if (backgroundAudio) writeVoiceNotificationIcon(join(app, "src", "main", "res"));
 
   // Manifest: App Link on the published host, so what ends there in the system browser comes back
   // to the shell instead of staying in Chrome. With the https sign-in return (no URL scheme) that
@@ -947,10 +996,12 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   manifest = manifest.replace(/\s*<\/activity>/, () => filter);
   manifest = withAudioPermissions(manifest);
   manifest = withBrowserQueries(manifest);
+  if (backgroundAudio) manifest = withVoiceService(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
     // PushNotifications.requestPermissions().
-    manifest = manifest.replace(/(\s*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+    // --background-audio declares it too, and one line is enough.
+    if (!manifest.includes('android:name="android.permission.POST_NOTIFICATIONS"')) manifest = manifest.replace(/(\s*)<uses-permission android:name="android.permission.INTERNET" \/>/,
       `$&$1<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />`);
     if (!manifest.includes("POST_NOTIFICATIONS")) fail("AndroidManifest layout changed, the notification permission was not added");
     // The Capacitor template applies the google-services Gradle plugin when this file exists.
@@ -962,14 +1013,14 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const javaDir = join(app, "src", "main", "java", ...appId.split("."));
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
-  writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
-  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellWebChromeClient.java", "ShellSystemBars.java"]) {
+  writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme, backgroundAudio));
+  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellWebChromeClient.java", "ShellSystemBars.java", ...(backgroundAudio ? VOICE_CLASSES : [])]) {
     writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
   }
   // The unit test runs the client above on the real Capacitor classes (Robolectric).
   const testDir = join(app, "src", "test", "java", ...appId.split("."));
   mkdirSync(testDir, { recursive: true });
-  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java"]) {
+  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java", ...(backgroundAudio ? VOICE_TESTS : [])]) {
     writeFileSync(join(testDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
   }
 
@@ -1001,6 +1052,10 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
     if (!gradle.includes("signingConfigs {")) fail("build.gradle layout changed, signing patch did not apply");
   }
   gradle = withBrowserDependency(withUnitTestSupport(gradle));
+  if (backgroundAudio) {
+    const variables = join(dirname(app), "variables.gradle");
+    gradle = withWebkitDependency(gradle, existsSync(variables) && readFileSync(variables, "utf8").includes("androidxWebkitVersion"));
+  }
   writeFileSync(gradlePath, gradle);
 
   // local.properties: point Gradle at the SDK on this machine (CI sets ANDROID_HOME itself).
@@ -1011,7 +1066,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   if (sdk) writeFileSync(join(dir, "android", "local.properties"), `sdk.dir=${sdk}\n`);
 }
 
-function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
+function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push, brand }) {
   const appDir = join(dir, "ios", "App", "App");
   patchIosSplash(appDir, brand);
   const plistPath = join(appDir, "Info.plist");
@@ -1034,6 +1089,7 @@ function patchIos(dir, { appName, appId, host, versionName, buildNumber, associa
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
   plist = withUsageDescriptions(plist, appName);
+  plist = withBackgroundAudio(plist, backgroundAudio);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
     plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t<false/>\n\t<key>LSRequiresIPhoneOS</key>");
   }
@@ -1096,7 +1152,7 @@ ${entitlements.join("\n")}
   writeFileSync(pbxPath, pbx);
 }
 
-function mainActivityJava(appId, callbackScheme) {
+function mainActivityJava(appId, callbackScheme, backgroundAudio = false) {
   return `package ${appId};
 
 import android.content.Intent;
@@ -1114,7 +1170,10 @@ public class MainActivity extends BridgeActivity {
     private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
 
     // The popup contract for the pages that connect an account (see ShellPopups).
-    private ShellPopups popups;
+    private ShellPopups popups;${backgroundAudio ? `
+
+    // Runs the foreground service while the page captures audio (see ShellVoiceCapture).
+    private ShellVoiceCapture voice;` : ""}
 
     // Replaces the bridge's own chrome client, once, to make media permission requests safe and to
     // give window.open a real child window (see ShellWebChromeClient and ShellPopups). Done here,
@@ -1127,14 +1186,28 @@ public class MainActivity extends BridgeActivity {
         if (getBridge() != null && getBridge().getWebView() != null) {
             popups = new ShellPopups(getBridge());
             getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge(), popups));
-            ShellSystemBars.install(getBridge());
+            ShellSystemBars.install(getBridge());${backgroundAudio ? `
+            voice = ShellVoiceCapture.install(getBridge());` : ""}
         }
     }
 
     // Lets the unit test replace the system browser, which it cannot run.
     ShellPopups popups() {
         return popups;
+    }${backgroundAudio ? `
+
+    // Lets the unit test play the messages of the page.
+    ShellVoiceCapture voice() {
+        return voice;
     }
+
+    // Capacitor's routing stays first. The answer to the notification permission the voice capture
+    // asked for is the only thing taken from here (see ShellVoiceCapture.onPermissionResult).
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (voice != null) voice.onPermissionResult(requestCode, permissions, grantResults);
+    }` : ""}
 
     // The bridge re-applies the stored bar styles on a configuration change, which can undo the
     // style the page asked for: see ShellSystemBars.recheck.
@@ -1241,6 +1314,36 @@ function withBrowserDependency(gradle) {
   return anchored;
 }
 
+// ShellVoiceCapture compiles against androidx.webkit, which Capacitor only brings as an
+// implementation detail of its own module. Patching twice changes nothing.
+// The version comes from the variable Capacitor's variables.gradle defines when it does, so the app
+// and Capacitor never resolve two webkit versions; the pinned constant is the fallback.
+function withWebkitDependency(gradle, useCapacitorVariable = false) {
+  if (gradle.includes("androidx.webkit:webkit")) return gradle;
+  const version = useCapacitorVariable ? "$androidxWebkitVersion" : ANDROIDX_WEBKIT_VERSION;
+  const anchored = gradle.replace(/(\n\s*)implementation project\(':capacitor-android'\)/,
+    (line, gap) => `${line}${gap}implementation "androidx.webkit:webkit:${version}"`);
+  if (anchored === gradle) fail("build.gradle layout changed, the webkit dependency was not added");
+  return anchored;
+}
+
+// Status bar icons are drawn from the alpha channel only, so the notification of the voice service
+// needs its own monochrome mark; a system drawable would change with the Android version.
+function writeVoiceNotificationIcon(res) {
+  mkdirSync(join(res, "drawable"), { recursive: true });
+  writeFileSync(join(res, "drawable", "ic_stat_voice.xml"), `<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,14c1.66,0 3,-1.34 3,-3L15,5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17.3,11c0,3 -2.54,5.1 -5.3,5.1S6.7,14 6.7,11L5,11c0,3.41 2.72,6.23 6,6.72L11,21h2v-3.28c3.28,-0.48 6,-3.3 6,-6.72h-1.7z" />
+</vector>
+`);
+}
+
 // Robolectric runs the generated unit test on a JVM. The resources are needed so that the merged
 // manifest (declared permissions) and the Capacitor assets are visible to it. Patching twice
 // changes nothing.
@@ -1271,6 +1374,7 @@ function androidTemplate(name, { appId, host, consentHosts = DEFAULT_CONSENT_HOS
   const text = readFileSync(join(here, "templates", "android", name), "utf8")
     .replace(/__PACKAGE__/g, () => appId)
     .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""))
+    .replace(/__APP_PORT__/g, () => (host.match(/:(\d+)$/) || [, "-1"])[1])
     // Both are validated plain names (isConsentHost, isReturnPath), so JSON.stringify gives valid Java string literals.
     .replace(/__CONSENT_HOSTS__/g, () => consentHosts.map((h) => JSON.stringify(h)).join(", "))
     .replace(/__RETURN_PATH__/g, () => returnPath);
@@ -1380,7 +1484,7 @@ function offlinePage(name, color) {
 `;
 }
 
-function readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }) {
+function readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }) {
   return `# ${appName} (mobile shell)
 
 Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: change
@@ -1396,6 +1500,7 @@ Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: 
   \`app-snippet/shell-return.html\` in the head of its index.html, and for Android App Links its
   \`public/.well-known/assetlinks.json\` (from \`generator/wellknown.mjs\`).` : `by https callback on the app host (Universal Link),
   which needs the host to serve the apple-app-site-association file.`}
+- Background audio: ${backgroundAudio ? "ON (iOS: UIBackgroundModes audio; Android: a foreground service of type microphone, with a notification, while the page captures audio; so a live voice conversation keeps the microphone with the screen locked)" : "off (pass --background-audio only for apps that keep audio going in the background)"}.
 - Push: iOS ${pushIos ? "on (aps-environment entitlement, AppDelegate hooks)" : "off"}, Android ${pushAndroid ? "on (Firebase config in android/app/google-services.json, not to be committed)" : "off"}.${pushIos || pushAndroid ? " The page uses Capacitor's PushNotifications plugin through the bridge, see \`app-snippet/push-example.html\`." : ""}
 - CI: \`.github/workflows/mobile.yml\` (secrets: Android keystore, App Store Connect API key).
 
@@ -1680,7 +1785,7 @@ function githubOutputs(obj) {
   try { lines = githubOutputLines(obj); } catch (e) { fail(e.message); }
   writeFileSync(process.env.GITHUB_OUTPUT, lines, { flag: "a" });
 }
-function selftest() {
+async function selftest() {
   const assert = (cond, msg) => { if (!cond) fail(`selftest: ${msg}`); };
   const throws = (fn) => { try { fn(); return false; } catch { return true; } };
   for (const [name, expected] of [["Minha Casa", "MC"], ["ROUTER", "RO"], ["x", "X"], ["Ação Já", "AJ"],
@@ -1847,6 +1952,23 @@ function selftest() {
   assert(withBar.includes("UIStatusBarStyleDarkContent") && withBar.split("<key>UIStatusBarStyle</key>").length === 2, "the launch status bar style is added once");
   assert(withLaunchStatusBar(withBar, true) === withBar, "an Info.plist that has the style is left alone");
   assert(withLaunchStatusBar(plist, true).includes("UIStatusBarStyleLightContent"), "a dark splash gets light status bar content");
+  const modesPlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  assert(withBackgroundAudio(modesPlist, false) === modesPlist, "background audio off leaves the Info.plist untouched");
+  const modes = withBackgroundAudio(modesPlist, true);
+  assert(modes.includes("<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>"), "background audio on declares the audio mode before the anchor");
+  assert(withBackgroundAudio(modes, true) === modes, "declaring background audio twice changes nothing");
+  const pushModes = modesPlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>remote-notification</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  const merged = withBackgroundAudio(pushModes, true);
+  assert(merged.includes("<string>remote-notification</string>\n\t\t<string>audio</string>\n\t</array>") && merged.split("<key>UIBackgroundModes</key>").length === 2, "audio joins an existing UIBackgroundModes array and keeps its entries");
+  assert(withBackgroundAudio(merged, true) === merged, "merging into an existing array is idempotent");
+  // fail() exits the process, so it is swapped for a throw while the missing anchor is tried.
+  const realExit = process.exit, realError = console.error;
+  let anchorMissing = false;
+  process.exit = () => { throw new Error("fail() called"); };
+  console.error = () => {};
+  try { withBackgroundAudio("<dict>\n\t<key>CFBundleName</key>\n</dict>", true); } catch (e) { anchorMissing = e.message === "fail() called"; }
+  finally { process.exit = realExit; console.error = realError; }
+  assert(anchorMissing, "a plist without the anchor fails loudly");
   // Nothing compiles the Swift here, so check that every member the file calls is still defined in
   // it (a past edit dropped four of them). The check itself is tried on a mutated copy per name.
   const swift = readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8");
@@ -1990,6 +2112,176 @@ dependencies {
   assert(mainJava.split("popups.onReturnLink(data)").length === 2 && mainJava.indexOf("popups.onReturnLink(data)") < mainJava.indexOf("CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())"), "a return of the popup is taken before the sign-in return logic, which is left as it was");
   assert(androidTemplate("ShellPopupsTest.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com"], returnPath: "/oauth/" }).includes('RETURN_PATH = "/oauth/";'), "the popup Robolectric test is written for the app");
   assert(swift.includes("createWebViewWith") && swift.includes("Callback.https(host:"), "the iOS template implements the popup contract");
+  // Background audio on Android: manifest, classes, activity wiring, dependency, the script.
+  const appManifest = `<manifest>\n    <application>\n        <activity android:name=".MainActivity" />\n    </application>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
+  const voiceManifest = withVoiceService(withAudioPermissions(appManifest));
+  const voicePermissions = ["FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MICROPHONE", "WAKE_LOCK", "POST_NOTIFICATIONS"].map((n) => `<uses-permission android:name="android.permission.${n}" />`);
+  assert(voicePermissions.every((p) => voiceManifest.includes(p)), "the voice service permissions are declared");
+  assert(voiceManifest.includes('<service android:name=".ShellVoiceService" android:foregroundServiceType="microphone" android:exported="false" />') && voiceManifest.indexOf("<service") < voiceManifest.indexOf("</application>"), "the voice service is declared inside the application, of type microphone and not exported");
+  assert(withVoiceService(voiceManifest) === voiceManifest, "declaring the voice service twice changes nothing");
+  assert(withVoiceService(withVoiceService(appManifest.replace(/\n/g, "\r\n"))).split("ShellVoiceService").length === 2, "a CRLF manifest is patched, once");
+  assert(voiceManifest.split("POST_NOTIFICATIONS").length === 2, "the notification permission is declared once");
+  assert(withVoiceService(appManifest.replace("</manifest>", '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>')).split("POST_NOTIFICATIONS").length === 2, "a manifest that already has the permission (push) is not given a second line");
+  assert(!audio.includes("POST_NOTIFICATIONS"), "without the option and without push the manifest does not declare the notification permission");
+  assert(!audio.includes("FOREGROUND_SERVICE") && !audio.includes("WAKE_LOCK") && !audio.includes("ShellVoiceService"), "without the option the manifest has none of it");
+  const missingAnchor = (fn, text) => {
+    const exit = process.exit, error = console.error;
+    let failed = false;
+    process.exit = () => { throw new Error("fail() called"); };
+    console.error = () => {};
+    try { fn(text); } catch (e) { failed = e.message === "fail() called"; }
+    finally { process.exit = exit; console.error = error; }
+    return failed;
+  };
+  assert(missingAnchor(withVoiceService, "<manifest>\n    <application/>\n</manifest>"), "a manifest without the INTERNET anchor fails loudly");
+  assert(missingAnchor(withVoiceService, '<manifest>\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>'), "a manifest without </application> fails loudly");
+  const voiceMain = mainActivityJava("io.example.app", undefined, true);
+  assert(voiceMain.split("voice = ShellVoiceCapture.install(getBridge());").length === 2 && voiceMain.indexOf("ShellSystemBars.install(getBridge());") < voiceMain.indexOf("ShellVoiceCapture.install(") && voiceMain.includes("ShellVoiceCapture voice() {"), "MainActivity installs the voice capture once, with the option");
+  assert(voiceMain.indexOf("super.onRequestPermissionsResult(requestCode, permissions, grantResults);") < voiceMain.indexOf("voice.onPermissionResult(") && !mainJava.includes("onRequestPermissionsResult"), "the voice MainActivity forwards the permission answer after Capacitor's routing, and only with the option");
+  assert(!mainJava.includes("ShellVoice"), "MainActivity has nothing of the voice service without the option");
+  const voiceVars = { appId: "io.example.app", host: "app.example.com:8443" };
+  const captureJava = androidTemplate("ShellVoiceCapture.java", voiceVars);
+  assert(captureJava.includes('APP_HOST = "app.example.com";') && captureJava.includes('"public/shell-voice.js"') && !/__[A-Z_]+__/.test(captureJava), "the capture class takes the app host and the bundled script");
+  assert(captureJava.includes("RECORD_AUDIO") && captureJava.includes("Lifecycle.State.STARTED") && captureJava.includes("if (!isMainFrame || !matches(origin, APP_HOST, APP_PORT)) return;") && captureJava.includes("addWebMessageListener(bridge.getWebView(), CHANNEL, bridge.getAllowedOriginRules()") && !captureJava.includes("addJavascriptInterface"), "the capture starts only with the permission and a started activity, reads the main frame of the app origin, and uses no JavascriptInterface");
+  assert(captureJava.includes("public void onPageStarted(WebView webView)") && captureJava.includes("onRenderProcessGone") && captureJava.includes("Lifecycle.Event.ON_DESTROY"), "the capture stops on a new page, a dead renderer and a destroyed activity");
+  assert(!androidTemplate("ShellPopups.java", voiceVars).includes("mitraShellVoice") && !androidTemplate("ShellPopups.java", voiceVars).includes("ShellVoice"), "the popup child windows never get the voice channel");
+  const serviceJava = androidTemplate("ShellVoiceService.java", voiceVars);
+  assert(serviceJava.includes("FOREGROUND_SERVICE_TYPE_MICROPHONE") && serviceJava.includes("START_NOT_STICKY") && serviceJava.includes("PARTIAL_WAKE_LOCK") && serviceJava.includes("wakeLock.release()") && serviceJava.includes("IMPORTANCE_LOW") && serviceJava.includes("Conversa por voz em andamento") && serviceJava.includes("FOREGROUND_SERVICE_IMMEDIATE") && !serviceJava.includes("POST_NOTIFICATIONS"), "the service is a sticky-less microphone service with a low importance notification shown at once, a wake lock released on destroy, and no runtime permission request of its own");
+  assert(captureJava.includes("POST_NOTIFICATIONS") && captureJava.includes("TIRAMISU"), "the capture asks for the notification permission on Android 13+");
+  for (const name of [...VOICE_TESTS]) assert(androidTemplate(name, voiceVars).startsWith("package io.example.app;") && !/__[A-Z_]+__/.test(androidTemplate(name, voiceVars)), `${name} is written for the app`);
+  const webkitGradle = withWebkitDependency(withBrowser);
+  assert(webkitGradle.includes(`androidx.webkit:webkit:${ANDROIDX_WEBKIT_VERSION}`) && withWebkitDependency(webkitGradle) === webkitGradle, "the app depends on androidx.webkit, once");
+  const variableGradle = withWebkitDependency(withBrowser, true);
+  assert(variableGradle.includes('androidx.webkit:webkit:$androidxWebkitVersion"') && !variableGradle.includes(ANDROIDX_WEBKIT_VERSION), "the webkit version comes from Capacitor's variable when it defines one");
+  assert(serviceJava.includes("R.drawable.ic_stat_voice") && !serviceJava.includes("android.R.drawable"), "the notification uses the shipped monochrome icon");
+  assert(captureJava.includes("addDocumentStartJavaScript") && captureJava.includes("DOCUMENT_START_SCRIPT") && captureJava.includes("START_DELAY_MS"), "the capture injects at document start when it can and debounces the start");
+  const portCapture = androidTemplate("ShellVoiceCapture.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(portCapture.includes('APP_HOST = "app.example.com";') && portCapture.includes("APP_PORT = 8443;") && androidTemplate("ShellVoiceCapture.java", { appId: "io.example.app", host: "app.example.com" }).includes("APP_PORT = -1;"), "the capture keeps the port of the published URL, and -1 without one");
+  assert(portCapture.includes("originRule(APP_HOST, APP_PORT)") && !portCapture.includes('"https://" + APP_HOST)'), "the document start rule is built from host and port");
+  await voiceSelftest(assert);
+}
+// Runs templates/android/shell-voice.js in a vm against a fake getUserMedia. A track is a plain
+// object with readyState, an "ended" listener list and the browser's own stop(), which ends it
+// without firing "ended", as the real one does.
+async function voiceSelftest(assert) {
+  const source = readFileSync(join(here, "templates", "android", "shell-voice.js"), "utf8");
+  assert(!/[^\x00-\x7f]/.test(source), "shell-voice.js is ASCII");
+  const makeTrack = (kind) => {
+    const track = { kind, readyState: "live", listeners: [], addEventListener(name, fn) { if (name === "ended") this.listeners.push(fn); } };
+    track.stop = function () { this.readyState = "ended"; };
+    track.end = function () { this.readyState = "ended"; this.listeners.forEach((fn) => fn()); };
+    return track;
+  };
+  const makeStream = (...tracks) => ({ tracks, getAudioTracks: () => tracks.filter((t) => t.kind === "audio") });
+  const run = ({ channel = true, framed = false, mediaDevices = true } = {}) => {
+    const messages = [], intervals = [];
+    const world = { next: null };
+    const devices = {
+      calls: [],
+      getUserMedia(...args) { this.calls.push({ self: this, args }); return world.next; }
+    };
+    const win = {
+      setInterval: (fn) => { intervals.push(fn); return intervals.length; },
+      clearInterval: (id) => { intervals[id - 1] = null; },
+      navigator: mediaDevices ? { mediaDevices: devices } : {},
+      mitraShellVoice: channel ? { postMessage: (m) => messages.push(m) } : undefined
+    };
+    win.window = win;
+    win.top = framed ? {} : win;
+    vm.createContext(win);
+    const load = () => vm.runInContext(source, win);
+    load();
+    // The page's call: the promise it gets, awaited the way a page does, so the script's own
+    // handler has run when this returns.
+    const call = async (outcome, ...args) => {
+      world.next = outcome;
+      const promise = win.navigator.mediaDevices.getUserMedia(...args);
+      return { promise, settled: await promise.then((v) => ({ value: v }), (e) => ({ error: e })) };
+    };
+    return { win, devices, messages, intervals, load, call };
+  };
+  // The page's side: same promise, same stream, receiver and arguments handed through.
+  let r = run();
+  let a = makeTrack("audio");
+  const stream = makeStream(a);
+  const resolved = Promise.resolve(stream);
+  const first = await r.call(resolved, { audio: true }, "extra");
+  assert(first.promise === resolved && first.settled.value === stream, "the page gets the same promise and the same stream");
+  assert(r.devices.calls.length === 1 && r.devices.calls[0].self === r.devices && r.devices.calls[0].args[1] === "extra", "the original is called with the same receiver and arguments");
+  assert(r.messages.join() === "capturing", "a resolved call with a live audio track reports capturing, once");
+  {
+    // stop() through the wrapper installed on the track.
+    r = run();
+    a = makeTrack("audio");
+    const originalStop = a.stop;
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(a.stop !== originalStop && r.messages.join() === "capturing", "the track is watched");
+    a.stop();
+    assert(r.messages.join() === "capturing,idle" && a.readyState === "ended", "stop() called by the page reports idle and still stops the track");
+    // ended event.
+    r = run();
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    a.end();
+    assert(r.messages.join() === "capturing,idle", "an ended track reports idle");
+    // Two tracks: idle only after the last one.
+    r = run();
+    a = makeTrack("audio");
+    const b = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a, b)), { audio: true });
+    a.stop();
+    assert(r.messages.join() === "capturing", "one live track left is still capturing");
+    b.end();
+    assert(r.messages.join() === "capturing,idle", "the last one ends it");
+    // A second call while the first is live does not report twice.
+    r = run();
+    a = makeTrack("audio");
+    const c = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    await r.call(Promise.resolve(makeStream(c)), { audio: true });
+    assert(r.messages.join() === "capturing", "a second stream while capturing reports nothing new");
+    a.stop();
+    c.stop();
+    assert(r.messages.join() === "capturing,idle", "both stopped is idle");
+    // The poll finds a track stopped through the prototype.
+    r = run();
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(r.intervals.length === 1 && r.intervals[0], "a poll runs while something is live");
+    a.readyState = "ended";
+    r.intervals[0]();
+    assert(r.messages.join() === "capturing,idle" && r.intervals[0] === null, "the poll reports a track that ended silently and stops itself");
+    // Video only, and no live track.
+    r = run();
+    await r.call(Promise.resolve(makeStream(makeTrack("video"))), { video: true });
+    const dead = makeTrack("audio");
+    dead.readyState = "ended";
+    await r.call(Promise.resolve(makeStream(dead)), { audio: true });
+    assert(r.messages.length === 0, "a video-only stream and an ended audio track never report");
+    // Rejection: same promise, same error, nothing reported.
+    r = run();
+    const failure = new Error("NotAllowedError");
+    const rejected = Promise.reject(failure);
+    const out = await r.call(rejected, { audio: true });
+    assert(out.promise === rejected && out.settled.error === failure && r.messages.length === 0, "a rejection reaches the page unchanged and reports nothing");
+    // Double injection is one wrapper.
+    r = run();
+    const wrapper = r.win.navigator.mediaDevices.getUserMedia;
+    r.load();
+    assert(r.win.navigator.mediaDevices.getUserMedia === wrapper, "a second injection leaves the same wrapper");
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(r.messages.join() === "capturing" && r.devices.calls.length === 1, "one wrapper means one report and one underlying call");
+    // Nothing to do without the channel, in a frame, or without mediaDevices.
+    for (const [name, options] of [["a channel", { channel: false }], ["the top window", { framed: true }], ["mediaDevices", { mediaDevices: false }]]) {
+      const bare = run(options);
+      assert(!bare.win.__mitraShellVoice, `without ${name} the script does not install`);
+    }
+    const noChannel = run({ channel: false });
+    noChannel.win.mitraShellVoice = { postMessage: (m) => noChannel.messages.push(m) };
+    noChannel.load();
+    assert(noChannel.win.__mitraShellVoice === true, "a later injection that finds the channel installs");
+  }
 }
 // Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the
 // background-color the page reports for an element; the canvas fake reads "#rrggbb" and

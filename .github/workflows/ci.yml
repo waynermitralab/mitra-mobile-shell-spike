@@ -134,4 +134,46 @@ jobs:
           test "$(grep -c '<key>NSCameraUsageDescription</key>' ios/App/App/Info.plist)" = 1
           grep -q 'CI Fixture usa o microfone' ios/App/App/Info.plist
           test -f ios/App/App/public/shell-bars.js
+          test "$(grep -c '<key>UIBackgroundModes</key>' ios/App/App/Info.plist)" = 0
+          ! grep -q 'FOREGROUND_SERVICE' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'WAKE_LOCK' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'POST_NOTIFICATIONS' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'ShellVoiceService' android/app/src/main/AndroidManifest.xml
+          ! test -e android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+          ! test -e www/shell-voice.js
+          ! grep -q 'ShellVoiceCapture' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java
+          ! grep -q 'androidx.webkit' android/app/build.gradle
+          ! test -e android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceCapture.java
+      - name: Generate a shell with background audio
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --background-audio --out "$RUNNER_TEMP/out-audio"
+      - name: Check the audio background mode
+        working-directory: ${{ runner.temp }}/out-audio/cifixture
+        run: |
+          test "$(grep -c '<key>UIBackgroundModes</key>' ios/App/App/Info.plist)" = 1
+          grep -q '<string>audio</string>' ios/App/App/Info.plist
+          node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
+          grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' android/app/src/main/AndroidManifest.xml
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+      # The option is the same on both platforms: with iOS off it still gives Android its foreground
+      # service, which the generated project tests on the real Capacitor classes.
+      - name: Generate a shell with background audio (Android only)
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --background-audio --out "$RUNNER_TEMP/out-voice"
+      - name: Run the unit tests of the generated project with the voice service
+        working-directory: ${{ runner.temp }}/out-voice/cifixture/android
+        run: ./gradlew --no-daemon testDebugUnitTest
+      - name: Check the microphone foreground service
+        working-directory: ${{ runner.temp }}/out-voice/cifixture
+        run: |
+          grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.FOREGROUND_SERVICE"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.WAKE_LOCK' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:foregroundServiceType="microphone"' android/app/src/main/AndroidManifest.xml
+          test "$(grep -c 'android:name=".ShellVoiceService"' android/app/src/main/AndroidManifest.xml)" = 1
+          ! test -e ios
+          test -f www/shell-voice.js
+          test -f android/app/src/main/assets/public/shell-voice.js
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellVoiceCaptureTest.java
+          test "$(grep -c 'ShellVoiceCapture.install(getBridge())' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
+          node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
 

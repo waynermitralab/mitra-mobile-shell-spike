@@ -164,6 +164,83 @@ trusted with it. The store privacy answers (App Privacy in App Store Connect, Da
 Console) are about data collected or shared, not about access: what changes them is whether
 recorded audio or photos leave the device, which depends on what the published app does with them.
 
+### Background audio (`--background-audio`)
+
+A page holding a live voice conversation (getUserMedia audio plus WebRTC playback) keeps playing
+with the phone locked, but both platforms silence the microphone of an app that is not in the
+foreground. With `--background-audio` (descriptor key `backgroundAudio`, workflow input
+`background_audio`) the generator handles both, and the option is the same on both platforms, so it
+also applies with `--no-ios`. It is off by default, and with it off none of what follows is in the
+app. Turn it on only for an app that really keeps audio going in the background.
+
+**iOS.** WebKit mutes microphone capture in a WKWebView app when the phone is locked or the app goes
+to the background (WebKit bugs 226620 and 233419). The generator adds `audio` to `UIBackgroundModes`
+in `Info.plist`, merging into an array that is already there. Apple rejects apps that declare the
+mode without using it (guideline 2.5.4).
+
+**Android.** Android silences capture for an app that is not in the foreground unless it runs a
+foreground service of type `microphone`. The shell runs one exactly while the page is capturing:
+
+- The manifest gets `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `WAKE_LOCK` and
+  `POST_NOTIFICATIONS` (one line even with `--push`), and declares `.ShellVoiceService`
+  (`foregroundServiceType="microphone"`, not exported). On Android 13+ the first "capturing" of a
+  process asks for `POST_NOTIFICATIONS` when it is not granted, because without it the notification
+  is listed only in the Task Manager and not in the shade. The service does not wait for the answer,
+  and a denial only hides the notification (it is not asked again in the same process).
+- Detection needs no change in the page. `shell-voice.js` (bundled as `public/shell-voice.js`, injected by
+  `ShellVoiceCapture` with `addDocumentStartJavaScript` for the app origin when the WebView supports
+  `DOCUMENT_START_SCRIPT`, otherwise with `evaluateJavascript` on the app host's pages at
+  `onPageCommitVisible`, once per document) wraps
+  `navigator.mediaDevices.getUserMedia` and watches the live audio tracks it hands out. It reports
+  "capturing" when a call resolves with at least one live audio track and "idle" when the last one is
+  gone: the track fires `ended`, or the page calls `stop()` (which does not fire `ended`, so the track's
+  `stop` is wrapped on the instance), or a poll every 2 seconds finds a track that ended without
+  either (`stop()` called through the prototype). The wrapper returns the same promise, resolves
+  with the same stream and rejects with the same error; a rejection, a video-only stream or a track
+  that is already ended never reports. Not covered: `getDisplayMedia`, the old callback
+  `getUserMedia`, and a page that stops the original track while a `clone()` of it keeps capturing.
+- The report reaches native code through a `WebMessageListener` named `mitraShellVoice`, added to the
+  main WebView with the origin rules of the Capacitor bridge. The native side then accepts a message
+  only from the main frame of the app host, and only the two literal strings "capturing" and "idle".
+  It is not a `JavascriptInterface`, which every frame of every page could call, and the child windows
+  of the popup contract never get it. If adding the listener fails, one line is logged (tag
+  `ShellVoice`) and the feature stays off. A WebView without `WEB_MESSAGE_LISTENER` support leaves the feature
+  off, and the conversation works as before.
+- On "capturing" the start waits about 1 second, so a page that probes the microphone and lets go
+  of it at once never starts a service ("idle" inside the window cancels it). The service starts only
+  if `RECORD_AUDIO` is granted (Android 14 throws otherwise) and the activity is started (a service
+  started from the background is refused); a start refused for that reason is retried when the activity
+  next starts, as long as the page is still capturing. On "idle" it stops after a grace period of 8
+  seconds (a new "capturing" cancels it), because with the screen locked a stopped service cannot come
+  back and pages reopen the microphone on a reconnect or a device change. A service that did not
+  yet reach `startForeground` is never stopped (Android kills the app for that): `onStartCommand`
+  always goes foreground first and then stops itself if the request was withdrawn. It also stops when the
+  main frame starts loading a page, when the WebView renderer dies and when the activity is destroyed;
+  any exception from the system is caught, leaving the conversation as it was without the service.
+- The page is third-party code and can report "capturing" without recording, so every 30 seconds the
+  service asks `AudioManager.getActiveRecordingConfigurations()` whether the app has an active
+  recording and stops after two checks in a row without one (assumption: the in-process capture of the
+  WebView is listed there for the app). The list cannot be narrowed to this app (other apps' recordings
+  appear with their client details hidden), so the check bounds a page that fakes capture only while no
+  other app is recording. The same check renews the wake lock, which is acquired with a
+  timeout of 75 seconds instead of unbounded.
+- `ShellVoiceService` shows an ongoing, low importance notification on its own channel (the app name and
+  "Conversa por voz em andamento"; a tap brings the app back) with a monochrome microphone icon
+  (`ic_stat_voice`, shipped by the generator), holds a `PARTIAL_WAKE_LOCK` for as long as it runs,
+  releases it on stop and destroy, and is `START_NOT_STICKY`.
+- Capacitor does not pause the WebView when the activity stops (`KeepRunning` defaults to true, see
+  `Bridge.shouldKeepRunning()`; the generator does not set it), so the page's JavaScript and WebRTC
+  keep running under lock. The service is all that is missing.
+
+Google Play requires a foreground service declaration in Play Console (App content, Foreground
+service permissions) for an app that declares `FOREGROUND_SERVICE_MICROPHONE`: the task is a live
+voice conversation the user started, and the app shows the notification while it runs. The console
+also asks for a short demo video of the feature in use. Only a real
+device with the screen locked proves the behavior (the microphone staying live on Android, the
+notification, a start from the background, OEM battery limits on a long call); the selftests, the
+Robolectric tests of the generated project and CI check the manifest, the script and the service
+logic, not Chromium or WebKit.
+
 ### Account connections in a popup
 
 A page that connects an account (Google, GitHub, Notion, Slack) uses the popup contract of the
@@ -342,6 +419,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
+| `--background-audio` | Keep the microphone of a live voice conversation with the screen locked: the `audio` background mode on iOS, a microphone foreground service on Android, see Background audio |
 | `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session on iOS |
 | `--consent-hosts a.com,b.com` | Extra hosts whose `window.open` is an account connection, see Account connections in a popup |
 | `--return-path /oauth/` | Path prefix on the app host where a connection comes back (default `/oauth/`) |
@@ -410,6 +488,7 @@ cannot be read stops, unless `build_number` is given.
 | `version` | `1.0` | Marketing version |
 | `build_number` | empty | Override the build number |
 | `associated_domains` | `true` | Declare `applinks` and `webcredentials` on iOS |
+| `background_audio` | `false` | Generate with `--background-audio` (iOS and Android) |
 | `push` | `false` | Generate with `--push` |
 | `upload_testflight` | `false` | Archive, upload to TestFlight and add the build to the group |
 | `testflight_group` | `Mitra shell testers` | TestFlight group that receives the build |
