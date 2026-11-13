@@ -99,6 +99,8 @@ const MARK_FRAME = 0.04;
 const BACKGROUND_TOLERANCE = 12;
 const MARK_TOLERANCE = 28;
 const MARK_ALPHA = 40;
+// Below this side a raster logo is upscaled enough to look soft on the 1024 px store icon.
+const SOFT_ICON_PX = 512;
 // A background that covers less of the picture than this is a gradient or a picture, not a color.
 const MIN_BACKGROUND_SHARE = 0.25;
 // Fringes and soft shadows around the mark are too faint to count as mark, but cut off they leave a hard edge.
@@ -161,7 +163,7 @@ const backgroundAudio = wantIos && Boolean(flags["background-audio"] || descript
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
-const iconSource = flags.icon || descriptor.icon || info?.logoUrl || scraped.icon;
+const iconSource = flags.icon || descriptor.icon || info?.logoUrl || (flags.identity ? undefined : await pageIcon(scraped));
 const host = new URL(url).host;
 // The host is written into AndroidManifest.xml and the iOS entitlements as is.
 if (!isPlainHost(host)) fail(`Unsupported host in the app URL: ${JSON.stringify(host)}`);
@@ -213,7 +215,7 @@ log(`appId    ${appId}`);
 log(`url      ${url}`);
 log(`theme    ${themeColor}`);
 log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
-log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
+if (!flags.identity) log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
 log(`audio    ios background audio ${backgroundAudio ? "on" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
@@ -380,16 +382,15 @@ function resolveContentInset(override, pageOwnsSafeArea) {
 // other meta does not count either. An unterminated block runs to the end of the text, which keeps
 // every pattern linear: tag patterns exclude "<", so a run of unclosed tags is not rescanned from
 // each start. Only the first 256 KB are looked at, which also bounds the work.
-function pageHandlesSafeArea(html) {
-  const head = html.slice(0, 262144).replace(
+function withoutInertBlocks(html) {
+  return html.slice(0, 262144).replace(
     /<!--(?:-?>|[\s\S]*?(?:-->|$))|<script\b[^<>]*>[\s\S]*?(?:<\/script\s*>|$)|<noscript\b[^<>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, "");
+}
+function pageHandlesSafeArea(html) {
+  const head = withoutInertBlocks(html);
   let content = null;
   for (const [tag] of head.matchAll(/<meta\b[^<>]*>/gi)) {
-    const attrs = {};
-    for (const m of tag.slice(5).matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
-      const key = m[1].toLowerCase();
-      if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
-    }
+    const attrs = tagAttrs(tag);
     // Browsers apply the last viewport meta.
     if ((attrs.name || "").trim().toLowerCase() === "viewport") content = attrs.content ?? "";
   }
@@ -397,21 +398,124 @@ function pageHandlesSafeArea(html) {
   return content.split(/[,;]/).some((part) => /^viewport-fit\s*=\s*cover$/i.test(part.trim()));
 }
 
+// Attributes of one tag, lowercase names, first occurrence wins (as in a browser).
+function tagAttrs(tag) {
+  const attrs = {};
+  for (const m of tag.replace(/^<[^\s>]*/, "").matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+    const key = m[1].toLowerCase();
+    if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
+  }
+  return attrs;
+}
+
+// Only http(s) and data: leave the page or the manifest; materializeIcon would refuse the rest anyway.
+function resolveIconUrl(href, base) {
+  const h = decodeEntities(String(href).trim());
+  if (/^data:/i.test(h)) return `data:${h.slice(5)}`;
+  try {
+    const u = new URL(h, base);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.toString() : undefined;
+  } catch { return undefined; }
+}
+
+// kind is "svg" or "png", the formats materializeIcon takes, "" for anything that says it is
+// something else, or "unknown" when nothing says (no type, no extension): materializeIcon then
+// decides from the content-type. A declared type wins over the extension, and a data: URI carries
+// its own mime.
+function iconCandidate({ href, type, sizes, base, touch, source }) {
+  if (!href) return null;
+  const url = resolveIconUrl(href, base);
+  if (!url) return null;
+  const declared = String(type || "").toLowerCase();
+  const label = declared || (url.startsWith("data:") ? (url.match(/^data:([^;,]*)/) || [])[1] : extname(new URL(url).pathname).slice(1).toLowerCase());
+  const kind = !label ? "unknown" : declared || url.startsWith("data:") ? mimeToExt(label) : ["svg", "png"].includes(label) ? label : "";
+  const side = Math.max(0, ...[...String(sizes || "").matchAll(/(\d+)x(\d+)/gi)].map((m) => Math.max(Number(m[1]), Number(m[2]))));
+  return { url, kind, size: side || (touch ? 180 : 32), touch, source };
+}
+
 function scrape(html, baseUrl) {
   const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
   const themeColor = (html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i) || [])[1];
-  // Prefer the apple-touch-icon (square, no transparency expected), then any rel=icon.
-  const links = [...html.matchAll(/<link\s+[^>]*>/gi)].map((m) => m[0]);
-  const pick = (test) => {
-    for (const tag of links) {
-      const rel = (tag.match(/rel=["']([^"']+)["']/i) || [])[1] || "";
-      if (!test(rel.toLowerCase())) continue;
-      const href = (tag.match(/href=["']([^"']+)["']/i) || [])[1];
-      if (href) return href.startsWith("data:") ? href : new URL(href, baseUrl).toString();
+  const iconCandidates = [];
+  let manifestUrl;
+  for (const [tag] of withoutInertBlocks(html).matchAll(/<link\s+[^>]*>/gi)) {
+    const attrs = tagAttrs(tag);
+    const rel = (attrs.rel || "").toLowerCase();
+    const tokens = rel.split(/\s+/);
+    if (tokens.includes("manifest") && attrs.href && !manifestUrl) {
+      const m = resolveIconUrl(attrs.href, baseUrl);
+      if (m && !m.startsWith("data:")) manifestUrl = m;
     }
-  };
-  const icon = pick((r) => r.includes("apple-touch-icon")) || pick((r) => r.split(/\s+/).includes("icon"));
-  return { title: title && decodeEntities(title.trim()), themeColor, icon };
+    const touch = rel.includes("apple-touch-icon");
+    if (!touch && !tokens.includes("icon")) continue;
+    const c = iconCandidate({ href: attrs.href, type: attrs.type, sizes: attrs.sizes, base: baseUrl, touch, source: "page" });
+    if (c) iconCandidates.push(c);
+  }
+  return { title: title && decodeEntities(title.trim()), themeColor, iconCandidates, manifestUrl };
+}
+
+// Maskable and monochrome entries are left out: the generator composes its own safe zone.
+function manifestIconCandidates(manifest, manifestUrl) {
+  const icons = manifest?.icons;
+  if (!Array.isArray(icons)) throw new Error("no icons array");
+  return icons.flatMap((icon) => {
+    if (!icon || typeof icon.src !== "string") return [];
+    const purposes = typeof icon.purpose === "string" ? icon.purpose.toLowerCase().split(/\s+/).filter(Boolean) : [];
+    if (purposes.length && purposes.every((p) => p === "maskable" || p === "monochrome")) return [];
+    const c = iconCandidate({ href: icon.src, type: icon.type, sizes: icon.sizes, base: manifestUrl, touch: false, source: "manifest" });
+    return c ? [c] : [];
+  });
+}
+
+const MANIFEST_MAX_BYTES = 1048576;
+
+async function pageIcon(scraped) {
+  return pickIcon([...scraped.iconCandidates, ...await fetchManifestIcons(scraped.manifestUrl)]);
+}
+
+// The manifest is third-party input and only a better source for the icon, so any failure
+// leaves the page icons to decide. The log carries the reason category only: an error message can
+// quote the body.
+async function fetchManifestIcons(manifestUrl) {
+  if (!manifestUrl) return [];
+  const skip = (why) => { log(`manifest ignored (${describe(manifestUrl).slice(0, 120)}): ${why}`); return []; };
+  let text;
+  let res;
+  try {
+    res = await fetch(manifestUrl, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return skip(`HTTP ${res.status}`);
+    if (Number(res.headers.get("content-length")) > MANIFEST_MAX_BYTES) return skip("over 1 MB");
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of res.body) {
+      total += chunk.length;
+      if (total > MANIFEST_MAX_BYTES) return skip("over 1 MB");
+      chunks.push(chunk);
+    }
+    text = Buffer.concat(chunks).toString("utf8");
+  } catch (e) {
+    return skip(`network error (${e.name})`);
+  }
+  let json;
+  try { json = JSON.parse(text); } catch { return skip("not JSON"); }
+  try {
+    return manifestIconCandidates(json, res.url || manifestUrl);
+  } catch (e) {
+    return skip(e.message);
+  }
+}
+
+// The icon is scaled to 1024 px for the store, so resolution decides how it looks: a vector never
+// goes soft, and among rasters the largest has the least to upscale. The apple-touch-icon wins a
+// tie because it is meant to be an opaque square. A page whose only icons are neither SVG nor PNG
+// (a favicon.ico) keeps the old pick, the apple-touch-icon or else the first icon, and
+// materializeIcon refuses it as before.
+function pickIcon(candidates) {
+  const usable = candidates.filter((c) => c.kind);
+  usable.sort((a, b) => (b.kind === "svg") - (a.kind === "svg") || (a.kind === "svg" ? 0 : b.size - a.size || (a.kind === "unknown") - (b.kind === "unknown") || b.touch - a.touch));
+  if (usable.length) return usable[0].url;
+  const fromPage = candidates.filter((c) => c.source === "page");
+  return (fromPage.find((c) => c.touch) || fromPage[0])?.url;
 }
 
 async function materializeIcon(source, assetsDir, fallbackSvg) {
@@ -456,6 +560,10 @@ async function composeBrand(dir, logoPath, theme) {
   let data;
   try {
     data = await rasterizeLogo(sharp, logoPath, side);
+    if (extname(logoPath) !== ".svg") {
+      const { width, height } = await sharp(readFileSync(logoPath)).metadata();
+      if (Math.min(width, height) < SOFT_ICON_PX) log(`WARNING  the icon is ${width}x${height} px and will look soft on the store icon and the splash; give an SVG or a PNG of 1024 px (--icon)`);
+    }
   } catch (e) {
     throw new Error(`the icon could not be read as an image: ${e.message}`);
   }
@@ -1455,7 +1563,7 @@ function mimeToExt(mime) {
   if (/png/.test(mime)) return "png";
   return "";
 }
-function describe(src) { return String(src).startsWith("data:") ? "inline data: URI from the page" : String(src); }
+function describe(src) { return String(src).startsWith("data:") ? "inline data: URI" : String(src); }
 function decodeEntities(s) { return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'"); }
 function escapeHtml(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function writeJson(p, obj) { writeFileSync(p, JSON.stringify(obj, null, 2) + "\n"); }
@@ -1491,6 +1599,37 @@ function selftest() {
   const svg = initialsLogoSvg("MC", "#ffffff");
   assert(svg.includes(">MC</text>") && svg.includes('fill="#ffffff"') && svg.includes('fill="#0f172a"'), "light logo has dark letters");
   assert(initialsLogoSvg("MC", "#000").includes('fill="#ffffff"'), "dark logo has light letters");
+  const base = "https://crew.mitralab.io/";
+  const pick = (html, manifest) => {
+    const sc = scrape(html, base);
+    return pickIcon([...sc.iconCandidates, ...(manifest ? manifestIconCandidates(manifest, "https://crew.mitralab.io/assets/manifest.webmanifest") : [])]);
+  };
+  const PNG180 = "data:image/png;base64,iVBORw0KGgo=";
+  const crew = `<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" sizes="180x180" href="${PNG180}"><link rel="manifest" href="/assets/manifest.webmanifest">`;
+  assert(scrape(crew, base).manifestUrl === "https://crew.mitralab.io/assets/manifest.webmanifest", "the manifest link is found");
+  const crewManifest = { icons: [{ src: "/icone.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }, { src: "/icone-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" }] };
+  assert(pick(crew, crewManifest) === "https://crew.mitralab.io/assets/favicon.svg", "a vector beats the 180 px apple-touch-icon, page before manifest");
+  assert(pick(`<link rel="apple-touch-icon" href="/t.png"><link rel="icon" href="/f.png" sizes="32x32">`) === "https://crew.mitralab.io/t.png", "apple-touch 180 beats icon 32");
+  assert(pick(`<link rel="apple-touch-icon" sizes="180x180" href="/t.png">`, { icons: [{ src: "i512.png", sizes: "512x512", type: "image/png" }] }) === "https://crew.mitralab.io/assets/i512.png", "manifest PNG 512 beats apple-touch 180, resolved against the manifest");
+  assert(pick(`<link rel="icon" href="/f.png" sizes="32x32">`, { icons: [{ src: "/m.svg", purpose: "maskable" }, { src: "/m.png", sizes: "512x512", purpose: "monochrome" }] }) === "https://crew.mitralab.io/f.png", "maskable-only and monochrome-only icons are ignored");
+  assert(pick(`<link rel="shortcut icon" href="/favicon.ico"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/f.png", "an .ico is not chosen over a PNG");
+  assert(pick(`<link rel="icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/t.ico">`) === "https://crew.mitralab.io/t.ico", "without SVG or PNG the old pick stays (touch icon first)");
+  assert(pick(`<link rel="icon" href="/favicon.ico">`) === "https://crew.mitralab.io/favicon.ico", "an .ico-only page keeps its old pick");
+  assert(pick(`<link rel="icon" type="image/png" sizes="192x192 512x512 48x48" href="/a.png"><link rel="icon" type="image/png" sizes="256x256" href="/b.png">`) === "https://crew.mitralab.io/a.png", "the largest of several sizes in one attribute counts");
+  assert(pick(`<link rel="apple-touch-icon" href="${PNG180}">`) === PNG180, "a data: URI is kept as is");
+  assert(pick(`<link rel='icon' href='img/f.png?v=1&amp;x=2'>`) === "https://crew.mitralab.io/img/f.png?v=1&x=2", "a relative href is resolved against the base and entities decoded");
+  assert(pick(`<link rel="icon" href="javascript:alert(1)"><link rel="icon" href="file:///etc/x.png">`) === undefined, "only http(s) and data: hrefs are taken");
+  assert(pick(`<link rel="icon" type="image/svg+xml" href="/v"><link rel="icon" href="/big.png" sizes="1024x1024">`) === "https://crew.mitralab.io/v", "a typed vector without extension wins over any raster");
+  assert(pick(`<link rel="apple-touch-icon" href="/apple-icon"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/apple-icon", "a link with no type and no extension ranks as a raster of its default size");
+  assert(pick(`<link rel="icon" href="/u" sizes="64x64"><link rel="icon" href="/k.png" sizes="64x64">`) === "https://crew.mitralab.io/k.png", "an unknown kind loses a tie to a known one");
+  assert(pick(`<link rel="icon" type="image/jpeg" href="/a"><link rel="icon" href="/b.jpg">`) === "https://crew.mitralab.io/a", "a declared other type or extension stays unusable (old pick only)");
+  assert(pick(`<!-- <link rel="icon" type="image/svg+xml" href="/dead.svg"> --><script>var x='<link rel="icon" type="image/svg+xml" href="/js.svg">'</script><link rel="icon" href="/live.png" sizes="32x32">`) === "https://crew.mitralab.io/live.png", "links in comments and scripts are not candidates");
+  assert(pick(`<link rel="icon" href="DATA:image/png;base64,AAAA">`) === "data:image/png;base64,AAAA", "an uppercase DATA: scheme is accepted and normalized");
+  assert(pick(`<link rel="icon" href="HTTPS://crew.mitralab.io/u.png">`) === "https://crew.mitralab.io/u.png", "an uppercase HTTPS: scheme is accepted");
+  assert(scrape(`<link rel="manifest" href="data:application/json,{}">`, base).manifestUrl === undefined, "only an http(s) manifest link is followed");
+  assert(manifestIconCandidates({ icons: [{ src: "/p.png", sizes: "512x512", purpose: "any maskable" }] }, base).length === 1, "purpose any maskable is kept");
+  assert(throws(() => manifestIconCandidates({ icons: "x" }, base)) && throws(() => manifestIconCandidates(null, base)), "a manifest without an icons array is refused");
+  assert(manifestIconCandidates({ icons: [null, { src: 3 }, { src: "/ok.png" }] }, base).length === 1, "malformed manifest entries are skipped");
   assert(resolveThemeColor("#ABC", ["#111111"]) === "#ABC", "own color wins");
   assert(throws(() => resolveThemeColor("red", [])), "own color must be hex");
   assert(throws(() => resolveThemeColor("#12345", [])), "5 hex digits are refused");
