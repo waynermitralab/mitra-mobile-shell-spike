@@ -417,7 +417,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |
 | `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
-| `--no-ios-keyboard-resize` | Keep the iOS web view at full height under the keyboard, see Keyboard resize (default: it ends at the keyboard) |
+| `--ios-keyboard resize\|notify\|off` | What the iOS shell does when the keyboard opens, see Keyboard (default: `resize`, the web view ends at the keyboard) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
 | `--background-audio` | Keep the microphone of a live voice conversation with the screen locked: the `audio` background mode on iOS, a microphone foreground service on Android, see Background audio |
@@ -476,12 +476,32 @@ field whose keyboard has no return or go key closes only when the page blurs it.
 lose their Done too (a `<select>`, a date or time input in wheel mode): they close by a tap outside
 them. If a WebKit release renames the content view, the bar just stays.
 
-### Keyboard resize (iOS)
+### Keyboard (iOS, `--ios-keyboard`)
 
 WKWebView keeps its height when the keyboard opens and reveals the focused field by scrolling the
 whole page, so a screen that fills the viewport (a chat: header, messages, composer) slides up,
-header included. Every iOS shell ends the web view at the top of the keyboard instead, with no
-page change and no Keyboard plugin. What the page sees while the keyboard is up:
+header included. The shell has three modes for it, with no Keyboard plugin:
+
+| Mode | Web view | Page event | Choose it when |
+|---|---|---|---|
+| `resize` (default) | Ends at the top of the keyboard | Yes | The page is not written for the shell: the header stays and the composer sits on the keyboard with no page change |
+| `notify` | Keeps its full height | Yes | The page moves itself with the keyboard, for the motion of a native screen |
+| `off` | Keeps its full height | No | The page already handles WebKit's own behavior and wants nothing changed |
+
+`resize` is correct but not fluid: WebKit does not paint the page again on every frame while the
+web view changes size, and the page lays out once, in one step, so a band can flash above the
+keyboard and the conversation jumps. `notify` leaves the motion to the page, which only works if
+the page listens to the event below; without a listener the composer stays under the keyboard.
+
+The mode is set with `--ios-keyboard` (or `iosKeyboard` in the descriptor) and written to
+`plugins.MitraShell.keyboard`; `mitra-shell.json` records it only when it is not `resize`.
+
+In both `resize` and `notify` the keyboard only counts when it is docked across the bottom and
+belongs to the app: a floating, undocked or split keyboard on iPad, a hardware keyboard and the
+keyboard of the sign-in sheet leave the page as it is, with no event (or a `willHide`, if the
+keyboard was up and stops being docked).
+
+#### `resize`: what the page sees
 
 - The viewport is shorter: `window.innerHeight`, `100dvh`, `100vh` and `visualViewport.height` are
   the height above the keyboard, and the page lays out again (a `resize` event), with the
@@ -498,14 +518,78 @@ page change and no Keyboard plugin. What the page sees while the keyboard is up:
 
 A screen locked to the viewport height should let its content scroll inside it (`overflow: auto`)
 or fit above the keyboard: content it clips with `overflow: hidden` is reached only by that one
-scroll. The keyboard only counts when it is docked across the bottom: a floating, undocked or
-split keyboard on iPad, a hardware keyboard and the keyboard of the sign-in sheet leave the page
-as it is. The window behind the web view takes the page background, which is what shows around the
+scroll. The window behind the web view takes the page background, which is what shows around the
 rounded corners of the keyboard.
 
-`--no-ios-keyboard-resize` (or `iosKeyboardResize: false` in the descriptor) keeps WebKit's
-behavior; the choice is written to `plugins.MitraShell.keyboardResize` and to `mitra-shell.json`
-only when it is off.
+#### `notify`: what the page sees
+
+- The layout is not resized: `window.innerHeight`, `100dvh` and `100vh` stay the full height, and
+  the keyboard covers the bottom of the page. `visualViewport.height` still shrinks, as in plain
+  WebKit, but only once the keyboard has landed.
+- A document that fits the viewport is kept at the top while the keyboard is up: the shell cancels
+  the scroll, and with it the `visualViewport.offsetTop` shift, that WebKit uses to reveal the
+  field. A document taller than the viewport scrolls as usual, and WebKit brings the field into
+  view there. The shell never calls `scrollIntoView` in this mode: the page owns the layout.
+- The safe area is untouched: `env(safe-area-inset-bottom)` keeps the home indicator value. The
+  `height` of the event already includes that area, so while the keyboard is up the page lifts its
+  composer by `height` in place of the safe area inset, not by the sum of the two.
+
+#### The `mitrashell:keyboard` event
+
+Sent on `window` in `resize` and `notify`. The fields are properties of the event itself
+(`event.height`), not of `event.detail`:
+
+| Field | Value |
+|---|---|
+| `mode` | `"resize"` or `"notify"`: whether the web view shrinks by itself or the page must lift its content |
+| `phase` | `"willShow"`, `"didShow"`, `"willHide"` or `"didHide"` |
+| `height` | How much of the bottom of the full-height web view the keyboard covers when the transition ends, home indicator area included; `0` on a hide. In points, which are CSS px for a page at `width=device-width` that is not zoomed |
+| `duration` | Keyboard animation in ms; `0` on `didShow` and `didHide`, and when the keyboard moves with no animation |
+| `curve` | The raw `UIView.AnimationCurve` of the keyboard (`7` for the system keyboard, which is private) |
+| `easing` | A CSS timing function for that curve: `ease-in-out`, `ease-in`, `ease-out` or `linear` for the public curves, and `cubic-bezier(0.38, 0.7, 0.125, 1)` for the keyboard's own, an approximation of its spring |
+
+`willShow` and `willHide` are sent before the keyboard animation starts, so a transition started
+in the listener runs along with it. `willShow` comes again, with the new `height`, when the height
+changes with the keyboard up (emoji, dictation). `didShow` and `didHide` come when the keyboard
+has landed. The same phase with the same height is sent once. In `resize` the page needs none of
+this to lay out; there `height` is how much shorter the viewport gets. A page that may run under
+either mode checks `mode` and lifts its content only in `notify`: lifting in `resize` would count
+the keyboard twice.
+
+A composer fixed to the bottom that travels with the keyboard, in `notify`. Its bottom padding is
+the safe area, and that padding is what goes under the keyboard:
+
+```css
+.composer { position: fixed; bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
+```
+
+```js
+window.addEventListener("mitrashell:keyboard", (event) => {
+  if (event.mode !== "notify") return;
+  if (event.phase !== "willShow" && event.phase !== "willHide") return;
+  // Read here and not once at load: the inset changes with rotation.
+  const safeBottom = parseFloat(getComputedStyle(composer).paddingBottom) || 0;
+  const lift = Math.max(0, event.height - safeBottom);
+  composer.style.transition = `transform ${event.duration}ms ${event.easing}`;
+  composer.style.transform = `translateY(${-lift}px)`;
+});
+```
+
+A page that loads or starts listening with the keyboard already up has missed the event, so the
+shell also leaves the last state on `window.__mitraShellKeyboard`, as `{ phase, mode, height }`.
+It is set before each event is dispatched and again when a document finishes loading; until then
+it is `undefined`, which reads as no keyboard:
+
+```js
+const keyboard = window.__mitraShellKeyboard;
+if (keyboard && keyboard.mode === "notify" && keyboard.height > 0) liftComposer(keyboard.height);
+```
+
+A descriptor that still has the earlier `iosKeyboardResize` key fails with a message: use
+`"iosKeyboard": "off"` in place of `false`.
+
+The message list needs the same distance (a transform, or bottom padding set on `didShow`), or its
+last messages stay under the keyboard. The event exists only in the iOS shell.
 
 ### Push (`--push`)
 

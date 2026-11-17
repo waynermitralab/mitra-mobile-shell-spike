@@ -37,7 +37,8 @@ import Capacitor
 // is hidden, see hideFormAccessoryBar.
 //
 // A seventh makes the keyboard behave as in a native app: the web view ends at the top of the
-// keyboard, so the page gets a shorter viewport instead of being scrolled, see installKeyboardResize.
+// keyboard, so the page gets a shorter viewport instead of being scrolled, or the page is told
+// where the keyboard is going and moves itself, see installKeyboard.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -96,7 +97,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
         installBarsProbe()
         installPopups()
         hideFormAccessoryBar()
-        installKeyboardResize()
+        installKeyboard()
     }
 
     // Users and App Review read the form bar above the keyboard as a web page, not an app. The
@@ -126,13 +127,32 @@ class ShellBridgeViewController: CAPBridgeViewController {
 
     // How much of the bottom of the full frame of this view the docked keyboard covers.
     private var keyboardOverlap: CGFloat = 0
-    private var keyboardResize = false
-    private var scrollObservations: [NSKeyValueObservation] = []
+    private var keyboardMode = KeyboardMode.off
+    // The last keyboard event sent to the page: the same one is not sent twice, and a document
+    // that loads later is told where the keyboard is, see publishKeyboardState.
+    private var keyboardPhase = "didHide"
+    private var announcedHeight: Double = 0
+    // Where the last notification taken into account sent the keyboard, and the window it was
+    // measured in, see keyboardMoved.
+    private var announcedFrame: CGRect?
+    private var announcedBounds: CGRect?
+    private var keyboardObservations: [NSKeyValueObservation] = []
     // Set from a resize until the page has laid out in the shorter viewport: the height the document
     // had before it, and whether it fit the viewport then, see dropStrayScroll.
     private var settlingHeight: CGFloat?
     private var holdsTop = false
     private var settleTimer: DispatchWorkItem?
+
+    // What the shell does when the keyboard opens, from plugins.MitraShell.keyboard:
+    // - resize: the web view ends at the keyboard, see below. The page needs no change, but WebKit
+    //   does not paint a web view again on every frame while its size animates, and the page lays
+    //   out in one step, so the move is not as smooth as in a native screen.
+    // - notify: the web view keeps its size and the page moves itself, with a transform in step
+    //   with the keyboard. It can only do that if it hears where the keyboard is going before the
+    //   animation starts, which no web API gives: see notifyKeyboard. The shell only keeps WebKit
+    //   from scrolling a document that fits the viewport, see dropStrayScroll.
+    // - off: WebKit as it comes, and no event.
+    private enum KeyboardMode: String { case resize, notify, off }
 
     // WKWebView keeps its height under the keyboard and reveals the focused field by scrolling its
     // scroll view and shifting the visual viewport. A page that fills the screen (a chat: header,
@@ -152,20 +172,24 @@ class ShellBridgeViewController: CAPBridgeViewController {
     //
     // A shorter frame no longer reaches the home indicator, so UIKit takes the bottom safe area
     // inset to 0 by itself and it is not counted on top of the keyboard, with either contentInset.
-    private func installKeyboardResize() {
-        guard bridge?.config.getPluginConfig("MitraShell").getBoolean("keyboardResize", true) ?? true,
-              let scrollView = webView?.scrollView else { return }
-        keyboardResize = true
+    private func installKeyboard() {
+        // A config written before the modes existed has no value and gets the default.
+        let mode = KeyboardMode(rawValue: bridge?.config.getPluginConfig("MitraShell").getString("keyboard") ?? "") ?? .resize
+        guard mode != .off, let webView = webView else { return }
+        let scrollView = webView.scrollView
+        keyboardMode = mode
         let center = NotificationCenter.default
         // willChangeFrame alone covers show, hide and a change of height (emoji, dictation); show
         // and hide are for a system that posts only them. On rotation the will notifications are
         // measured against the bounds the window had before it, so didChangeFrame measures again.
+        // didShow and didHide only tell the page that the keyboard has landed.
         for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillShowNotification,
-                     UIResponder.keyboardWillHideNotification, UIResponder.keyboardDidChangeFrameNotification] {
-            center.addObserver(self, selector: #selector(keyboardWillMove(_:)), name: name, object: nil)
+                     UIResponder.keyboardWillHideNotification, UIResponder.keyboardDidChangeFrameNotification,
+                     UIResponder.keyboardDidShowNotification, UIResponder.keyboardDidHideNotification] {
+            center.addObserver(self, selector: #selector(keyboardMoved(_:)), name: name, object: nil)
         }
         // Both fire per scroll frame and per layout of the page; dropStrayScroll is a few compares.
-        scrollObservations = [
+        keyboardObservations = [
             scrollView.observe(\.contentOffset) { [weak self] _, _ in self?.dropStrayScroll() },
             scrollView.observe(\.contentSize) { [weak self] scrollView, _ in
                 guard let self = self else { return }
@@ -174,35 +198,142 @@ class ShellBridgeViewController: CAPBridgeViewController {
                 } else {
                     self.dropStrayScroll()
                 }
+            },
+            // The navigation delegate belongs to Capacitor, so the end of a load is read here.
+            webView.observe(\.isLoading) { [weak self] webView, _ in
+                if !webView.isLoading { self?.publishKeyboardState() }
             }
         ]
     }
 
-    @objc private func keyboardWillMove(_ notification: Notification) {
-        let overlap = notification.name == UIResponder.keyboardWillHideNotification ? 0 : dockedKeyboardOverlap(notification)
-        guard overlap != keyboardOverlap else { return }
-        let taller = overlap > keyboardOverlap
-        keyboardOverlap = overlap
+    @objc private func keyboardMoved(_ notification: Notification) {
+        let name = notification.name
+        let info = notification.userInfo
+        let curve = (info?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 0
+        // These two only confirm where the keyboard is. One that arrives late, from a transition
+        // the user reversed, does not match the state and must not move anything.
+        if name == UIResponder.keyboardDidShowNotification || name == UIResponder.keyboardDidHideNotification {
+            let shown = name == UIResponder.keyboardDidShowNotification
+            if shown == (keyboardOverlap > 0) { notifyKeyboard(shown ? "didShow" : "didHide", duration: 0, curve: curve) }
+            return
+        }
+        let landed = name == UIResponder.keyboardDidChangeFrameNotification
+        let end = (info?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+        let bounds = view.window?.bounds
+        // didChangeFrame measures again only for what the will notifications could not know: on
+        // rotation they are measured against the bounds of before. In the same bounds, one whose
+        // frame is not where the last will sent the keyboard is late, from a transition the user
+        // reversed, and taking it would tell the page of a hide with the keyboard up.
+        if landed, let announced = announcedFrame, end != announced, bounds == announcedBounds { return }
+        announcedFrame = end
+        announcedBounds = bounds
+        let overlap = name == UIResponder.keyboardWillHideNotification ? 0 : dockedKeyboardOverlap(notification)
+        // After the fact there is no keyboard animation left to travel with.
+        let duration = landed ? 0 : (info?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0
+        if overlap != keyboardOverlap {
+            let taller = overlap > keyboardOverlap
+            keyboardOverlap = overlap
+            // First, so the page starts its own transition with the keyboard and not after it.
+            notifyKeyboard(overlap > 0 ? "willShow" : "willHide", duration: duration, curve: curve)
+            if keyboardMode == .resize {
+                resizeForKeyboard(taller: taller, duration: duration, curve: curve)
+            } else {
+                dropStrayScroll()
+            }
+        }
+        if landed { notifyKeyboard(keyboardOverlap > 0 ? "didShow" : "didHide", duration: 0, curve: curve) }
+    }
+
+    private func resizeForKeyboard(taller: Bool, duration: Double, curve: UInt) {
         if taller {
             beginSettling()
-        } else if overlap == 0 {
+        } else if keyboardOverlap == 0 {
             settleTimer?.cancel()
             endSettling()
         }
         // What shows through a translucent keyboard, and around its rounded corners, is the window:
         // without a color it is black under a light page. The color is set once per keyboard, from
         // the page as it is then, and is not taken back: nothing else lets the window show.
-        if overlap > 0, let window = view.window {
+        if keyboardOverlap > 0, let window = view.window {
             window.backgroundColor = webView?.underPageBackgroundColor
         }
-        let info = notification.userInfo
-        let duration = (info?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0
-        // After the fact there is no keyboard animation left to travel with.
-        guard duration > 0, notification.name != UIResponder.keyboardDidChangeFrameNotification else { return fitToKeyboard() }
+        guard duration > 0 else { return fitToKeyboard() }
         // The curve of the keyboard is not one of the public ones; shifted by 16 it is the option.
-        let curve = (info?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 0
         UIView.animate(withDuration: duration, delay: 0, options: [UIView.AnimationOptions(rawValue: curve << 16), .beginFromCurrentState]) {
             self.fitToKeyboard()
+        }
+    }
+
+    static let keyboardEvent = "mitrashell:keyboard"
+
+    // The page hears of the keyboard from the shell because the web only reports it afterwards
+    // (visualViewport resizes when the keyboard has landed), too late to animate along with it.
+    // The fields are set on the event object itself, as Capacitor does with the data of its own
+    // window events, not on a detail:
+    //   mode      resize or notify: whether the web view shrinks by itself or the page has to
+    //             lift its content, so one page can run under either.
+    //   phase     willShow, didShow, willHide or didHide. willShow comes again when the height
+    //             changes with the keyboard up (emoji, dictation).
+    //   height    how much of the bottom of the web view at full height the keyboard covers when
+    //             the transition ends, home indicator area included, 0 on a hide. In points, which
+    //             are CSS px for a page at width=device-width that is not zoomed.
+    //   duration  of the keyboard animation, in ms; 0 on did* and when there is none.
+    //   curve     the raw UIView.AnimationCurve of the notification.
+    //   easing    the CSS timing function closest to that curve.
+    // The same phase with the same height is sent once: willChangeFrame and willShow, or
+    // didChangeFrame and didShow, report one transition twice.
+    //
+    // The script goes straight to the web view and not through triggerWindowJSEvent of the bridge:
+    // that one waits a turn of the main queue, by when the keyboard animation is committed, and
+    // needs window.Capacitor in the page. What is pasted into it is JSON of the constants above
+    // and finite numbers, never page data.
+    private func notifyKeyboard(_ phase: String, duration: Double, curve: UInt) {
+        let height = Double(keyboardOverlap)
+        guard phase != keyboardPhase || height != announcedHeight, height.isFinite, duration.isFinite else { return }
+        keyboardPhase = phase
+        announcedHeight = height
+        let fields: [String: Any] = ["mode": keyboardMode.rawValue, "phase": phase, "height": height,
+                                     "duration": (duration * 1000).rounded(), "curve": Int(curve),
+                                     "easing": Self.keyboardEasing(curve)]
+        guard let json = Self.json(fields), let state = keyboardState() else { return }
+        webView?.evaluateJavaScript("""
+            (function (fields) {
+              var event = new Event("\(Self.keyboardEvent)");
+              for (var name in fields) event[name] = fields[name];
+              window.__mitraShellKeyboard = \(state);
+              window.dispatchEvent(event);
+            })(\(json))
+            """)
+    }
+
+    // A page that loads, or starts listening, after an event has no way to ask where the keyboard
+    // is, so the last state is also left on window. A new document starts without it and gets it
+    // when its load ends.
+    private func publishKeyboardState() {
+        guard keyboardMode != .off, let state = keyboardState() else { return }
+        webView?.evaluateJavaScript("window.__mitraShellKeyboard = \(state)")
+    }
+
+    private func keyboardState() -> String? {
+        return Self.json(["phase": keyboardPhase, "mode": keyboardMode.rawValue, "height": announcedHeight])
+    }
+
+    private static func json(_ fields: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: fields) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    // The keyboard reports curve 7, which is private: UIKit runs it as a spring and publishes no
+    // control points. The bezier is the fit that circulates for it in React Native keyboard code
+    // (Easing.bezier(0.38, 0.7, 0.125, 1)), not something measured here; a page that needs an exact
+    // match has to tune it against a recording.
+    private static func keyboardEasing(_ curve: UInt) -> String {
+        switch curve {
+        case 0: return "ease-in-out"
+        case 1: return "ease-in"
+        case 2: return "ease-out"
+        case 3: return "linear"
+        default: return "cubic-bezier(0.38, 0.7, 0.125, 1)"
         }
     }
 
@@ -232,7 +363,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
     // the view out of the hierarchy (the camera or a full-screen picker over it) finds no container
     // to measure, and the height would otherwise stay short for good.
     private func fitToKeyboard() {
-        guard keyboardResize, let container = view.superview else { return }
+        guard keyboardMode == .resize, let container = view.superview else { return }
         var frame = container.bounds
         frame.size.height -= keyboardOverlap
         if view.frame != frame { view.frame = frame }
@@ -251,6 +382,13 @@ class ShellBridgeViewController: CAPBridgeViewController {
     // fits the resized viewport, where no offset but the top is a real scroll position (the scroll
     // view does not bounce in Capacitor). A page that scrolls is taller than the viewport and is
     // never touched.
+    //
+    // In notify mode the web view keeps its height, and this is all the shell does to the page:
+    // WebKit still scrolls the field into view and shifts the visual viewport with it, which for a
+    // document that fits the viewport is the whole screen sliding up under a page that is already
+    // moving its composer by itself. No field is scrolled to there: the page owns the layout.
+    // The bottom inset UIKit adds to the scroll view for the keyboard stays, so a document that
+    // scrolls can scroll that much further; whether that is wanted is to be judged on a device.
     //
     // The new size of the document arrives a few frames after the resize, and WebKit scrolls in
     // between, when the old size still says there is room: the header would flash out and back.
