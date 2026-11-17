@@ -468,9 +468,10 @@ The account connections in a popup do not use them: there the page sees the chil
 
 WKWebView puts a bar above the keyboard of a form field (previous, next, Done), which reads as a web
 page. Every iOS shell hides it, with no page change and no Keyboard plugin: `SceneDelegate.swift`
-gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil (the swap
-the Capacitor Keyboard plugin makes when a page asks it to). Without the bar there is no Done
-button, so a field whose keyboard has no return or go key closes only when the page blurs it. The
+gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil. The
+Capacitor Keyboard plugin can hide the bar too; the shell does it itself so that no app carries a
+plugin, with its keyboard resize handling and JS surface, for this one effect. Without the bar
+there is no Done button, so a field whose keyboard has no return or go key closes only when the page blurs it. The
 wheel pickers lose their Done too (a `<select>`, a date or time input in wheel mode): they close by
 a tap outside them. If a
 WebKit release renames the content view, the bar just stays.

@@ -96,9 +96,10 @@ class ShellBridgeViewController: CAPBridgeViewController {
     }
 
     // Users and App Review read the form bar above the keyboard as a web page, not an app. The
-    // Capacitor Keyboard plugin hides it with this same swap, but only when the page calls it, and
-    // the published page does not know the shell exists. WebKit asks its content view (a private
-    // WKContentView) for inputAccessoryView, so that one view gets a runtime subclass returning nil.
+    // Capacitor Keyboard plugin can hide it too, but it would put a whole plugin, with its own
+    // keyboard resize handling and a JS surface, in every app for this one effect. WebKit asks its
+    // content view (a private WKContentView) for inputAccessoryView, so that one view gets a
+    // runtime subclass returning nil.
     // A WebKit that renames the view only keeps the bar: nothing else depends on finding it. The
     // runtime class is what gets subclassed, and one that is not WebKit's own (a KVO subclass, say)
     // is left alone rather than subclassed again under it.
