@@ -287,5 +287,19 @@ public class ShellPopups {
                 return false;
             }
         }
+
+        // The sign-in of the app (ShellSignIn), which has no child window to come back to: only the
+        // Auth Tab can hand its return to the shell, by the URL scheme of the shell. False without
+        // an Auth Tab, with no Custom Tab instead: the caller then leaves the navigation to the
+        // bridge, which is how a sign-in always opened.
+        boolean launchSignIn(Uri url, String redirectScheme) {
+            try {
+                if (!support.isSupported(activity)) return false;
+                new AuthTabIntent.Builder().build().launch(authTab, url, redirectScheme);
+                return true;
+            } catch (RuntimeException e) {
+                return false;
+            }
+        }
     }
 }
