@@ -127,7 +127,9 @@ class ShellBridgeViewController: CAPBridgeViewController {
 
     // How much of the bottom of the full frame of this view the docked keyboard covers.
     private var keyboardOverlap: CGFloat = 0
+    // The mode in force, and the one of the config that every new document starts with.
     private var keyboardMode = KeyboardMode.off
+    private var defaultKeyboardMode = KeyboardMode.off
     // The last keyboard event sent to the page: the same one is not sent twice, and a document
     // that loads later is told where the keyboard is, see publishKeyboardState.
     private var keyboardPhase = "didHide"
@@ -152,6 +154,9 @@ class ShellBridgeViewController: CAPBridgeViewController {
     //   animation starts, which no web API gives: see notifyKeyboard. The shell only keeps WebKit
     //   from scrolling a document that fits the viewport, see dropStrayScroll.
     // - off: WebKit as it comes, and no event.
+    // The config gives the mode a document starts with; the page can change it for itself, see
+    // switchKeyboardMode. So the keyboard is followed in every mode, off included: a switch made
+    // with the keyboard up has to know where it is.
     private enum KeyboardMode: String { case resize, notify, off }
 
     // WKWebView keeps its height under the keyboard and reveals the focused field by scrolling its
@@ -175,8 +180,9 @@ class ShellBridgeViewController: CAPBridgeViewController {
     private func installKeyboard() {
         // A config written before the modes existed has no value and gets the default.
         let mode = KeyboardMode(rawValue: bridge?.config.getPluginConfig("MitraShell").getString("keyboard") ?? "") ?? .resize
-        guard mode != .off, let webView = webView else { return }
+        guard let webView = webView else { return }
         let scrollView = webView.scrollView
+        defaultKeyboardMode = mode
         keyboardMode = mode
         let center = NotificationCenter.default
         // willChangeFrame alone covers show, hide and a change of height (emoji, dictation); show
@@ -198,12 +204,28 @@ class ShellBridgeViewController: CAPBridgeViewController {
                 } else {
                     self.dropStrayScroll()
                 }
-            },
-            // The navigation delegate belongs to Capacitor, so the end of a load is read here.
-            webView.observe(\.isLoading) { [weak self] webView, _ in
-                if !webView.isLoading { self?.publishKeyboardState() }
             }
         ]
+        // The mode a page chose ends with its document. The navigation delegate belongs to
+        // Capacitor, and the start of a load is not the moment anyway: a load that fails or is
+        // cancelled (offline, a download, the sign-in host the shell takes over) leaves the old
+        // document in place, and it must keep its mode. A script at document start runs only in a
+        // document that was committed, before any script of the page, so the default is back
+        // ahead of the page's own call, on a reload too. A document restored from the back/forward
+        // cache runs no script again: the mode stays as the document before it left it.
+        let documents = KeyboardDocumentHandler()
+        documents.shell = self
+        let content = webView.configuration.userContentController
+        content.add(documents, name: KeyboardDocumentHandler.name)
+        content.addUserScript(WKUserScript(
+            source: "window.webkit.messageHandlers.\(KeyboardDocumentHandler.name).postMessage(\"\")",
+            injectionTime: .atDocumentStart, forMainFrameOnly: true))
+    }
+
+    // A new document also gets the state, since its window starts without one.
+    fileprivate func keyboardDocumentStarted() {
+        applyKeyboardMode(defaultKeyboardMode)
+        publishKeyboardState()
     }
 
     @objc private func keyboardMoved(_ notification: Notification) {
@@ -292,6 +314,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
         guard phase != keyboardPhase || height != announcedHeight, height.isFinite, duration.isFinite else { return }
         keyboardPhase = phase
         announcedHeight = height
+        guard keyboardMode != .off else { return }
         let fields: [String: Any] = ["mode": keyboardMode.rawValue, "phase": phase, "height": height,
                                      "duration": (duration * 1000).rounded(), "curve": Int(curve),
                                      "easing": Self.keyboardEasing(curve)]
@@ -308,14 +331,49 @@ class ShellBridgeViewController: CAPBridgeViewController {
 
     // A page that loads, or starts listening, after an event has no way to ask where the keyboard
     // is, so the last state is also left on window. A new document starts without it and gets it
-    // when its load ends.
+    // as it starts, see keyboardDocumentStarted.
     private func publishKeyboardState() {
-        guard keyboardMode != .off, let state = keyboardState() else { return }
+        guard let state = keyboardState() else { return }
         webView?.evaluateJavaScript("window.__mitraShellKeyboard = \(state)")
     }
 
     private func keyboardState() -> String? {
-        return Self.json(["phase": keyboardPhase, "mode": keyboardMode.rawValue, "height": announcedHeight])
+        return Self.json(keyboardStateFields())
+    }
+
+    // In off the page gets no event, so a state that said the keyboard is up would never be taken
+    // back: there the shell reports no keyboard at all.
+    private func keyboardStateFields() -> [String: Any] {
+        let silent = keyboardMode == .off
+        return ["phase": silent ? "didHide" : keyboardPhase, "mode": keyboardMode.rawValue, "height": silent ? 0 : announcedHeight]
+    }
+
+    // The page picks the mode for itself (MitraShell.setKeyboardMode): one app can have a chat
+    // that moves with the keyboard and forms that are better off resized. The choice lasts for the
+    // document, see installKeyboard. Returns the state under the new mode, or nil for a name that
+    // is not a mode.
+    func switchKeyboardMode(_ name: String) -> [String: Any]? {
+        guard let mode = KeyboardMode(rawValue: name) else { return nil }
+        applyKeyboardMode(mode)
+        return keyboardStateFields()
+    }
+
+    // With the keyboard up the switch takes effect at once and without animation: the frame goes
+    // back to full height when resize is left and to the keyboard when it is entered. No event is
+    // made up for it; the page reads the state, which already carries the new mode, and the events
+    // of the new mode start with the next move of the keyboard.
+    private func applyKeyboardMode(_ mode: KeyboardMode) {
+        guard mode != keyboardMode else { return }
+        let resized = keyboardMode == .resize
+        keyboardMode = mode
+        if resized {
+            settleTimer?.cancel()
+            endSettling()
+            if let container = view.superview, view.frame != container.bounds { view.frame = container.bounds }
+        }
+        if mode == .resize { resizeForKeyboard(taller: keyboardOverlap > 0, duration: 0, curve: 0) }
+        dropStrayScroll()
+        publishKeyboardState()
     }
 
     private static func json(_ fields: [String: Any]) -> String? {
@@ -395,7 +453,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
     // So a document that fit the viewport before the resize is held at the top until its new size
     // is known.
     private func dropStrayScroll() {
-        guard keyboardOverlap > 0, let scrollView = webView?.scrollView else { return }
+        guard keyboardOverlap > 0, keyboardMode != .off, let scrollView = webView?.scrollView else { return }
         let top = -scrollView.adjustedContentInset.top
         guard abs(scrollView.contentOffset.y - top) > 0.5, holdsTop || documentFits(scrollView) else { return }
         scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: top), animated: false)
@@ -866,11 +924,45 @@ final class ShellPopups: NSObject, WKUIDelegate, WKNavigationDelegate, ASWebAuth
     }
 }
 
+// Hears of every new document of the main frame, see installKeyboard. The handler is reachable
+// from any frame and by any script that knows the name; all it does is put the keyboard mode back
+// to the default of the app, so a page that posts to it by hand only undoes its own choice.
+// WKUserContentController keeps its handlers strongly, hence the weak reference and a class apart.
+private final class KeyboardDocumentHandler: NSObject, WKScriptMessageHandler {
+    static let name = "mitraShellDocument"
+    weak var shell: ShellBridgeViewController?
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame else { return }
+        shell?.keyboardDocumentStarted()
+    }
+}
+
 @objc(MitraShellPlugin)
 public class MitraShellPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "MitraShellPlugin"
     public let jsName = "MitraShell"
-    public let pluginMethods: [CAPPluginMethod] = []
+    // Capacitor only dispatches the methods listed here (and its own listener calls), so this is
+    // all a page can reach. Its message handler does not check the frame, so an iframe of another
+    // origin can post the call by hand: what it reaches is the keyboard mode of the page around
+    // it, and it gets no reply, since the reply goes to the main frame.
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setKeyboardMode", returnType: CAPPluginReturnPromise)
+    ]
+
+    // Plugin calls arrive off the main thread, and the mode moves a view.
+    @objc func setKeyboardMode(_ call: CAPPluginCall) {
+        let mode = call.getString("mode") ?? ""
+        DispatchQueue.main.async {
+            guard let shell = self.bridge?.viewController as? ShellBridgeViewController else {
+                return call.reject("the shell is not ready")
+            }
+            guard let state = shell.switchKeyboardMode(mode) else {
+                return call.reject("mode must be resize, notify or off")
+            }
+            call.resolve(state)
+        }
+    }
 
     private var session: ASWebAuthenticationSession?
 

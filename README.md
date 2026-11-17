@@ -488,6 +488,9 @@ header included. The shell has three modes for it, with no Keyboard plugin:
 | `notify` | Keeps its full height | Yes | The page moves itself with the keyboard, for the motion of a native screen |
 | `off` | Keeps its full height | No | The page already handles WebKit's own behavior and wants nothing changed |
 
+The generator sets the mode every document starts in; a page can change it for itself at runtime,
+see Choosing the mode from the page.
+
 `resize` is correct but not fluid: WebKit does not paint the page again on every frame while the
 web view changes size, and the page lays out once, in one step, so a band can flash above the
 keyboard and the conversation jumps. `notify` leaves the motion to the page, which only works if
@@ -577,13 +580,44 @@ window.addEventListener("mitrashell:keyboard", (event) => {
 
 A page that loads or starts listening with the keyboard already up has missed the event, so the
 shell also leaves the last state on `window.__mitraShellKeyboard`, as `{ phase, mode, height }`.
-It is set before each event is dispatched and again when a document finishes loading; until then
-it is `undefined`, which reads as no keyboard:
+It is set before each event is dispatched and when a document starts, ahead of the scripts of the
+page. Read `undefined` (an older shell) as no keyboard:
 
 ```js
 const keyboard = window.__mitraShellKeyboard;
 if (keyboard && keyboard.mode === "notify" && keyboard.height > 0) liftComposer(keyboard.height);
 ```
+
+In `off` the state is always `{ phase: "didHide", mode: "off", height: 0 }`: the shell reports no
+keyboard there.
+
+#### Choosing the mode from the page
+
+A page can pick the mode for itself, for example `notify` on a chat screen and `resize` on forms:
+
+```js
+const shell = window.Capacitor?.Plugins?.MitraShell;
+if (typeof shell?.setKeyboardMode === "function") {
+  const state = await shell.setKeyboardMode({ mode: "notify" }); // { phase, mode, height }
+}
+```
+
+- The promise resolves with the state under the new mode, the same object left on
+  `window.__mitraShellKeyboard`, and rejects for a value that is not `resize`, `notify` or `off`.
+- The choice lasts for the current document. Every new document, a reload included, starts again
+  in the mode the app was generated with, so a page that wants another mode calls this on load.
+  Navigation inside a single-page app keeps the choice, and so does a load that fails or is
+  cancelled, since the document stays.
+- Call it on `pageshow` too. A document that comes back from the back/forward cache runs no script
+  again, and the shell does not see it as new: the mode in force is the one the document shown in
+  between left, and `window.__mitraShellKeyboard` is the one this document had when it went away.
+  `window.addEventListener("pageshow", applyKeyboardMode)` covers the first load and the restore.
+- With the keyboard up the switch is immediate and not animated: leaving `resize` gives the web
+  view its full height back, entering it ends the web view at the keyboard. No event is sent for
+  the switch; read `height` from the resolved state, and the events of the new mode start with the
+  next move of the keyboard.
+- The `typeof` check is the feature detection: a shell generated before this method, the Android
+  shell and a browser do not have it, and there the page keeps the behavior it gets.
 
 A descriptor that still has the earlier `iosKeyboardResize` key fails with a message: use
 `"iosKeyboard": "off"` in place of `false`.
