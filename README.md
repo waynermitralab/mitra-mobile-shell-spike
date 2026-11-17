@@ -417,6 +417,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |
 | `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
+| `--no-ios-keyboard-resize` | Keep the iOS web view at full height under the keyboard, see Keyboard resize (default: it ends at the keyboard) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
 | `--background-audio` | Keep the microphone of a live voice conversation with the screen locked: the `audio` background mode on iOS, a microphone foreground service on Android, see Background audio |
@@ -470,11 +471,41 @@ WKWebView puts a bar above the keyboard of a form field (previous, next, Done), 
 page. Every iOS shell hides it, with no page change and no Keyboard plugin: `SceneDelegate.swift`
 gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil. The
 Capacitor Keyboard plugin can hide the bar too; the shell does it itself so that no app carries a
-plugin, with its keyboard resize handling and JS surface, for this one effect. Without the bar
-there is no Done button, so a field whose keyboard has no return or go key closes only when the page blurs it. The
-wheel pickers lose their Done too (a `<select>`, a date or time input in wheel mode): they close by
-a tap outside them. If a
-WebKit release renames the content view, the bar just stays.
+plugin, with its JS surface, for this one effect. Without the bar there is no Done button, so a
+field whose keyboard has no return or go key closes only when the page blurs it. The wheel pickers
+lose their Done too (a `<select>`, a date or time input in wheel mode): they close by a tap outside
+them. If a WebKit release renames the content view, the bar just stays.
+
+### Keyboard resize (iOS)
+
+WKWebView keeps its height when the keyboard opens and reveals the focused field by scrolling the
+whole page, so a screen that fills the viewport (a chat: header, messages, composer) slides up,
+header included. Every iOS shell ends the web view at the top of the keyboard instead, with no
+page change and no Keyboard plugin. What the page sees while the keyboard is up:
+
+- The viewport is shorter: `window.innerHeight`, `100dvh`, `100vh` and `visualViewport.height` are
+  the height above the keyboard, and the page lays out again (a `resize` event), with the
+  keyboard's own animation. They come back when it closes.
+- `visualViewport.offsetTop` stays 0 and the document is not scrolled for the keyboard, so a page
+  that compensated with `visualViewport` (offsetting its top, or sizing itself to
+  `visualViewport.height`) keeps working: the compensation is now zero.
+- `env(safe-area-inset-bottom)` is 0, since the web view no longer reaches the home indicator.
+- A page that scrolls keeps scrolling, and WebKit still brings the field into view. Only a
+  document that fits the shorter viewport is kept at the top. If the shorter viewport leaves the
+  focused field out of view, the shell scrolls to it once, about half a second after the keyboard
+  starts (`scrollIntoView`, which also reaches a field inside a box with its own overflow). An
+  iframe, an element with no size and a field taller than the viewport are left where they are.
+
+A screen locked to the viewport height should let its content scroll inside it (`overflow: auto`)
+or fit above the keyboard: content it clips with `overflow: hidden` is reached only by that one
+scroll. The keyboard only counts when it is docked across the bottom: a floating, undocked or
+split keyboard on iPad, a hardware keyboard and the keyboard of the sign-in sheet leave the page
+as it is. The window behind the web view takes the page background, which is what shows around the
+rounded corners of the keyboard.
+
+`--no-ios-keyboard-resize` (or `iosKeyboardResize: false` in the descriptor) keeps WebKit's
+behavior; the choice is written to `plugins.MitraShell.keyboardResize` and to `mitra-shell.json`
+only when it is off.
 
 ### Push (`--push`)
 

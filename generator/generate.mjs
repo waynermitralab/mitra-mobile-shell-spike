@@ -12,6 +12,7 @@
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
 //          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
+//          [--no-ios-keyboard-resize]              (default: the iOS web view ends at the keyboard)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
 // (public, no token) gives name, published origins, accent color and the login logo. The page
@@ -140,7 +141,7 @@ const DEFAULT_RETURN_PATH = "/oauth/";
 // Shipped only with --background-audio, see withVoiceService.
 const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
 const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "notifyPage"];
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "installKeyboardResize", "fitToKeyboard", "dropStrayScroll", "revealFocusedField", "notifyPage"];
 
 if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
@@ -180,6 +181,8 @@ if (!isVersionName(versionName)) fail(`--version must look like 1, 1.2 or 1.2.3,
 const buildNumber = Number(flags["build-number"] || descriptor.buildNumber || 1);
 if (!Number.isInteger(buildNumber) || buildNumber < 1) fail("--build-number must be a positive integer");
 const associatedDomains = Boolean(flags["associated-domains"] || descriptor.associatedDomains);
+// On unless turned off: SceneDelegate reads it at runtime (plugins.MitraShell.keyboardResize).
+const iosKeyboardResize = resolveKeyboardResize(flags["no-ios-keyboard-resize"], descriptor.iosKeyboardResize);
 // Platform neutral: iOS gets its plist entry (patchIos) and Android its foreground service (patchAndroid).
 const backgroundAudio = Boolean(flags["background-audio"] || descriptor.backgroundAudio);
 const callback = String(flags.callback || descriptor.callback || "scheme");
@@ -250,6 +253,7 @@ if (!flags.identity) {
   else iconLine = `(none, drawing the initials ${initials(appName, slug)})`;
   log(`icon     ${iconLine}`);
 }
+log(`keyboard ios web view ${iosKeyboardResize ? "ends at the keyboard (the page viewport shrinks)" : "keeps its height under the keyboard (--no-ios-keyboard-resize or the descriptor)"}`);
 log(`audio    background audio ${backgroundAudio ? "on (ios audio mode, android microphone service)" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
@@ -352,7 +356,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
     // a shift when the page is known to declare cover.
     ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
-    MitraShell: { authHosts, consentHosts, returnPath, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
+    MitraShell: { authHosts, consentHosts, returnPath, keyboardResize: iosKeyboardResize, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
   }
 });
@@ -360,7 +364,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
+  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, iosKeyboardResize: iosKeyboardResize ? undefined : false, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -425,6 +429,10 @@ function resolveContentInset(override, pageOwnsSafeArea) {
   if (override == null) return pageOwnsSafeArea ? "never" : "automatic";
   if (!["never", "automatic"].includes(override)) throw new Error(`--ios-content-inset must be never or automatic, got ${JSON.stringify(override)}`);
   return override;
+}
+// On by default: only the flag or an explicit false in the descriptor turns the resize off.
+function resolveKeyboardResize(noResizeFlag, descriptorValue) {
+  return !noResizeFlag && descriptorValue !== false;
 }
 // Whether the page reserves the safe area itself: its viewport meta carries viewport-fit=cover.
 // Then the native scroll view must not add the inset too, or the status bar height shows up twice
@@ -1981,6 +1989,14 @@ async function selftest() {
   assert(missingSwiftMembers(swift.replace("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
   const didLoad = swift.slice(swift.indexOf("override func capacitorDidLoad()"), swift.indexOf("private func hideFormAccessoryBar()"));
   assert(didLoad.includes("hideFormAccessoryBar()") && swift.includes('NSStringFromClass($0).hasPrefix("WKContent")') && swift.includes("objc_allocateClassPair(base, name, 0)") && swift.includes("#selector(getter: UIResponder.inputAccessoryView)") && swift.includes("object_setClass(content, subclass)"), "iOS hides the form accessory bar of the web view from capacitorDidLoad");
+  const keyboard = swift.slice(swift.indexOf("private func installKeyboardResize()"), swift.indexOf("// The popup contract needs"));
+  assert(didLoad.includes("installKeyboardResize()") && keyboard.includes('getBoolean("keyboardResize", true) ?? true'), "iOS resizes the web view for the keyboard from capacitorDidLoad unless the config turns it off");
+  assert(["keyboardWillChangeFrameNotification", "keyboardWillShowNotification", "keyboardWillHideNotification"].every((n) => keyboard.includes(`UIResponder.${n}`)) && keyboard.includes("keyboardAnimationDurationUserInfoKey") && keyboard.includes("UIView.AnimationOptions(rawValue: curve << 16)"), "the resize follows every keyboard frame change with the keyboard's own duration and curve");
+  assert(keyboard.includes("keyboardIsLocalUserInfoKey") && keyboard.includes("window.convert(end, from: window.screen.coordinateSpace)") && keyboard.includes("keyboard.intersects(bounds), keyboard.maxY >= bounds.maxY - 1"), "only a docked keyboard of this app, measured in the window, takes space from the page");
+  assert(/override func viewDidLayoutSubviews\(\) \{\s*super\.viewDidLayoutSubviews\(\)\s*fitToKeyboard\(\)/.test(keyboard) && /super\.viewDidAppear\(animated\)\s*fitToKeyboard\(\)/.test(swift), "the frame is applied again on every layout and when the view comes back, so a hide missed off screen cannot leave it short");
+  assert(keyboard.includes("UIResponder.keyboardDidChangeFrameNotification") && keyboard.includes("settleTimer?.cancel()") && keyboard.includes('field.tagName === "IFRAME"') && keyboard.includes("if (!box.width || !box.height || box.height > window.innerHeight) return;"), "the keyboard is measured again after rotation, the settle timer is cancellable, and an iframe, an empty box or one taller than the viewport is not scrolled to");
+  assert(/guard abs\(scrollView\.contentOffset\.y - top\) > 0\.5, holdsTop \|\| documentFits\(scrollView\) else \{ return \}/.test(keyboard) && !keyboard.includes("isScrollEnabled"), "the scroll offset is put back only for a document that fits the viewport, and scrolling stays on");
+  assert(keyboard.includes("box.top < 0 || box.bottom > window.innerHeight") && keyboard.includes('field.scrollIntoView({ block: "center" })'), "a focused field is scrolled to only when the shorter viewport left it out of view");
   const plugin = swift.slice(swift.indexOf("class MitraShellPlugin"));
   assert(plugin.includes('authCancelEvent = "mitrashell:authcancel"') && plugin.includes('authFailEvent = "mitrashell:authfail"') && plugin.includes("bridge?.triggerWindowJSEvent(eventName: event)"), "the sign-in session names the two events it dispatches in the page");
   assert(plugin.includes("guard !finished else { return }") && plugin.includes("if !session.start(), !finished {"), "a sign-in session ends once: one event and at most one browser fallback");
@@ -2017,6 +2033,8 @@ async function selftest() {
   }
   assert(pageHandlesSafeArea(`${"<!--".repeat(50000)}${viewport("viewport-fit=cover")}`) === false, "many unterminated comments finish and hide the meta");
   assert(resolveContentInset(undefined, true) === "never" && resolveContentInset(null, false) === "automatic" && resolveContentInset(null, true) === "never", "a null or missing override falls back to detection");
+  assert(resolveKeyboardResize(undefined, undefined) && resolveKeyboardResize(undefined, true) && resolveKeyboardResize(undefined, null), "the iOS keyboard resize is on by default");
+  assert(!resolveKeyboardResize(true, undefined) && !resolveKeyboardResize(true, true) && !resolveKeyboardResize(undefined, false), "the flag or a false in the descriptor turns the iOS keyboard resize off");
   assert(resolveContentInset("automatic", true) === "automatic" && throws(() => resolveContentInset("always", true)), "an override wins and must be never or automatic");
   for (const [html, expected, why] of [
     [`<!-->${viewport("viewport-fit=cover")}`, true, "an empty comment <!--> does not swallow the meta"],

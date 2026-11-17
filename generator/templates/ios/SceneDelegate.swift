@@ -35,6 +35,9 @@ import Capacitor
 //
 // A sixth makes forms feel native: the bar WebKit puts above the keyboard (previous, next, Done)
 // is hidden, see hideFormAccessoryBar.
+//
+// A seventh makes the keyboard behave as in a native app: the web view ends at the top of the
+// keyboard, so the page gets a shorter viewport instead of being scrolled, see installKeyboardResize.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -93,6 +96,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
         installBarsProbe()
         installPopups()
         hideFormAccessoryBar()
+        installKeyboardResize()
     }
 
     // Users and App Review read the form bar above the keyboard as a web page, not an app. The
@@ -118,6 +122,198 @@ class ShellBridgeViewController: CAPBridgeViewController {
         class_addMethod(subclass, selector, imp_implementationWithBlock(noAccessory), method_getTypeEncoding(original))
         objc_registerClassPair(subclass)
         object_setClass(content, subclass)
+    }
+
+    // How much of the bottom of the full frame of this view the docked keyboard covers.
+    private var keyboardOverlap: CGFloat = 0
+    private var keyboardResize = false
+    private var scrollObservations: [NSKeyValueObservation] = []
+    // Set from a resize until the page has laid out in the shorter viewport: the height the document
+    // had before it, and whether it fit the viewport then, see dropStrayScroll.
+    private var settlingHeight: CGFloat?
+    private var holdsTop = false
+    private var settleTimer: DispatchWorkItem?
+
+    // WKWebView keeps its height under the keyboard and reveals the focused field by scrolling its
+    // scroll view and shifting the visual viewport. A page that fills the screen (a chat: header,
+    // messages, composer) slides up whole, header included, and can only chase visualViewport to
+    // undo it, which shows as a jump. Ending the web view at the keyboard makes the layout viewport
+    // itself shorter (innerHeight, 100dvh), so such a page lays out again with the header in place
+    // and the composer on the keyboard, and nothing has to scroll.
+    //
+    // The frame of the view is what changes, as in the "native" resize of the Capacitor Keyboard
+    // plugin. In Capacitor the web view is the view of this controller, and here that is the root
+    // view of the window: it has no superview of ours to hold a bottom constraint or a
+    // keyboardLayoutGuide, and additionalSafeAreaInsets would only change env(safe-area-inset-bottom),
+    // not the viewport height. UIKit puts the frame of a root view back on rotation and on a window
+    // resize, so viewDidLayoutSubviews applies the overlap again. Unlike the plugin, which resizes
+    // after the keyboard has landed, the frame moves inside the keyboard's own animation, so the
+    // bottom edge travels with the keyboard and the composer is never under it.
+    //
+    // A shorter frame no longer reaches the home indicator, so UIKit takes the bottom safe area
+    // inset to 0 by itself and it is not counted on top of the keyboard, with either contentInset.
+    private func installKeyboardResize() {
+        guard bridge?.config.getPluginConfig("MitraShell").getBoolean("keyboardResize", true) ?? true,
+              let scrollView = webView?.scrollView else { return }
+        keyboardResize = true
+        let center = NotificationCenter.default
+        // willChangeFrame alone covers show, hide and a change of height (emoji, dictation); show
+        // and hide are for a system that posts only them. On rotation the will notifications are
+        // measured against the bounds the window had before it, so didChangeFrame measures again.
+        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillShowNotification,
+                     UIResponder.keyboardWillHideNotification, UIResponder.keyboardDidChangeFrameNotification] {
+            center.addObserver(self, selector: #selector(keyboardWillMove(_:)), name: name, object: nil)
+        }
+        // Both fire per scroll frame and per layout of the page; dropStrayScroll is a few compares.
+        scrollObservations = [
+            scrollView.observe(\.contentOffset) { [weak self] _, _ in self?.dropStrayScroll() },
+            scrollView.observe(\.contentSize) { [weak self] scrollView, _ in
+                guard let self = self else { return }
+                if self.holdsTop, let height = self.settlingHeight, abs(scrollView.contentSize.height - height) > 0.5 {
+                    self.endSettling()
+                } else {
+                    self.dropStrayScroll()
+                }
+            }
+        ]
+    }
+
+    @objc private func keyboardWillMove(_ notification: Notification) {
+        let overlap = notification.name == UIResponder.keyboardWillHideNotification ? 0 : dockedKeyboardOverlap(notification)
+        guard overlap != keyboardOverlap else { return }
+        let taller = overlap > keyboardOverlap
+        keyboardOverlap = overlap
+        if taller {
+            beginSettling()
+        } else if overlap == 0 {
+            settleTimer?.cancel()
+            endSettling()
+        }
+        // What shows through a translucent keyboard, and around its rounded corners, is the window:
+        // without a color it is black under a light page. The color is set once per keyboard, from
+        // the page as it is then, and is not taken back: nothing else lets the window show.
+        if overlap > 0, let window = view.window {
+            window.backgroundColor = webView?.underPageBackgroundColor
+        }
+        let info = notification.userInfo
+        let duration = (info?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0
+        // After the fact there is no keyboard animation left to travel with.
+        guard duration > 0, notification.name != UIResponder.keyboardDidChangeFrameNotification else { return fitToKeyboard() }
+        // The curve of the keyboard is not one of the public ones; shifted by 16 it is the option.
+        let curve = (info?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 0
+        UIView.animate(withDuration: duration, delay: 0, options: [UIView.AnimationOptions(rawValue: curve << 16), .beginFromCurrentState]) {
+            self.fitToKeyboard()
+        }
+    }
+
+    // Only a keyboard that sits on the bottom edge across the whole width takes space from the
+    // page. A floating, undocked or split keyboard on iPad reports an empty or detached frame and
+    // a hardware keyboard one below the screen: the page keeps its height, as in Safari. The bar a
+    // hardware keyboard may leave docked at the bottom counts, since it covers the page all the
+    // same. A keyboard of another process (the sign-in sheet over this view, the other app in
+    // Split View) is not typing into the page, so the page does not move for it.
+    private func dockedKeyboardOverlap(_ notification: Notification) -> CGFloat {
+        let info = notification.userInfo
+        guard (info?[UIResponder.keyboardIsLocalUserInfoKey] as? NSNumber)?.boolValue ?? true,
+              let end = (info?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue,
+              let window = view.window, let container = view.superview else { return 0 }
+        // The frame comes in screen coordinates, and on iPad the window may not be the screen
+        // (Split View, Slide Over, Stage Manager).
+        let keyboard = window.convert(end, from: window.screen.coordinateSpace)
+        let bounds = window.bounds
+        guard keyboard.intersects(bounds), keyboard.maxY >= bounds.maxY - 1,
+              keyboard.minX <= bounds.minX + 1, keyboard.maxX >= bounds.maxX - 1 else { return 0 }
+        let full = container.convert(container.bounds, to: window)
+        return min(max(0, full.maxY - keyboard.minY), full.height)
+    }
+
+    // The frame is the full one of the container less the keyboard. It is written on every layout
+    // and when the view comes back, not only while the keyboard is up: a keyboard that closes with
+    // the view out of the hierarchy (the camera or a full-screen picker over it) finds no container
+    // to measure, and the height would otherwise stay short for good.
+    private func fitToKeyboard() {
+        guard keyboardResize, let container = view.superview else { return }
+        var frame = container.bounds
+        frame.size.height -= keyboardOverlap
+        if view.frame != frame { view.frame = frame }
+        dropStrayScroll()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        fitToKeyboard()
+    }
+
+    // WebKit starts scrolling the focused field into view from the layout it had before the resize,
+    // and for a page that fills the viewport that leaves the document pushed up with nothing to
+    // scroll back with. Scrolling stays on, because a long form needs WebKit to bring its field
+    // into view: the offset is put back only while the keyboard is up and only when the document
+    // fits the resized viewport, where no offset but the top is a real scroll position (the scroll
+    // view does not bounce in Capacitor). A page that scrolls is taller than the viewport and is
+    // never touched.
+    //
+    // The new size of the document arrives a few frames after the resize, and WebKit scrolls in
+    // between, when the old size still says there is room: the header would flash out and back.
+    // So a document that fit the viewport before the resize is held at the top until its new size
+    // is known.
+    private func dropStrayScroll() {
+        guard keyboardOverlap > 0, let scrollView = webView?.scrollView else { return }
+        let top = -scrollView.adjustedContentInset.top
+        guard abs(scrollView.contentOffset.y - top) > 0.5, holdsTop || documentFits(scrollView) else { return }
+        scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: top), animated: false)
+    }
+
+    // The bottom inset comes from the safe area and not from adjustedContentInset, which also
+    // carries what UIKit adds for the keyboard when WebKit hears of it before the shell does.
+    private func documentFits(_ scrollView: UIScrollView) -> Bool {
+        let bottom = scrollView.contentInsetAdjustmentBehavior == .never ? 0 : scrollView.safeAreaInsets.bottom
+        return scrollView.contentSize.height <= scrollView.bounds.height - scrollView.adjustedContentInset.top - bottom + 1
+    }
+
+    // Runs before the frame changes, so the document is measured against the full viewport.
+    private func beginSettling() {
+        guard let scrollView = webView?.scrollView else { return }
+        settlingHeight = scrollView.contentSize.height
+        holdsTop = documentFits(scrollView) && abs(scrollView.contentOffset.y + scrollView.adjustedContentInset.top) <= 0.5
+        // A held document as tall after the resize as before reports no new size, so the hold also
+        // ends on time. Half a second is past the keyboard animation and any layout seen.
+        settleTimer?.cancel()
+        let timer = DispatchWorkItem { [weak self] in
+            self?.endSettling()
+            self?.revealFocusedField()
+        }
+        settleTimer = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: timer)
+    }
+
+    private func endSettling() {
+        guard settlingHeight != nil else { return }
+        settlingHeight = nil
+        holdsTop = false
+        dropStrayScroll()
+    }
+
+    // WebKit brought the field into view against the old layout, and does not try again after the
+    // page lays out: a field the shorter viewport pushed out of sight (a page that no longer fits
+    // and now scrolls, or one that keeps its content in a scrolling or clipping box) would stay
+    // under the keyboard. The hold at the top is one cause too: it drops the scroll WebKit asked
+    // for, which a page that turned out to scroll needed. Chrome on Android scrolls to the field
+    // after its own resize; here the shell asks once, when the keyboard has landed and the page
+    // has had time for its own transition, and only for a field that is not wholly in view, so a
+    // visible one never moves. Left alone: an iframe (the field is inside it, out of reach), a box
+    // with no size (the hidden input behind a drawn code field) and one taller than the viewport
+    // (a long text area, where centering would take the caret away).
+    private func revealFocusedField() {
+        guard keyboardOverlap > 0 else { return }
+        webView?.evaluateJavaScript("""
+            (function () {
+              var field = document.activeElement;
+              if (!field || field === document.body || field.tagName === "IFRAME" || !field.getBoundingClientRect) return;
+              var box = field.getBoundingClientRect();
+              if (!box.width || !box.height || box.height > window.innerHeight) return;
+              if (box.top < 0 || box.bottom > window.innerHeight) field.scrollIntoView({ block: "center" });
+            })()
+            """)
     }
 
     // The popup contract needs the https callback of ASWebAuthenticationSession, from iOS 17.4.
@@ -215,6 +411,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        fitToKeyboard()
         showSplashEntrance()
         // The StatusBar plugin put its configured style back when the view appeared again (for
         // example after the sign-in browser closed); the page reports its own once more.
