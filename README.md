@@ -447,6 +447,34 @@ URL fragment. The shell has two ways to get it back into the WebView:
   `/.well-known/assetlinks.json`, which `generator/wellknown.mjs` writes. No other app can claim
   the host, so this is the path for apps where the scheme risk is not acceptable.
 
+On iOS 17.4 and later the sign-in runs in an `ASWebAuthenticationSession`, and a session that ends
+without a return loads nothing, so a page that shows the sign-in in progress would stay that way.
+The shell tells the page instead, with an event on `window` (no detail), and the page can put its
+button back:
+
+- `mitrashell:authcancel`: the user closed the sign-in sheet.
+- `mitrashell:authfail`: the session failed or could not start, or came back with a URL that is not
+  a return of the app. When it failed, the sign-in then opens in the system browser, as before.
+
+```js
+window.addEventListener("mitrashell:authcancel", resetSignInButton);
+window.addEventListener("mitrashell:authfail", resetSignInButton);
+```
+
+Neither event exists on Android or below iOS 17.4, where the sign-in goes to the system browser.
+The account connections in a popup do not use them: there the page sees the child window close.
+
+### Keyboard form bar (iOS)
+
+WKWebView puts a bar above the keyboard of a form field (previous, next, Done), which reads as a web
+page. Every iOS shell hides it, with no page change and no Keyboard plugin: `SceneDelegate.swift`
+gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil (the swap
+the Capacitor Keyboard plugin makes when a page asks it to). Without the bar there is no Done
+button, so a field whose keyboard has no return or go key closes only when the page blurs it. The
+wheel pickers lose their Done too (a `<select>`, a date or time input in wheel mode): they close by
+a tap outside them. If a
+WebKit release renames the content view, the bar just stays.
+
 ### Push (`--push`)
 
 Off by default, and then the push plugin is left out of the native projects.

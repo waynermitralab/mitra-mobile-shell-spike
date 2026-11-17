@@ -140,7 +140,7 @@ const DEFAULT_RETURN_PATH = "/oauth/";
 // Shipped only with --background-audio, see withVoiceService.
 const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
 const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "notifyPage"];
 
 if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
@@ -1979,6 +1979,14 @@ async function selftest() {
   }
   assert(missingSwiftMembers(swift.replace("init?(hex:", "init?(hexx:")).includes("init?(hex"), "the Swift check does not notice init?(hex going missing");
   assert(missingSwiftMembers(swift.replace("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
+  const didLoad = swift.slice(swift.indexOf("override func capacitorDidLoad()"), swift.indexOf("private func hideFormAccessoryBar()"));
+  assert(didLoad.includes("hideFormAccessoryBar()") && swift.includes('NSStringFromClass($0).hasPrefix("WKContent")') && swift.includes("objc_allocateClassPair(base, name, 0)") && swift.includes("#selector(getter: UIResponder.inputAccessoryView)") && swift.includes("object_setClass(content, subclass)"), "iOS hides the form accessory bar of the web view from capacitorDidLoad");
+  const plugin = swift.slice(swift.indexOf("class MitraShellPlugin"));
+  assert(plugin.includes('authCancelEvent = "mitrashell:authcancel"') && plugin.includes('authFailEvent = "mitrashell:authfail"') && plugin.includes("bridge?.triggerWindowJSEvent(eventName: event)"), "the sign-in session names the two events it dispatches in the page");
+  assert(plugin.includes("guard !finished else { return }") && plugin.includes("if !session.start(), !finished {"), "a sign-in session ends once: one event and at most one browser fallback");
+  const fallbacks = plugin.split("UIApplication.shared.open(url)");
+  assert(fallbacks.length === 3 && fallbacks.slice(0, -1).every((before) => before.trimEnd().endsWith("notifyPage(MitraShellPlugin.authFailEvent)")), "every fallback of the sign-in to the browser tells the page first");
+  assert(/if cancelled \{\s*self\?\.notifyPage\(MitraShellPlugin\.authCancelEvent\)/.test(plugin), "a cancelled sign-in tells the page");
   // The plain-logo fallback keeps the theme color and drops the entrance.
   const asIs = { bg: "#0f172a", isDarkBg: true, frames: [], branch: "fallback" };
   const plainTheme = patchLaunchTheme(capacitorStyles, asIs);

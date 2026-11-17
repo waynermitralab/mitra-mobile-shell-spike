@@ -32,6 +32,9 @@ import Capacitor
 //
 // A fifth keeps the status bar readable: a page that draws under the bar (contentInset never) gets
 // shell-bars.js, which reports the color the page paints behind the bar so its content can contrast.
+//
+// A sixth makes forms feel native: the bar WebKit puts above the keyboard (previous, next, Done)
+// is hidden, see hideFormAccessoryBar.
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -89,6 +92,31 @@ class ShellBridgeViewController: CAPBridgeViewController {
         bridge?.registerPluginInstance(MitraShellPlugin())
         installBarsProbe()
         installPopups()
+        hideFormAccessoryBar()
+    }
+
+    // Users and App Review read the form bar above the keyboard as a web page, not an app. The
+    // Capacitor Keyboard plugin hides it with this same swap, but only when the page calls it, and
+    // the published page does not know the shell exists. WebKit asks its content view (a private
+    // WKContentView) for inputAccessoryView, so that one view gets a runtime subclass returning nil.
+    // A WebKit that renames the view only keeps the bar: nothing else depends on finding it. The
+    // runtime class is what gets subclassed, and one that is not WebKit's own (a KVO subclass, say)
+    // is left alone rather than subclassed again under it.
+    private func hideFormAccessoryBar() {
+        guard let content = webView?.scrollView.subviews.first(where: { object_getClass($0).map { NSStringFromClass($0).hasPrefix("WKContent") } ?? false }),
+              let base = object_getClass(content) else { return }
+        let name = NSStringFromClass(base) + "_MitraShellNoAccessory"
+        if let existing = NSClassFromString(name) {
+            object_setClass(content, existing)
+            return
+        }
+        let selector = #selector(getter: UIResponder.inputAccessoryView)
+        guard let original = class_getInstanceMethod(UIResponder.self, selector),
+              let subclass = objc_allocateClassPair(base, name, 0) else { return }
+        let noAccessory: @convention(block) (AnyObject) -> UIView? = { _ in nil }
+        class_addMethod(subclass, selector, imp_implementationWithBlock(noAccessory), method_getTypeEncoding(original))
+        objc_registerClassPair(subclass)
+        object_setClass(content, subclass)
     }
 
     // The popup contract needs the https callback of ASWebAuthenticationSession, from iOS 17.4.
@@ -543,27 +571,50 @@ public class MitraShellPlugin: CAPPlugin, CAPBridgedPlugin {
             // the generator declares in App.entitlements and the platform serves in the AASA file.
             callback = .https(host: appHost, path: "/")
         }
+        // Apple does not say whether the completion also runs when start() returns false, and only
+        // the first end of a session may tell the page and open the browser.
+        var finished = false
         let session = ASWebAuthenticationSession(url: url, callback: callback) { [weak self, weak shell] callbackURL, error in
+            guard !finished else { return }
+            finished = true
             self?.session = nil
             guard let callbackURL = callbackURL else {
                 let cancelled = (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin
-                if !cancelled {
+                if cancelled {
+                    self?.notifyPage(MitraShellPlugin.authCancelEvent)
+                } else {
                     // The session could not run, for example because the host is not an associated
                     // domain yet: fall back to the browser, as Capacitor would have done.
+                    self?.notifyPage(MitraShellPlugin.authFailEvent)
                     UIApplication.shared.open(url)
                 }
                 return
             }
-            guard let target = shell?.appURL(fromReturn: callbackURL) else { return }
+            guard let target = shell?.appURL(fromReturn: callbackURL) else {
+                self?.notifyPage(MitraShellPlugin.authFailEvent)
+                return
+            }
             shell?.loadInShell(target)
         }
         session.prefersEphemeralWebBrowserSession = false
         session.presentationContextProvider = self
         self.session = session
-        if !session.start() {
+        if !session.start(), !finished {
+            finished = true
             self.session = nil
+            notifyPage(MitraShellPlugin.authFailEvent)
             UIApplication.shared.open(url)
         }
+    }
+
+    // The page that started the sign-in shows it in progress until the return reloads it. A session
+    // that ends without a return loads nothing, so the page is told, and can put its button back.
+    static let authCancelEvent = "mitrashell:authcancel"
+    static let authFailEvent = "mitrashell:authfail"
+
+    // The name is one of the constants above, never page or URL data: Capacitor quotes it into script.
+    private func notifyPage(_ event: String) {
+        bridge?.triggerWindowJSEvent(eventName: event)
     }
 }
 
