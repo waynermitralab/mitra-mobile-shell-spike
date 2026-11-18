@@ -533,6 +533,10 @@ rounded corners of the keyboard.
   the scroll, and with it the `visualViewport.offsetTop` shift, that WebKit uses to reveal the
   field. A document taller than the viewport scrolls as usual, and WebKit brings the field into
   view there. The shell never calls `scrollIntoView` in this mode: the page owns the layout.
+- A finger cannot drag such a document either: while the keyboard is up the shell turns off the
+  pan of the document, which would otherwise travel by the keyboard height and snap back. Boxes
+  that scroll inside the page (`overflow: auto`) keep scrolling, and so does a document taller
+  than the viewport.
 - The safe area is untouched: `env(safe-area-inset-bottom)` keeps the home indicator value. The
   `height` of the event already includes that area, so while the keyboard is up the page lifts its
   composer by `height` in place of the safe area inset, not by the sum of the two.

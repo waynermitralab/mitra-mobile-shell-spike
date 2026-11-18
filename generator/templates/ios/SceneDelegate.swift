@@ -204,6 +204,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
                 } else {
                     self.dropStrayScroll()
                 }
+                self.holdDocumentPan()
             }
         ]
         // The mode a page chose ends with its document. The navigation delegate belongs to
@@ -257,6 +258,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
             keyboardOverlap = overlap
             // First, so the page starts its own transition with the keyboard and not after it.
             notifyKeyboard(overlap > 0 ? "willShow" : "willHide", duration: duration, curve: curve)
+            holdDocumentPan()
             if keyboardMode == .resize {
                 resizeForKeyboard(taller: taller, duration: duration, curve: curve)
             } else {
@@ -373,6 +375,7 @@ class ShellBridgeViewController: CAPBridgeViewController {
         }
         if mode == .resize { resizeForKeyboard(taller: keyboardOverlap > 0, duration: 0, curve: 0) }
         dropStrayScroll()
+        holdDocumentPan()
         publishKeyboardState()
     }
 
@@ -452,6 +455,18 @@ class ShellBridgeViewController: CAPBridgeViewController {
     // between, when the old size still says there is room: the header would flash out and back.
     // So a document that fit the viewport before the resize is held at the top until its new size
     // is known.
+    // In notify the web view keeps its height, but UIKit still adds the keyboard to the bottom
+    // inset of its scroll view: a document that fits the screen gains that much scroll, follows
+    // the finger, and is put back by dropStrayScroll on every frame, which shows as the screen
+    // shaking under a drag. Such a document has nowhere to go, so its pan is off while the
+    // keyboard is up. Boxes that scroll inside the page have scroll views of their own and keep
+    // theirs; a document taller than the screen keeps its pan, it is the page scrolling.
+    private func holdDocumentPan() {
+        guard let scrollView = webView?.scrollView else { return }
+        let hold = keyboardMode == .notify && keyboardOverlap > 0 && documentFits(scrollView)
+        if scrollView.panGestureRecognizer.isEnabled == hold { scrollView.panGestureRecognizer.isEnabled = !hold }
+    }
+
     private func dropStrayScroll() {
         guard keyboardOverlap > 0, keyboardMode != .off, let scrollView = webView?.scrollView else { return }
         let top = -scrollView.adjustedContentInset.top
@@ -577,12 +592,15 @@ class ShellBridgeViewController: CAPBridgeViewController {
     }
 
     // A return on the app host is used as is. One on the scheme, <scheme>://auth#codeMitra=...,
-    // becomes the app host with the same fragment: the SDK reads the fragment, never the scheme.
+    // becomes the root of the app with the same fragment: the SDK reads the fragment, never the
+    // scheme. The root keeps the scheme and the port of server.url, since storage belongs to the
+    // origin and a page served on a port would otherwise come back signed in somewhere else.
     func appURL(fromReturn url: URL) -> URL? {
         guard let appHost = appHost else { return nil }
         if url.host?.lowercased() == appHost { return url }
         guard let scheme = url.scheme?.lowercased(), scheme == callbackScheme,
-              var components = URLComponents(string: "https://\(appHost)/") else { return nil }
+              let server = bridge?.config.serverURL,
+              var components = URLComponents(string: "\(server.scheme ?? "https")://\(appHost)\(server.port.map { ":\($0)" } ?? "")/") else { return nil }
         let incoming = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components.percentEncodedQuery = incoming?.percentEncodedQuery
         components.percentEncodedFragment = incoming?.percentEncodedFragment
