@@ -20,7 +20,7 @@
 // initials on the theme color. Then it writes package.json +
 // capacitor.config.json + www/ + assets/, npm ci,
 // cap add android/ios, apply the native patches (App Link intent-filter, onNewIntent
-// in MainActivity, release signing from env, exempt encryption, optional Associated Domains,
+// and the sign-in in an Auth Tab in MainActivity, release signing from env, exempt encryption, optional Associated Domains,
 // SceneDelegate with the sign-in session and Universal Link handling on iOS),
 // compose the icon and splash from the logo (composeBrand), generate icons and splash, cap sync,
 // copy the CI workflow. Optionally builds and installs
@@ -371,7 +371,7 @@ run("npx", ["cap", "add", "android"], projectDir);
 if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 
 // ---------- 4. Android patches ----------
-patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath, backgroundAudio });
+patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, authHosts, consentHosts, returnPath, backgroundAudio });
 
 // ---------- 5. iOS patches ----------
 if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push: pushIos, brand });
@@ -979,7 +979,7 @@ function patchIosSplash(appDir, brand) {
   });
 }
 
-function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, consentHosts, returnPath, backgroundAudio }) {
+function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, authHosts, consentHosts, returnPath, backgroundAudio }) {
   const app = join(dir, "android", "app");
   patchAndroidSplash(join(app, "src", "main", "res"), brand);
   if (backgroundAudio) writeVoiceNotificationIcon(join(app, "src", "main", "res"));
@@ -1014,14 +1014,14 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
   writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme, backgroundAudio));
-  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellWebChromeClient.java", "ShellSystemBars.java", ...(backgroundAudio ? VOICE_CLASSES : [])]) {
-    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
+  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellSignIn.java", "ShellWebChromeClient.java", "ShellSystemBars.java", ...(backgroundAudio ? VOICE_CLASSES : [])]) {
+    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host, authHosts, consentHosts, returnPath }));
   }
   // The unit test runs the client above on the real Capacitor classes (Robolectric).
   const testDir = join(app, "src", "test", "java", ...appId.split("."));
   mkdirSync(testDir, { recursive: true });
-  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java", ...(backgroundAudio ? VOICE_TESTS : [])]) {
-    writeFileSync(join(testDir, name), androidTemplate(name, { appId, host, consentHosts, returnPath }));
+  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java", "ShellSignInTest.java", ...(backgroundAudio ? VOICE_TESTS : [])]) {
+    writeFileSync(join(testDir, name), androidTemplate(name, { appId, host, authHosts, consentHosts, returnPath }));
   }
 
   // build.gradle: version and release signing from the environment.
@@ -1159,6 +1159,7 @@ import android.content.Intent;
 import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.webkit.WebView;
 
 import com.getcapacitor.BridgeActivity;
@@ -1167,17 +1168,30 @@ public class MainActivity extends BridgeActivity {
 
     private static final String SHELL_LINK_PARAM = "shellLink";
     // Sign-in return by URL scheme (null when the shell relies on the App Link alone).
-    private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+    static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+    // A browser may hand the same scheme return over twice, as the result of the Auth Tab and as a
+    // link to the intent filter. The code in it is single use, so the second load would fail the
+    // sign-in the first one finished. The memory is of this instance: both deliveries come while
+    // the activity that launched the tab is in front. One recreated in between (a configuration
+    // change is not one, the manifest keeps the activity) loads the return again, and the page
+    // then reports the used code as a failed sign-in, which the person retries.
+    private static final long SAME_RETURN_WINDOW_MS = 3_000;
+    private String lastReturn;
+    private long lastReturnAt;
 
     // The popup contract for the pages that connect an account (see ShellPopups).
-    private ShellPopups popups;${backgroundAudio ? `
+    private ShellPopups popups;
+
+    // The sign-in of the app in an Auth Tab (see ShellSignIn).
+    private ShellSignIn signIn;${backgroundAudio ? `
 
     // Runs the foreground service while the page captures audio (see ShellVoiceCapture).
     private ShellVoiceCapture voice;` : ""}
 
     // Replaces the bridge's own chrome client, once, to make media permission requests safe and to
-    // give window.open a real child window (see ShellWebChromeClient and ShellPopups). Done here,
-    // before the activity starts, because both register activity result launchers when they are
+    // give window.open a real child window (see ShellWebChromeClient and ShellPopups), and the
+    // bridge's web view client, once, to open the sign-in in an Auth Tab (see ShellSignIn). Done here,
+    // before the activity starts, because they register activity result launchers when they are
     // created. The same block registers the system bars listener (see ShellSystemBars), once,
     // because it adds a listener to the bridge.
     @Override
@@ -1186,6 +1200,7 @@ public class MainActivity extends BridgeActivity {
         if (getBridge() != null && getBridge().getWebView() != null) {
             popups = new ShellPopups(getBridge());
             getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge(), popups));
+            signIn = ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn);
             ShellSystemBars.install(getBridge());${backgroundAudio ? `
             voice = ShellVoiceCapture.install(getBridge());` : ""}
         }
@@ -1194,6 +1209,11 @@ public class MainActivity extends BridgeActivity {
     // Lets the unit test replace the system browser, which it cannot run.
     ShellPopups popups() {
         return popups;
+    }
+
+    // Lets the unit test stand in for the Auth Tab and play its result.
+    ShellSignIn signIn() {
+        return signIn;
     }${backgroundAudio ? `
 
     // Lets the unit test play the messages of the page.
@@ -1229,6 +1249,15 @@ public class MainActivity extends BridgeActivity {
         // The return of an account connection the shell sent to the system browser belongs to the
         // child window of the page, not to the page itself, which must not reload.
         if (popups != null && popups.onReturnLink(data)) return;
+        loadReturn(data);
+    }
+
+    // Loads in the page what came back to the shell, as a link (onNewIntent) or as the result of the
+    // Auth Tab (ShellSignIn). False when it is not a return of the app, and then nothing loads.
+    boolean loadReturn(Uri data) {
+        String returned = data.toString();
+        long now = SystemClock.elapsedRealtime();
+        if (returned.equals(lastReturn) && now - lastReturnAt < SAME_RETURN_WINDOW_MS) return true;
 
         String serverUrl = getBridge().getServerUrl();
         Uri app = Uri.parse(serverUrl != null ? serverUrl : getBridge().getAppUrl());
@@ -1238,15 +1267,18 @@ public class MainActivity extends BridgeActivity {
             data = app.buildUpon().path("/").encodedQuery(data.getEncodedQuery())
                 .encodedFragment(data.getEncodedFragment()).build();
         }
-        if (data.getHost() == null || !data.getHost().equalsIgnoreCase(app.getHost())) return;
+        if (data.getHost() == null || !data.getHost().equalsIgnoreCase(app.getHost())) return false;
 
         // A fragment-only change would not reload the document, and the sign-in completes
         // only when the app boots. A fresh query value forces a full load.
         Uri target = data.buildUpon()
             .appendQueryParameter(SHELL_LINK_PARAM, String.valueOf(System.currentTimeMillis()))
             .build();
+        lastReturn = returned;
+        lastReturnAt = now;
         WebView webView = getBridge().getWebView();
         webView.post(() -> webView.loadUrl(target.toString()));
+        return true;
     }
 }
 `;
@@ -1370,13 +1402,21 @@ function withUnitTestSupport(gradle) {
 // The Java the shell adds for media permissions lives in templates/android (MediaPermissionGate is
 // pure Java and has a JVM test in generator/test). The package and the app host are substituted
 // through a callback, so no character of them is read as a replacement pattern.
-function androidTemplate(name, { appId, host, consentHosts = DEFAULT_CONSENT_HOSTS, returnPath = DEFAULT_RETURN_PATH }) {
+// A sign-in host may be given with a port (the API on :8443), and Uri.getHost() on the device
+// returns the name alone: the list the app compares against carries names only.
+function hostnameOf(host) {
+  try { return new URL(`https://${host}`).hostname.toLowerCase(); } catch { return String(host).toLowerCase(); }
+}
+
+function androidTemplate(name, { appId, host, authHosts = [], consentHosts = DEFAULT_CONSENT_HOSTS, returnPath = DEFAULT_RETURN_PATH }) {
   const text = readFileSync(join(here, "templates", "android", name), "utf8")
     .replace(/__PACKAGE__/g, () => appId)
     .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""))
     .replace(/__APP_PORT__/g, () => (host.match(/:(\d+)$/) || [, "-1"])[1])
     // Both are validated plain names (isConsentHost, isReturnPath), so JSON.stringify gives valid Java string literals.
     .replace(/__CONSENT_HOSTS__/g, () => consentHosts.map((h) => JSON.stringify(h)).join(", "))
+    // Host names from URLs, the descriptor and a flag, lowercased: a JSON string is a valid Java one.
+    .replace(/__AUTH_HOSTS__/g, () => [...new Set(authHosts.map(hostnameOf))].map((h) => JSON.stringify(h)).join(", "))
     .replace(/__RETURN_PATH__/g, () => returnPath);
   if (/__[A-Z_]+__/.test(text)) fail(`${name} has a placeholder that was not substituted`);
   return text;
@@ -2111,6 +2151,24 @@ dependencies {
   assert(mainJava.indexOf("popups = new ShellPopups(getBridge());") > mainJava.indexOf("super.onCreate(savedInstanceState);") && mainJava.indexOf("popups = new ShellPopups(getBridge());") < mainJava.indexOf("setWebChromeClient(new ShellWebChromeClient(getBridge(), popups))"), "MainActivity creates the popups before the chrome client that uses them, after super.onCreate");
   assert(mainJava.split("popups.onReturnLink(data)").length === 2 && mainJava.indexOf("popups.onReturnLink(data)") < mainJava.indexOf("CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())"), "a return of the popup is taken before the sign-in return logic, which is left as it was");
   assert(androidTemplate("ShellPopupsTest.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com"], returnPath: "/oauth/" }).includes('RETURN_PATH = "/oauth/";'), "the popup Robolectric test is written for the app");
+  // Sign-in in an Auth Tab (Android): template, MainActivity wiring, one return path, the fallback.
+  const signInJava = androidTemplate("ShellSignIn.java", { appId: "io.example.app", host: "app.example.com:8443", authHosts: ["beta.mitralab.io", "accounts.google.com"] });
+  assert(signInJava.startsWith("package io.example.app;") && signInJava.includes('APP_HOST = "app.example.com";') && signInJava.includes('AUTH_HOSTS = { "beta.mitralab.io", "accounts.google.com" };') && !/__[A-Z_]+__/.test(signInJava), "the sign-in class is written for the app package, the app host without the port and the sign-in hosts");
+  assert(androidTemplate("ShellSignIn.java", { appId: "io.example.app", host: "app.example.com", authHosts: ["api.example.com:8443", "API.example.com", "accounts.google.com"] }).includes('{ "api.example.com", "accounts.google.com" }'), "a sign-in host given with a port or in another case is compared by its name, once");
+  assert(androidTemplate("ShellSignIn.java", { appId: "io.a$&b", host: "h.example.com", authHosts: ["a$&b.example"] }).includes('{ "a$&b.example" }'), "the sign-in hosts substitution is literal");
+  assert(signInJava.includes('AUTH_CANCEL_EVENT = "mitrashell:authcancel"') && signInJava.includes('AUTH_FAIL_EVENT = "mitrashell:authfail"') && signInJava.includes("bridge.triggerWindowJSEvent(resultCode == AuthTabIntent.RESULT_CANCELED ? AUTH_CANCEL_EVENT : AUTH_FAIL_EVENT);"), "the Android sign-in names the two events it dispatches in the page, a cancel apart from a failure");
+  assert(signInJava.includes("if (request.isForMainFrame() && signIn.start(request.getUrl())) return true;") && signInJava.includes("return super.shouldOverrideUrlLoading(view, request);") && signInJava.includes("class Client extends BridgeWebViewClient"), "only a main frame navigation is taken, and the rest stays with the bridge's client");
+  assert(signInJava.includes("!APP_HOST.equalsIgnoreCase(host) && Arrays.asList(AUTH_HOSTS).contains(host)") && signInJava.includes('!"https".equalsIgnoreCase(url.getScheme())'), "a sign-in is an https URL of a sign-in host that is not the app host");
+  assert(signInJava.indexOf("returnLoader.load(resultUri)) return;") < signInJava.indexOf("if (!wasOpen) return;") && signInJava.indexOf("if (!wasOpen) return;") < signInJava.indexOf("bridge.triggerWindowJSEvent("), "a return always loads through the activity, and only a sign-in this instance opened tells the page, once");
+  assert(signInJava.indexOf("if (inAuthTab) return true;") > 0 && signInJava.indexOf("if (inAuthTab) return true;") < signInJava.indexOf("browser.launchSignIn("), "a second sign-in navigation while the Auth Tab is up opens nothing");
+  assert(mainJava.includes("if (returned.equals(lastReturn) && now - lastReturnAt < SAME_RETURN_WINDOW_MS) return true;") && mainJava.indexOf("SAME_RETURN_WINDOW_MS) return true;") < mainJava.indexOf("String serverUrl"), "the same return handed over twice loads once");
+  assert(signInJava.includes("if (callbackScheme == null || !isSignIn(url)) return false;") && signInJava.includes("if (!browser.launchSignIn(url, callbackScheme)) return false;") && !signInJava.includes("EXTRA_HTTPS_REDIRECT"), "without a URL scheme or an Auth Tab the navigation is left to the bridge");
+  assert(popupsJava.includes("if (!support.isSupported(activity)) return false;") && popupsJava.includes("new AuthTabIntent.Builder().build().launch(authTab, url, redirectScheme);"), "the sign-in Auth Tab returns by the scheme and has no Custom Tab fallback");
+  assert(mainJava.split("signIn = ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn);").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSignIn.install(") && mainJava.includes("ShellSignIn signIn() {"), "MainActivity installs the sign-in once, after super.onCreate");
+  assert(mainJava.split("boolean loadReturn(Uri data) {").length === 2 && mainJava.split("appendQueryParameter(SHELL_LINK_PARAM").length === 2 && mainJava.indexOf("popups.onReturnLink(data)) return;") < mainJava.indexOf("loadReturn(data);\n    }") && mainJava.indexOf("loadReturn(data);\n    }") < mainJava.indexOf("boolean loadReturn(Uri data) {"), "a link and the Auth Tab result load the return through the same code, after the popups had their turn");
+  assert(mainJava.includes("static final String CALLBACK_SCHEME = null;") && mainActivityJava("io.example.app", "io.example.app").includes('static final String CALLBACK_SCHEME = "io.example.app";'), "MainActivity hands the sign-in the callback scheme, or none");
+  const signInTest = androidTemplate("ShellSignInTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(signInTest.startsWith("package io.example.app;") && signInTest.includes('"https://app.example.com/home"') && signInTest.includes("RobolectricTestRunner") && signInTest.includes("MainActivity.CALLBACK_SCHEME") && !/__[A-Z_]+__/.test(signInTest), "the sign-in Robolectric test is written for the app package and host");
   assert(swift.includes("createWebViewWith") && swift.includes("Callback.https(host:"), "the iOS template implements the popup contract");
   // Background audio on Android: manifest, classes, activity wiring, dependency, the script.
   const appManifest = `<manifest>\n    <application>\n        <activity android:name=".MainActivity" />\n    </application>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;

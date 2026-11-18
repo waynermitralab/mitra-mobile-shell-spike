@@ -113,6 +113,9 @@ jobs:
           test -f android/app/src/main/java/cloud/mitra/cifixture/ShellPopups.java
           test -f android/app/src/main/java/cloud/mitra/cifixture/PopupPolicy.java
           test -f android/app/src/test/java/cloud/mitra/cifixture/ShellPopupsTest.java
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellSignIn.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellSignInTest.java
+          test "$(grep -c 'ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn)' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
       - name: Generate a shell from a page that declares viewport-fit=cover, no override
         run: node generator/generate.mjs --url "$FIXTURE_URL/cover" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-cover"
       - name: Check the detected cover reaches the config

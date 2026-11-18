@@ -293,7 +293,7 @@ Options, with a flag or a descriptor field, and echoed in `capacitor.config.json
 | `--consent-hosts a.com,b.com` | `consentHosts` | `accounts.google.com`, `login.microsoftonline.com`, `login.live.com`, `appleid.apple.com`, `github.com`, `api.notion.com`, `slack.com`; the flag and the descriptor add to them, and the app host is never in the list |
 | `--return-path /oauth/` | `returnPath` | `/oauth/`; a path prefix that starts and ends with `/`, and is not `/` itself |
 
-The consent list is not `authHosts` (the sign-in hosts on iOS, which include the platform API host
+The consent list is not `authHosts` (the sign-in hosts, which include the platform API host
 and the auth page host): a `window.open` to those keeps opening in the system browser.
 
 The return prefix must not cover the path where the sign-in of the app comes back. The sign-in uses
@@ -420,7 +420,7 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
 | `--background-audio` | Keep the microphone of a live voice conversation with the screen locked: the `audio` background mode on iOS, a microphone foreground service on Android, see Background audio |
-| `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session on iOS |
+| `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session (iOS) and in the Auth Tab (Android) |
 | `--consent-hosts a.com,b.com` | Extra hosts whose `window.open` is an account connection, see Account connections in a popup |
 | `--return-path /oauth/` | Path prefix on the app host where a connection comes back (default `/oauth/`) |
 | `--push`, `--google-services <file>` | Push notifications, see below |
@@ -446,6 +446,46 @@ URL fragment. The shell has two ways to get it back into the WebView:
   account connections). It needs `--associated-domains` and the host serving `/.well-known/apple-app-site-association` and
   `/.well-known/assetlinks.json`, which `generator/wellknown.mjs` writes. No other app can claim
   the host, so this is the path for apps where the scheme risk is not acceptable.
+
+On Android, with `--callback scheme`, the sign-in runs in an Auth Tab when the default browser has
+one (androidx.browser 1.9, Chrome 137 and later): a sheet of the browser over the app, with the
+browser's cookies, that tells the shell how it ended. `ShellSignIn` replaces the bridge's web view
+client and takes a navigation of the main frame to an `https` URL whose host is in `authHosts` and
+is not the app host; the page does not navigate, and asking again while the tab is up opens nothing
+more. A frame, another host, `http` and `window.open` stay with the bridge as before. The Auth Tab
+returns by the URL scheme. What comes back loads in the page through the code a link takes in
+`MainActivity` (`loadReturn`): the app host with the same fragment and a fresh `shellLink` query
+value, so the SDK finishes the sign-in at boot. The same return handed over twice within three
+seconds (as the Auth Tab result and as a link) loads once.
+
+An Auth Tab that ends without a return loads nothing, so the Android shell tells the page, with an
+event on `window` (no detail), once for each sign-in:
+
+- `mitrashell:authcancel`: the user closed the Auth Tab.
+- `mitrashell:authfail`: the Auth Tab gave a result that is neither a return nor a cancel, or a URL
+  that is not a return of the app. On Android a failure is the event only: the shell does not open
+  the sign-in in the system browser afterwards.
+
+On Android the events exist only for a sign-in that ran in an Auth Tab. With `--callback https`, or
+without an Auth Tab (another default browser, an older Chrome, or one that could not start), nothing
+changes and neither event is dispatched: the bridge sends the sign-in to the system browser, and the
+return comes back as a link, by the App Link or the scheme, through `MainActivity.onNewIntent`. The
+https return stays there because the Auth Tab matches an https return by one exact path, and that
+sign-in ends on any path of the host. When Android recreates the activity while the tab is up, the
+return still loads, and a cancel or a failure is not reported, as the page that waited is gone. The
+account connections in a popup do not use the events: there the page sees the child window close.
+The generated project carries `ShellSignInTest.java`, a Robolectric test on the real Bridge, the
+real `AuthTabIntent` and the activity result registry: which navigations are taken, the callback
+handed to the Auth Tab, the reload with `shellLink` and the fragment, the two events, one signal
+for each sign-in, a recreated activity, and the path without an Auth Tab. It has a case for the
+https return too, which only runs in a project generated with `--callback https`; `ci.yml`
+generates with the scheme, so CI does not run it. What Chrome does with the intent was not
+exercised on a device.
+
+The keyboard needs nothing from the shell on Android: Capacitor's `SystemBars` plugin (on by
+default, `insetsHandling` not `disable`) pads the window's decor view by the keyboard inset while
+the keyboard is up, with the page under the bars or not, so the web view shrinks and a composer at
+the bottom stays above the keyboard.
 
 ### Push (`--push`)
 
