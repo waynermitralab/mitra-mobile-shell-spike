@@ -48,6 +48,11 @@ on:
         description: "Keep the microphone of a live voice conversation with the screen locked: the audio background mode on iOS, a microphone foreground service on Android (only for apps that use it: App Review rejects the mode otherwise, and Play asks for a foreground service declaration)"
         type: boolean
         default: false
+      ios_keyboard:
+        description: "What the iOS shell does when the keyboard opens: resize (the web view ends at the keyboard), notify (the page moves itself on mitrashell:keyboard) or off (plain WebKit; the page can still ask for another mode)"
+        type: choice
+        options: [resize, notify, "off"]
+        default: resize
       push:
         description: "Push notifications: aps entitlement on iOS; on Android only when the GOOGLE_SERVICES_JSON_B64 secret has this app (else Android is built without the push plugin)"
         type: boolean
@@ -89,6 +94,7 @@ env:
   INPUT_ASSOCIATED_DOMAINS: ${{ inputs.associated_domains }}
   INPUT_BACKGROUND_AUDIO: ${{ inputs.background_audio }}
   INPUT_PUSH: ${{ inputs.push }}
+  INPUT_IOS_KEYBOARD: ${{ inputs.ios_keyboard }}
 
 jobs:
   # The build number is resolved once, before both builds: reading the Play history opens an edit,
@@ -288,6 +294,7 @@ jobs:
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
           [ "$INPUT_ASSOCIATED_DOMAINS" = "true" ] && args+=(--associated-domains)
           [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
+          args+=(--ios-keyboard "$INPUT_IOS_KEYBOARD")
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/generate.mjs "${args[@]}"
       - name: Unsigned device build
@@ -391,5 +398,6 @@ jobs:
             echo "- iOS: $IOS_RESULT"
             echo "- associated domains: $INPUT_ASSOCIATED_DOMAINS"
             echo "- background audio: $INPUT_BACKGROUND_AUDIO"
+            echo "- iOS keyboard: $INPUT_IOS_KEYBOARD"
             echo "- push: $INPUT_PUSH"
           } >> "$GITHUB_STEP_SUMMARY"

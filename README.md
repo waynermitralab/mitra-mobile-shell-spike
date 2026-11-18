@@ -671,6 +671,7 @@ cannot be read stops, unless `build_number` is given.
 | `build_number` | empty | Override the build number |
 | `associated_domains` | `true` | Declare `applinks` and `webcredentials` on iOS |
 | `background_audio` | `false` | Generate with `--background-audio` (iOS and Android) |
+| `ios_keyboard` | `resize` | Generate with `--ios-keyboard` (`resize`, `notify` or `off`), see Keyboard |
 | `push` | `false` | Generate with `--push` |
 | `upload_testflight` | `false` | Archive, upload to TestFlight and add the build to the group |
 | `testflight_group` | `Mitra shell testers` | TestFlight group that receives the build |
