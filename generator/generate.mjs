@@ -11,6 +11,7 @@
 //          [--consent-hosts a.com,b.com] [--return-path /oauth/]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
+//          [--ios-tests]
 //          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
@@ -140,7 +141,7 @@ const DEFAULT_RETURN_PATH = "/oauth/";
 // Shipped only with --background-audio, see withVoiceService.
 const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
 const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle"];
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "notifyPage"];
 
 if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
@@ -376,6 +377,12 @@ patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme
 // ---------- 5. iOS patches ----------
 if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
+// --ios-tests (CI): the XCTest target of the shell's sign-in, see generator/ios-tests.rb. Never in a
+// store build, which archives the App target alone anyway.
+if (wantIos && flags["ios-tests"]) {
+  run("ruby", [join(here, "ios-tests.rb"), join(projectDir, "ios", "App", "App.xcodeproj"), join(here, "templates", "ios-tests")], projectDir);
+  log("ios      AppTests target (generator/templates/ios-tests), shared App scheme with the test action");
+}
 
 // ---------- 6. Assets, sync, CI ----------
 run("npx", capacitorAssetsArgs(brand), projectDir);
@@ -2014,11 +2021,20 @@ async function selftest() {
   const swift = readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8");
   assert(!missingSwiftMembers(swift).length, `SceneDelegate.swift calls ${missingSwiftMembers(swift)} but does not define it`);
   for (const name of SWIFT_MEMBERS) {
-    const broken = swift.replace(new RegExp(`(var|func) ${name}\\b`), "let $1_x").replace("init?(hex:", "init?(hexx:");
+    const broken = swift.replace(new RegExp(`(var|func) ${name}\\b`, "g"), "let $1_x").replace("init?(hex:", "init?(hexx:");
     assert(missingSwiftMembers(broken).includes(name), `the Swift check does not notice ${name} going missing`);
   }
   assert(missingSwiftMembers(swift.replace("init?(hex:", "init?(hexx:")).includes("init?(hex"), "the Swift check does not notice init?(hex going missing");
-  assert(missingSwiftMembers(swift.replace("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
+  assert(missingSwiftMembers(swift.replaceAll("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
+  const didLoad = swift.slice(swift.indexOf("override func capacitorDidLoad()"), swift.indexOf("private func hideFormAccessoryBar()"));
+  assert(didLoad.includes("hideFormAccessoryBar()") && swift.includes('NSStringFromClass($0).hasPrefix("WKContent")') && swift.includes("objc_allocateClassPair(base, name, 0)") && swift.includes("#selector(getter: UIResponder.inputAccessoryView)") && swift.includes("object_setClass(content, subclass)"), "iOS hides the form accessory bar of the web view from capacitorDidLoad");
+  const plugin = swift.slice(swift.indexOf("class MitraShellPlugin"));
+  assert(plugin.includes('authCancelEvent = "mitrashell:authcancel"') && plugin.includes('authFailEvent = "mitrashell:authfail"') && plugin.includes("bridge?.triggerWindowJSEvent(eventName: event)"), "the sign-in session names the two events it dispatches in the page");
+  assert(plugin.includes("guard !finished else { return }") && plugin.includes("if !session.start(), !finished {"), "a sign-in session ends once: one event and at most one browser fallback");
+  const fallbacks = plugin.split("openInBrowser(url)");
+  assert(fallbacks.length === 3 && fallbacks.slice(0, -1).every((before) => /notifyPage\(MitraShellPlugin\.authFailEvent\)\s*(self\?\.)?$/.test(before)), "every fallback of the sign-in to the browser tells the page first");
+  assert(plugin.split("UIApplication.shared.open(").length === 2, "the browser fallback opens the system browser in one place");
+  assert(/if cancelled \{\s*self\?\.notifyPage\(MitraShellPlugin\.authCancelEvent\)/.test(plugin), "a cancelled sign-in tells the page");
   // The plain-logo fallback keeps the theme color and drops the entrance.
   const asIs = { bg: "#0f172a", isDarkBg: true, frames: [], branch: "fallback" };
   const plainTheme = patchLaunchTheme(capacitorStyles, asIs);

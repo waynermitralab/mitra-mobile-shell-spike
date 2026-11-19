@@ -180,3 +180,40 @@ jobs:
           test "$(grep -c 'ShellVoiceCapture.install(getBridge())' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
           node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
 
+
+  # The sign-in of the iOS shell on the real plugin, in the simulator: the project is generated with
+  # --ios-tests (generator/ios-tests.rb adds the AppTests target, templates/ios-tests has the cases).
+  # The system sheet is replaced by a fake session the test ends by hand; nothing here needs a secret.
+  ios:
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+    env:
+      FIXTURE_URL: http://127.0.0.1:8099
+      FIXTURE_APP_ID: cloud.mitra.cifixture
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Serve the fixture page
+        run: |
+          node -e 'require("http").createServer((req, res) => res.end("<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$FIXTURE_URL" > /dev/null
+      - name: Generate a shell with the iOS test target
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --ios-tests --out "$RUNNER_TEMP/out"
+      - name: Run the iOS sign-in tests in the simulator
+        working-directory: ${{ runner.temp }}/out/cifixture/ios/App
+        run: |
+          set -o pipefail
+          UDID="$(xcrun simctl list devices available -j | node -e '
+            const d = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
+            const all = Object.entries(d).filter(([k]) => k.includes("iOS")).sort().reverse().flatMap(([, v]) => v);
+            console.log((all.find((x) => /^iPhone/.test(x.name)) || {}).udid || "");
+          ')"
+          [ -n "$UDID" ] || { echo "::error::No iPhone simulator on this runner"; exit 1; }
+          xcodebuild test -project App.xcodeproj -scheme App -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" | grep -E "error:|Test Case|Executed|\*\* TEST"

@@ -482,10 +482,50 @@ https return too, which only runs in a project generated with `--callback https`
 generates with the scheme, so CI does not run it. What Chrome does with the intent was not
 exercised on a device.
 
+On iOS 17.4 and later the sign-in runs in an `ASWebAuthenticationSession`, and a session that ends
+without a return loads nothing, so a page that shows the sign-in in progress would stay that way.
+The shell tells the page instead, with an event on `window` (no detail), and the page can put its
+button back:
+
+- `mitrashell:authcancel`: the user closed the sign-in sheet.
+- `mitrashell:authfail`: the session failed or could not start, or came back with a URL that is not
+  a return of the app. When it failed, the sign-in then opens in the system browser, as before.
+
+```js
+window.addEventListener("mitrashell:authcancel", resetSignInButton);
+window.addEventListener("mitrashell:authfail", resetSignInButton);
+```
+
+Below iOS 17.4 neither event exists: the sign-in goes to the system browser. The account
+connections in a popup do not use them: there the page sees the child window close.
+
+The iOS sign-in has a test on the real plugin: `generate.mjs --ios-tests` adds an `AppTests` target
+hosted by the app (`generator/ios-tests.rb`, with the xcodeproj gem CocoaPods ships) and a shared
+`App` scheme, and the `ios` job of `ci.yml` runs it in the simulator. The plugin starts its session
+through a seam (`sessionFactory`, `browserOpener`, `pageNotifier`, nil in the app), so the cases in
+`generator/templates/ios-tests/ShellSignInTests.swift` end a fake session by hand: a valid return,
+a cancel, a failure, a return that is not of the app, `start()` false with and without a completion
+inside it, late and duplicate completions, and two sign-ins in a row. Each checks the page event
+(one per sign-in), the browser fallback (at most one) and what loads in the shell. The real factory
+is checked to make a non-ephemeral `ASWebAuthenticationSession` presented by the plugin. The system
+sheet itself is not driven.
+
 The keyboard needs nothing from the shell on Android: Capacitor's `SystemBars` plugin (on by
 default, `insetsHandling` not `disable`) pads the window's decor view by the keyboard inset while
 the keyboard is up, with the page under the bars or not, so the web view shrinks and a composer at
 the bottom stays above the keyboard.
+
+### Keyboard form bar (iOS)
+
+WKWebView puts a bar above the keyboard of a form field (previous, next, Done), which reads as a web
+page. Every iOS shell hides it, with no page change and no Keyboard plugin: `SceneDelegate.swift`
+gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil. The
+Capacitor Keyboard plugin can hide the bar too; the shell does it itself so that no app carries a
+plugin, with its keyboard resize handling and JS surface, for this one effect. Without the bar
+there is no Done button, so a field whose keyboard has no return or go key closes only when the page blurs it. The
+wheel pickers lose their Done too (a `<select>`, a date or time input in wheel mode): they close by
+a tap outside them. If a
+WebKit release renames the content view, the bar just stays.
 
 ### Push (`--push`)
 
