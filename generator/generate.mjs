@@ -13,6 +13,7 @@
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
 //          [--ios-tests]
 //          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
+//          [--ios-keyboard resize|notify|off]      (default: resize, the iOS web view ends at the keyboard)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
 // (public, no token) gives name, published origins, accent color and the login logo. The page
@@ -141,7 +142,13 @@ const DEFAULT_RETURN_PATH = "/oauth/";
 // Shipped only with --background-audio, see withVoiceService.
 const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
 const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "notifyPage"];
+// What the iOS shell does when the keyboard opens, see installKeyboard in SceneDelegate.swift.
+const IOS_KEYBOARD_MODES = {
+  resize: "the web view ends at the keyboard (the page viewport shrinks)",
+  notify: "the web view keeps its height and the page moves itself on mitrashell:keyboard",
+  off: "plain WebKit, no keyboard event"
+};
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "installKeyboard", "notifyKeyboard", "switchKeyboardMode", "fitToKeyboard", "dropStrayScroll", "holdDocumentPan", "revealFocusedField", "notifyPage"];
 
 if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
@@ -181,6 +188,11 @@ if (!isVersionName(versionName)) fail(`--version must look like 1, 1.2 or 1.2.3,
 const buildNumber = Number(flags["build-number"] || descriptor.buildNumber || 1);
 if (!Number.isInteger(buildNumber) || buildNumber < 1) fail("--build-number must be a positive integer");
 const associatedDomains = Boolean(flags["associated-domains"] || descriptor.associatedDomains);
+// SceneDelegate reads it at runtime (plugins.MitraShell.keyboard).
+let iosKeyboard;
+try {
+  iosKeyboard = resolveIosKeyboard(flags["ios-keyboard"], descriptor.iosKeyboard, descriptor.iosKeyboardResize);
+} catch (e) { fail(e.message); }
 // Platform neutral: iOS gets its plist entry (patchIos) and Android its foreground service (patchAndroid).
 const backgroundAudio = Boolean(flags["background-audio"] || descriptor.backgroundAudio);
 const callback = String(flags.callback || descriptor.callback || "scheme");
@@ -251,6 +263,7 @@ if (!flags.identity) {
   else iconLine = `(none, drawing the initials ${initials(appName, slug)})`;
   log(`icon     ${iconLine}`);
 }
+log(`keyboard ios ${iosKeyboard}: ${IOS_KEYBOARD_MODES[iosKeyboard]}`);
 log(`audio    background audio ${backgroundAudio ? "on (ios audio mode, android microphone service)" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
@@ -353,7 +366,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
     // a shift when the page is known to declare cover.
     ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
-    MitraShell: { authHosts, consentHosts, returnPath, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
+    MitraShell: { authHosts, consentHosts, returnPath, keyboard: iosKeyboard, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
   }
 });
@@ -361,7 +374,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
+  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, iosKeyboard: iosKeyboard === "resize" ? undefined : iosKeyboard, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -432,6 +445,16 @@ function resolveContentInset(override, pageOwnsSafeArea) {
   if (override == null) return pageOwnsSafeArea ? "never" : "automatic";
   if (!["never", "automatic"].includes(override)) throw new Error(`--ios-content-inset must be never or automatic, got ${JSON.stringify(override)}`);
   return override;
+}
+// The flag wins over the descriptor (null counts as none), and resize is the default: it is the
+// mode that needs nothing from the page.
+// iosKeyboardResize is the boolean of a version that was never released: a descriptor that still
+// carries it fails, since ignoring it would turn a shell that asked for no resize into one that resizes.
+function resolveIosKeyboard(flag, descriptorValue, retiredResize) {
+  if (retiredResize !== undefined) throw new Error(`iosKeyboardResize in the descriptor was replaced by iosKeyboard: use "iosKeyboard": "off" for false, and drop the key for true`);
+  const mode = flag ?? descriptorValue ?? "resize";
+  if (!Object.hasOwn(IOS_KEYBOARD_MODES, mode)) throw new Error(`--ios-keyboard must be resize, notify or off, got ${JSON.stringify(mode)}`);
+  return mode;
 }
 // Whether the page reserves the safe area itself: its viewport meta carries viewport-fit=cover.
 // Then the native scroll view must not add the inset too, or the status bar height shows up twice
@@ -2028,7 +2051,29 @@ async function selftest() {
   assert(missingSwiftMembers(swift.replaceAll("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
   const didLoad = swift.slice(swift.indexOf("override func capacitorDidLoad()"), swift.indexOf("private func hideFormAccessoryBar()"));
   assert(didLoad.includes("hideFormAccessoryBar()") && swift.includes('NSStringFromClass($0).hasPrefix("WKContent")') && swift.includes("objc_allocateClassPair(base, name, 0)") && swift.includes("#selector(getter: UIResponder.inputAccessoryView)") && swift.includes("object_setClass(content, subclass)"), "iOS hides the form accessory bar of the web view from capacitorDidLoad");
+  const keyboard = swift.slice(swift.indexOf("private func installKeyboard()"), swift.indexOf("// The popup contract needs"));
+  assert(didLoad.includes("installKeyboard()") && swift.includes("private enum KeyboardMode: String { case resize, notify, off }") && keyboard.includes('KeyboardMode(rawValue: bridge?.config.getPluginConfig("MitraShell").getString("keyboard") ?? "") ?? .resize') && keyboard.includes("defaultKeyboardMode = mode") && !keyboard.includes("guard mode != .off"), "iOS reads the default keyboard mode from the config in capacitorDidLoad, resize when it is missing, and follows the keyboard in every mode");
+  assert(!swift.includes("isLoading") && keyboard.includes("content.add(documents, name: KeyboardDocumentHandler.name)") && keyboard.includes("source: Self.documentStartScript(mode: mode.rawValue),") && /return "window\.__mitraShellKeyboard = \\\(state\);\\n"\s*\+ "window\.webkit\.messageHandlers\.\\\(KeyboardDocumentHandler\.name\)\.postMessage\(\\"\\"\)"/.test(keyboard) && keyboard.includes('json(["phase": "didHide", "mode": mode, "height": 0])') && keyboard.includes("injectionTime: .atDocumentStart, forMainFrameOnly: true))") && /fileprivate func keyboardDocumentStarted\(\) \{\s*applyKeyboardMode\(defaultKeyboardMode\)\s*publishKeyboardState\(\)\s*if keyboardMode != \.off && keyboardOverlap > 0 \{ sendKeyboardEvent\(keyboardPhase, duration: 0, curve: 0\) \}/.test(keyboard), "a committed document, not the start of a load, has the state of a new document before the page's scripts, then puts the configured mode back, gets the real state and, with the keyboard up, the event");
+  assert(swift.includes('static let name = "mitraShellDocument"') && swift.includes("weak var shell: ShellBridgeViewController?") && /guard message\.frameInfo\.isMainFrame else \{ return \}\s*shell\?\.keyboardDocumentStarted\(\)/.test(swift), "the new document message counts only from the main frame and does not keep the controller alive");
+  assert(/keyboardPhase = phase\s*announcedHeight = height\s*sendKeyboardEvent\(phase, duration: duration, curve: curve\)/.test(keyboard) && /private func sendKeyboardEvent\(_ phase: String, duration: Double, curve: UInt\) \{\s*let height = Double\(keyboardOverlap\)\s*guard keyboardMode != \.off, height\.isFinite, duration\.isFinite else \{ return \}/.test(keyboard) && keyboard.includes("guard keyboardOverlap > 0, keyboardMode != .off, let scrollView") && keyboard.includes('["phase": silent ? "didHide" : keyboardPhase, "mode": keyboardMode.rawValue, "height": silent ? 0 : announcedHeight]'), "off sends no event, leaves the scroll alone and never reports a keyboard, while the shell still tracks it");
+  const apply = keyboard.slice(keyboard.indexOf("private func applyKeyboardMode("), keyboard.indexOf("// The keyboard reports curve 7"));
+  assert(apply.includes("guard mode != keyboardMode else { return }") && apply.includes("if let container = view.superview, view.frame != container.bounds { view.frame = container.bounds }") && apply.includes("if mode == .resize { resizeForKeyboard(taller: keyboardOverlap > 0, duration: 0, curve: 0) }") && apply.includes("publishKeyboardState()") && !apply.includes("notifyKeyboard("), "a mode switch restores or applies the frame at once, publishes the state and makes up no event");
+  assert(keyboard.includes("guard let mode = KeyboardMode(rawValue: name) else { return nil }"), "a name that is not a mode changes nothing");
+  assert(Object.keys(IOS_KEYBOARD_MODES).join() === "resize,notify,off", "the generator and the Swift enum name the same keyboard modes");
+  assert(keyboard.includes('static let keyboardEvent = "mitrashell:keyboard"') && keyboard.includes('var event = new Event("\\(Self.keyboardEvent)");') && keyboard.includes("for (var name in fields) event[name] = fields[name];") && keyboard.includes("window.dispatchEvent(event);") && !keyboard.includes("triggerWindowJSEvent(eventName: Self.keyboardEvent") && ["willShow", "didShow", "willHide", "didHide"].every((phase) => keyboard.includes(`"${phase}"`)) && ["mode", "phase", "height", "duration", "curve", "easing"].every((field) => keyboard.includes(`"${field}":`)) && keyboard.includes('"mode": keyboardMode.rawValue'), "the page gets mitrashell:keyboard with the mode, the four phases and the other fields, as JSON");
+  assert(keyboard.includes("guard phase != keyboardPhase || height != announcedHeight, height.isFinite, duration.isFinite else { return }") && keyboard.indexOf('notifyKeyboard(overlap > 0 ? "willShow" : "willHide"') < keyboard.indexOf("resizeForKeyboard(taller: taller") && keyboard.includes("if shown == (keyboardOverlap > 0)"), "a keyboard event is sent once, before the frame moves, and a late didShow or didHide that does not match the state is dropped");
+  assert(keyboard.includes('default: return "cubic-bezier(0.38, 0.7, 0.125, 1)"') && ['case 0: return "ease-in-out"', 'case 1: return "ease-in"', 'case 2: return "ease-out"', 'case 3: return "linear"'].every((c) => keyboard.includes(c)), "the public curves map to their CSS names and the keyboard's own to a bezier");
+  assert(keyboard.includes("guard keyboardMode == .resize, let container = view.superview else { return }") && /if keyboardMode == \.resize \{\s*resizeForKeyboard\(taller: taller, duration: duration, curve: curve\)\s*\} else \{\s*dropStrayScroll\(\)/.test(keyboard) && keyboard.indexOf("revealFocusedField()") > keyboard.indexOf("private func beginSettling()"), "notify mode never touches the frame and never scrolls to the field: it only drops the stray scroll");
+  assert(keyboard.includes("let hold = keyboardMode == .notify && keyboardOverlap > 0 && documentFits(scrollView)") && keyboard.includes("scrollView.panGestureRecognizer.isEnabled = !hold") && keyboard.indexOf("holdDocumentPan()", keyboard.indexOf('notifyKeyboard(overlap > 0 ? "willShow" : "willHide"')) > 0 && apply.includes("holdDocumentPan()"), "in notify a document that fits cannot be dragged while the keyboard is up, and the pan comes back with the keyboard down or another mode");
+  assert(swift.includes('URLComponents(string: "\\(server.scheme ?? "https")://\\(appHost)\\(server.port.map { ":\\($0)" } ?? "")/")') && !swift.includes('URLComponents(string: "https://\\(appHost)/")'), "a return on the scheme goes to the origin of server.url, scheme and port included");
+  assert(["keyboardWillChangeFrameNotification", "keyboardWillShowNotification", "keyboardWillHideNotification", "keyboardDidShowNotification", "keyboardDidHideNotification"].every((n) => keyboard.includes(`UIResponder.${n}`)) && keyboard.includes("keyboardAnimationDurationUserInfoKey") && keyboard.includes("UIView.AnimationOptions(rawValue: curve << 16)"), "the resize follows every keyboard frame change with the keyboard's own duration and curve");
+  assert(keyboard.includes("keyboardIsLocalUserInfoKey") && keyboard.includes("window.convert(end, from: window.screen.coordinateSpace)") && keyboard.includes("keyboard.intersects(bounds), keyboard.maxY >= bounds.maxY - 1"), "only a docked keyboard of this app, measured in the window, takes space from the page");
+  assert(/override func viewDidLayoutSubviews\(\) \{\s*super\.viewDidLayoutSubviews\(\)\s*fitToKeyboard\(\)/.test(keyboard) && /super\.viewDidAppear\(animated\)\s*fitToKeyboard\(\)/.test(swift), "the frame is applied again on every layout and when the view comes back, so a hide missed off screen cannot leave it short");
+  assert(keyboard.includes("UIResponder.keyboardDidChangeFrameNotification") && keyboard.includes("settleTimer?.cancel()") && keyboard.includes('field.tagName === "IFRAME"') && keyboard.includes("if (!box.width || !box.height || box.height > window.innerHeight) return;"), "the keyboard is measured again after rotation, the settle timer is cancellable, and an iframe, an empty box or one taller than the viewport is not scrolled to");
+  assert(/guard abs\(scrollView\.contentOffset\.y - top\) > 0\.5, holdsTop \|\| documentFits\(scrollView\) else \{ return \}/.test(keyboard) && !keyboard.includes("isScrollEnabled"), "the scroll offset is put back only for a document that fits the viewport, and scrolling stays on");
+  assert(keyboard.includes("box.top < 0 || box.bottom > window.innerHeight") && keyboard.includes('field.scrollIntoView({ block: "center" })'), "a focused field is scrolled to only when the shorter viewport left it out of view");
   const plugin = swift.slice(swift.indexOf("class MitraShellPlugin"));
+  assert(/pluginMethods: \[CAPPluginMethod\] = \[\s*CAPPluginMethod\(name: "setKeyboardMode", returnType: CAPPluginReturnPromise\)\s*\]/.test(plugin) && plugin.includes("@objc func setKeyboardMode(_ call: CAPPluginCall)") && plugin.includes('return call.reject("mode must be resize, notify or off")') && plugin.includes('return call.reject("the shell is not ready")') && plugin.includes("call.resolve(state)") && /DispatchQueue\.main\.async \{\s*guard let shell = self\.bridge\?\.viewController as\? ShellBridgeViewController/.test(plugin), "setKeyboardMode is the only plugin method: it runs on the main thread, resolves with the state and rejects a value that is not a mode");
   assert(plugin.includes('authCancelEvent = "mitrashell:authcancel"') && plugin.includes('authFailEvent = "mitrashell:authfail"') && plugin.includes("bridge?.triggerWindowJSEvent(eventName: event)"), "the sign-in session names the two events it dispatches in the page");
   assert(plugin.includes("guard !finished else { return }") && plugin.includes("if !session.start(), !finished {"), "a sign-in session ends once: one event and at most one browser fallback");
   const fallbacks = plugin.split("openInBrowser(url)");
@@ -2065,6 +2110,12 @@ async function selftest() {
   }
   assert(pageHandlesSafeArea(`${"<!--".repeat(50000)}${viewport("viewport-fit=cover")}`) === false, "many unterminated comments finish and hide the meta");
   assert(resolveContentInset(undefined, true) === "never" && resolveContentInset(null, false) === "automatic" && resolveContentInset(null, true) === "never", "a null or missing override falls back to detection");
+  assert(keyboard.includes("if landed, let announced = announcedFrame, end != announced, bounds == announcedBounds { return }"), "a didChangeFrame whose frame is not the announced one is dropped unless the window changed size");
+  assert(keyboard.includes("window.__mitraShellKeyboard = \\(state);") && keyboard.indexOf("window.__mitraShellKeyboard = \\(state);") < keyboard.indexOf("window.dispatchEvent(event);") && keyboard.includes("return Self.json(keyboardStateFields())"), "the last keyboard state is left on window before each event and again when a document finishes loading");
+  assert(throws(() => resolveIosKeyboard(undefined, undefined, false)) && throws(() => resolveIosKeyboard("off", undefined, true)), "a descriptor with the retired iosKeyboardResize key fails instead of being ignored");
+  assert(resolveIosKeyboard(undefined, undefined) === "resize" && resolveIosKeyboard(undefined, null) === "resize", "the iOS keyboard mode is resize by default");
+  assert(resolveIosKeyboard("notify", undefined) === "notify" && resolveIosKeyboard(undefined, "off") === "off" && resolveIosKeyboard("off", "notify") === "off", "the iOS keyboard mode comes from the flag, then from the descriptor");
+  assert(throws(() => resolveIosKeyboard("native", undefined)) && throws(() => resolveIosKeyboard(undefined, false)) && throws(() => resolveIosKeyboard(true, "notify")) && throws(() => resolveIosKeyboard("toString", undefined)), "an iOS keyboard mode must be resize, notify or off, and the flag needs a value");
   assert(resolveContentInset("automatic", true) === "automatic" && throws(() => resolveContentInset("always", true)), "an override wins and must be never or automatic");
   for (const [html, expected, why] of [
     [`<!-->${viewport("viewport-fit=cover")}`, true, "an empty comment <!--> does not swallow the meta"],

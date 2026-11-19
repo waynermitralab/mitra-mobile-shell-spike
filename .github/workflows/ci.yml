@@ -181,9 +181,10 @@ jobs:
           node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
 
 
-  # The sign-in of the iOS shell on the real plugin, in the simulator: the project is generated with
+  # The sign-in and the keyboard of the iOS shell, in the simulator: the project is generated with
   # --ios-tests (generator/ios-tests.rb adds the AppTests target, templates/ios-tests has the cases).
-  # The system sheet is replaced by a fake session the test ends by hand; nothing here needs a secret.
+  # The system sheet is replaced by a fake session the test ends by hand, and the keyboard by the
+  # notifications UIKit posts, on the real view controller and web view; nothing here needs a secret.
   ios:
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     env:
