@@ -612,15 +612,17 @@ class ShellBridgeViewController: CAPBridgeViewController {
     }
 
     // A return on the app host is used as is. One on the scheme, <scheme>://auth#codeMitra=...,
-    // becomes the root of the app with the same fragment: the SDK reads the fragment, never the
-    // scheme. The root keeps the scheme and the port of server.url, since storage belongs to the
-    // origin and a page served on a port would otherwise come back signed in somewhere else.
+    // becomes the page the shell loads, built from server.url itself, with the same fragment: the
+    // SDK reads the fragment, never the scheme. The scheme and the port are kept because storage
+    // belongs to the origin (a page served on a port would otherwise come back signed in somewhere
+    // else), and the path because an app served under one, like /noodle, signs in there.
     func appURL(fromReturn url: URL) -> URL? {
         guard let appHost = appHost else { return nil }
         if url.host?.lowercased() == appHost { return url }
         guard let scheme = url.scheme?.lowercased(), scheme == callbackScheme,
-              let server = bridge?.config.serverURL,
-              var components = URLComponents(string: "\(server.scheme ?? "https")://\(appHost)\(server.port.map { ":\($0)" } ?? "")/") else { return nil }
+              let serverURL = bridge?.config.serverURL,
+              var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false) else { return nil }
+        components.path = serverURL.path.isEmpty ? "/" : serverURL.path
         let incoming = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components.percentEncodedQuery = incoming?.percentEncodedQuery
         components.percentEncodedFragment = incoming?.percentEncodedFragment

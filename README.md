@@ -2,10 +2,13 @@
 
 Capacitor shell generator and store pipeline for Mitra platform apps (App Store and Google Play).
 
-One repository serves every app. Nothing about a specific app is stored here: the generator
-takes an app published by the platform and writes a complete Capacitor project for it (a native
-shell whose WebView loads the published URL), and the workflows build that project and hand it
-to the stores.
+One repository serves every app. The generator takes an app published by the platform and writes
+a complete Capacitor project for it (a native shell whose WebView loads the published URL), and the
+workflows build that project and hand it to the stores. A platform app needs nothing stored here:
+its UUID is enough. The one exception is an app that is not a single platform app, such as the
+Infusion, whose page lives under a path of another app's host and whose name, bundle id and icon
+are its own: its descriptor and icon are kept under `apps/` (see Descriptors in this repository),
+because the store workflow can only read files from this repository.
 
 ## Layout
 
@@ -16,6 +19,8 @@ to the stores.
   `assetlinks.json`) for a generated project.
 - `generator/test/`: tests that need a JVM (`MediaPermissionGateTest.java`, see Microphone and camera, and
   `PopupPolicyTest.java`, see Account connections in a popup).
+- `apps/`: descriptors of the apps that are not one platform app (`apps/<name>.json`) and their
+  icons (`apps/<name>/`). Nothing else about a specific app is stored here.
 - `generator/templates/`: files copied into every generated project (iOS `SceneDelegate.swift`,
   its CI workflow, its `.gitignore`).
 - `package.json` and `package-lock.json`: the pinned Capacitor dependencies. The generator copies
@@ -32,6 +37,26 @@ node generator/generate.mjs --app <app uuid> [--api https://beta.mitralab.io] [f
 node generator/generate.mjs --url https://<published host> [flags]
 node generator/generate.mjs --descriptor path/to/app.json [flags override the file]
 ```
+
+### Descriptors in this repository
+
+A descriptor is the JSON that `mitra-shell.json` echoes (same keys), so a generated project can be
+generated again from itself. `apps/<name>.json` is the descriptor of an app that the store workflow
+builds without a platform UUID (input `descriptor`). Its rules:
+
+- Precedence: a flag (or a workflow input that gives one) wins over the descriptor, and the
+  descriptor wins over what the platform (`app`) or the page (`url`) says. `url` and `app` may
+  both be in the descriptor; the URL it gives is the one the shell loads.
+- Booleans (`associatedDomains`, `backgroundAudio`, `push`, `debug`): `true` in either the flag or
+  the descriptor turns the option on, and a flag cannot turn off what the descriptor turns on. So
+  in `shell.yml` a boolean input left `false` keeps the descriptor's value; the run summary shows
+  the configuration the app got (read from its `mitra-shell.json`), not the inputs.
+- Lists (`authHosts`, `consentHosts`): the flag adds to the descriptor and to the defaults.
+- `url`: `http(s)://host[:port]` with an optional path (`/noodle`), never a query, a fragment or
+  credentials, and each path segment made of `A-Z a-z 0-9 . _ ~ -` (no `.` or `..` segment). The path
+  is where the shell starts and where a sign-in that returns by the URL scheme lands.
+- `icon`: a path relative to the repository root (the workflow runs there) or a URL.
+- `appId` is checked like `--app-id`, and once an app is in a store it must not change.
 
 With `--app` the identity comes from the platform:
 `GET {api}/code-studio/api/v1/apps/{app}/info` (public, no token) gives the name, the published
@@ -480,8 +505,10 @@ real `AuthTabIntent` and the activity result registry: which navigations are tak
 handed to the Auth Tab, the reload with `shellLink` and the fragment, the two events, one signal
 for each sign-in, a recreated activity, and the path without an Auth Tab. It has a case for the
 https return too, which only runs in a project generated with `--callback https`; `ci.yml`
-generates with the scheme, so CI does not run it. What Chrome does with the intent was not
-exercised on a device.
+generates with the scheme, so CI does not run it. `ci.yml` runs it twice, on a project served at
+the root and on one served under `/noodle`, where a return by the scheme must load `/noodle` by the
+Auth Tab and as a link (`SHELL_TEST_APP_PATH` names the path the run asked for). What Chrome does
+with the intent was not exercised on a device.
 
 On iOS 17.4 and later the sign-in runs in an `ASWebAuthenticationSession`, and a session that ends
 without a return loads nothing, so a page that shows the sign-in in progress would stay that way.
@@ -517,8 +544,8 @@ posts the keyboard notifications UIKit posts and loads its own documents, one th
 viewport and one that scrolls. It checks `resize` (the frame ends at the keyboard, `innerHeight` is
 shorter), `notify` and `off` (events and state the page sees), a switch of mode with the keyboard
 up, from the shell and from the page through `setKeyboardMode`, a document that commits (the mode
-of the config again, and with the keyboard up the event a new page needs) and a load that fails
-(the document keeps its mode), the pan and the scroll held or left for each kind of document, and
+of the config again, and with the keyboard up the event a new page needs) and a navigation the
+shell takes over, which does not commit (the document keeps its mode), the pan and the scroll held or left for each kind of document, and
 the state an inline script reads at load. The keyboard itself is not shown: no animation, input
 or real focus is exercised, so the motion is still to be judged on a device.
 
@@ -733,6 +760,7 @@ cannot be read stops, unless `build_number` is given.
 | `app` | empty | Platform app UUID |
 | `api` | `https://beta.mitralab.io` | Platform API base URL |
 | `url` | empty | Published URL, when there is no app UUID |
+| `descriptor` | empty | Descriptor in this repository (`apps/<name>.json`), see Descriptors in this repository. Its fields are the defaults: `app`, `url` and `app_id` override them when given, `version` and `ios_keyboard` always do (they have defaults), and a boolean input only turns an option on |
 | `app_id` | empty | Override the application id and bundle id |
 | `version` | `1.0` | Marketing version |
 | `build_number` | empty | Override the build number |

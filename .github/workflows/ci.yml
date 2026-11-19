@@ -74,6 +74,18 @@ jobs:
       - name: Run the unit tests of the generated Android project
         working-directory: ${{ runner.temp }}/out/cifixture/android
         run: ./gradlew --no-daemon testDebugUnitTest
+      # An app served under a path (the Infusion is /noodle on another app's host): a sign-in that
+      # returns by the scheme lands there, by the Auth Tab and as a link. The sign-in test reads the
+      # path from server.url and checks it against SHELL_TEST_APP_PATH, so the run proves both.
+      - name: Generate a shell served under a path (Android only)
+        run: node generator/generate.mjs --url "$FIXTURE_URL/noodle" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-path"
+      - name: Run the sign-in tests of the shell served under a path
+        working-directory: ${{ runner.temp }}/out-path/cifixture/android
+        env:
+          SHELL_TEST_APP_PATH: /noodle
+        run: |
+          node -e 'process.exit(require("../capacitor.config.json").server.url === process.env.FIXTURE_URL + "/noodle" ? 0 : 1)'
+          ./gradlew --no-daemon testDebugUnitTest --tests '*.ShellSignInTest'
       - name: Check the generated project
         working-directory: ${{ runner.temp }}/out/cifixture
         run: |

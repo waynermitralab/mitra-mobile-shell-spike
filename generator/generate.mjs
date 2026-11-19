@@ -208,6 +208,9 @@ if (!iconSource && !flags.identity) ({ icons: pageIcons, backgroundColor: manife
 const host = new URL(url).host;
 // The host is written into AndroidManifest.xml and the iOS entitlements as is.
 if (!isPlainHost(host)) fail(`Unsupported host in the app URL: ${JSON.stringify(host)}`);
+// The URL may carry a path (an app served under a route of another host, like /noodle): the shell
+// loads it and brings a sign-in back to it. A query or fragment would be dropped on that return.
+if (!isAppUrl(url)) fail(`The app URL must be https://host[/path], without query or fragment, got ${JSON.stringify(url)}`);
 // A bundle id is a valid URL scheme (letters, digits, dot, hyphen), unique per app on the device.
 const callbackScheme = callback === "scheme" ? appId.toLowerCase() : undefined;
 // Hosts whose top-level navigation is a sign-in: the shell opens them in a native auth session
@@ -920,6 +923,16 @@ function withLaunchStatusBar(plist, dark) {
 \t<key>LSRequiresIPhoneOS</key>`);
 }
 
+// CFBundleName is $(PRODUCT_NAME) from cap add, which is "App" for every shell. iOS shows it in
+// system prompts, as the sign-in sheet's "\"App\" Wants to Use ... to Sign In", so it gets the app
+// name, the same one CFBundleDisplayName carries on the home screen. Escaped like the usage strings.
+function withBundleName(plist, appName) {
+  const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
+  const named = plist.replace(/(<key>CFBundleName<\/key>\s*<string>)\$\(PRODUCT_NAME\)(<\/string>)/, (_, open, close) => `${open}${name}${close}`);
+  if (named === plist && !plist.includes(`<key>CFBundleName</key>\n\t<string>${name}</string>`)) fail("Info.plist layout changed, CFBundleName was not set");
+  return named;
+}
+
 // Every app can record voice and take photos through the page (getUserMedia, a file input), and
 // iOS terminates an app that touches the microphone or camera without these strings. The app name
 // comes from a third party and lands in XML, hence the escaping. Keys already present are kept.
@@ -1118,6 +1131,7 @@ function patchIos(dir, { appName, appId, host, versionName, buildNumber, associa
 \t<key>LSRequiresIPhoneOS</key>`);
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
+  plist = withBundleName(plist, appName);
   plist = withUsageDescriptions(plist, appName);
   plist = withBackgroundAudio(plist, backgroundAudio);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
@@ -1293,8 +1307,11 @@ public class MainActivity extends BridgeActivity {
         Uri app = Uri.parse(serverUrl != null ? serverUrl : getBridge().getAppUrl());
         if (CALLBACK_SCHEME != null && CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())) {
             // The app page bounced the SDK fragment to the shell by its scheme: carry the fragment
-            // to the app host, where the SDK finishes the sign-in at boot.
-            data = app.buildUpon().path("/").encodedQuery(data.getEncodedQuery())
+            // to the page the shell loads (server.url, path included: an app served under a path,
+            // like /noodle, signs in there), where the SDK finishes the sign-in at boot.
+            String appPath = app.getEncodedPath();
+            data = app.buildUpon().encodedPath(appPath == null || appPath.isEmpty() ? "/" : appPath)
+                .encodedQuery(data.getEncodedQuery())
                 .encodedFragment(data.getEncodedFragment()).build();
         }
         if (data.getHost() == null || !data.getHost().equalsIgnoreCase(app.getHost())) return false;
@@ -1632,6 +1649,12 @@ function isConsentHost(h) { return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(h); }
 // App Link prefix cannot match a sibling ("/oauth/" does not cover "/oauthx").
 function isReturnPath(p) { return /^\/([A-Za-z0-9._~-]+\/)+$/.test(p) && !p.split("/").some((seg) => seg === "." || seg === ".."); }
 function isPlainHost(h) { return /^[a-z0-9.-]+(:\d+)?$/.test(h); }
+function isAppUrl(u) {
+  let p;
+  try { p = new URL(u); } catch { return false; }
+  if (!/^https?:$/.test(p.protocol) || p.search || p.hash || p.username || p.password || /[?#]/.test(u)) return false;
+  return p.pathname === "/" || (/^(\/[A-Za-z0-9._~-]+)+\/?$/.test(p.pathname) && !p.pathname.split("/").some((seg) => seg === "." || seg === ".."));
+}
 function validateAppId(id) {
   const parts = id.split(".");
   if (parts.length < 2 || parts.some((p) => !/^[a-zA-Z][a-zA-Z0-9_]*$/.test(p))) fail(`Invalid app id for Android/iOS: ${id}`);
@@ -1926,6 +1949,7 @@ async function selftest() {
   assert(throws(() => githubOutputLines({ appName: "A\rB" })), "carriage return in an output is refused");
   assert(clean("My\n  App | tagline") === "My App", "clean collapses line breaks");
   assert(isVersionName("1") && isVersionName("1.2.3") && !isVersionName("1.0${x}") && !isVersionName('1.0"') && !isVersionName("1.2.3.4"), "isVersionName");
+  assert(isAppUrl("https://crew.mitralab.io") && isAppUrl("https://crew.mitralab.io/") && isAppUrl("https://crew.mitralab.io/noodle") && isAppUrl("http://127.0.0.1:8099/a/b/") && !isAppUrl("https://h.com/noodle?x=1") && !isAppUrl("https://h.com/#a") && !isAppUrl("https://u@h.com/") && !isAppUrl("ftp://h.com/") && !isAppUrl("https://h.com/a b"), "isAppUrl takes a path, never a query or fragment");
   assert(isPlainHost("a-1.example.com") && isPlainHost("127.0.0.1:8099") && !isPlainHost('a"b.com') && !isPlainHost("a b"), "isPlainHost");
   // Synthetic 100x100 logos, as px(x, y) -> [r, g, b, a].
   const white = [255, 255, 255, 255];
@@ -2022,6 +2046,10 @@ async function selftest() {
   assert(withBar.includes("UIStatusBarStyleDarkContent") && withBar.split("<key>UIStatusBarStyle</key>").length === 2, "the launch status bar style is added once");
   assert(withLaunchStatusBar(withBar, true) === withBar, "an Info.plist that has the style is left alone");
   assert(withLaunchStatusBar(plist, true).includes("UIStatusBarStyleLightContent"), "a dark splash gets light status bar content");
+  const namePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>\n</dict>";
+  assert(withBundleName(namePlist, "Infusion").includes("<key>CFBundleName</key>\n\t<string>Infusion</string>"), "CFBundleName gets the app name");
+  assert(withBundleName(namePlist, "A & $& B").includes("<string>A &amp; $&amp; B</string>"), "the bundle name is escaped and literal");
+  assert(withBundleName(withBundleName(namePlist, "Infusion"), "Infusion") === withBundleName(namePlist, "Infusion"), "setting the bundle name twice changes nothing");
   const modesPlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
   assert(withBackgroundAudio(modesPlist, false) === modesPlist, "background audio off leaves the Info.plist untouched");
   const modes = withBackgroundAudio(modesPlist, true);
@@ -2065,7 +2093,7 @@ async function selftest() {
   assert(keyboard.includes('default: return "cubic-bezier(0.38, 0.7, 0.125, 1)"') && ['case 0: return "ease-in-out"', 'case 1: return "ease-in"', 'case 2: return "ease-out"', 'case 3: return "linear"'].every((c) => keyboard.includes(c)), "the public curves map to their CSS names and the keyboard's own to a bezier");
   assert(keyboard.includes("guard keyboardMode == .resize, let container = view.superview else { return }") && /if keyboardMode == \.resize \{\s*resizeForKeyboard\(taller: taller, duration: duration, curve: curve\)\s*\} else \{\s*dropStrayScroll\(\)/.test(keyboard) && keyboard.indexOf("revealFocusedField()") > keyboard.indexOf("private func beginSettling()"), "notify mode never touches the frame and never scrolls to the field: it only drops the stray scroll");
   assert(keyboard.includes("let hold = keyboardMode == .notify && keyboardOverlap > 0 && documentFits(scrollView)") && keyboard.includes("scrollView.panGestureRecognizer.isEnabled = !hold") && keyboard.indexOf("holdDocumentPan()", keyboard.indexOf('notifyKeyboard(overlap > 0 ? "willShow" : "willHide"')) > 0 && apply.includes("holdDocumentPan()"), "in notify a document that fits cannot be dragged while the keyboard is up, and the pan comes back with the keyboard down or another mode");
-  assert(swift.includes('URLComponents(string: "\\(server.scheme ?? "https")://\\(appHost)\\(server.port.map { ":\\($0)" } ?? "")/")') && !swift.includes('URLComponents(string: "https://\\(appHost)/")'), "a return on the scheme goes to the origin of server.url, scheme and port included");
+  assert(swift.includes("var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)") && !swift.includes('URLComponents(string: "https://\\(appHost)/")'), "a return on the scheme goes to server.url, scheme, port and path included");
   assert(["keyboardWillChangeFrameNotification", "keyboardWillShowNotification", "keyboardWillHideNotification", "keyboardDidShowNotification", "keyboardDidHideNotification"].every((n) => keyboard.includes(`UIResponder.${n}`)) && keyboard.includes("keyboardAnimationDurationUserInfoKey") && keyboard.includes("UIView.AnimationOptions(rawValue: curve << 16)"), "the resize follows every keyboard frame change with the keyboard's own duration and curve");
   assert(keyboard.includes("keyboardIsLocalUserInfoKey") && keyboard.includes("window.convert(end, from: window.screen.coordinateSpace)") && keyboard.includes("keyboard.intersects(bounds), keyboard.maxY >= bounds.maxY - 1"), "only a docked keyboard of this app, measured in the window, takes space from the page");
   assert(/override func viewDidLayoutSubviews\(\) \{\s*super\.viewDidLayoutSubviews\(\)\s*fitToKeyboard\(\)/.test(keyboard) && /super\.viewDidAppear\(animated\)\s*fitToKeyboard\(\)/.test(swift), "the frame is applied again on every layout and when the view comes back, so a hide missed off screen cannot leave it short");
@@ -2233,6 +2261,8 @@ dependencies {
   assert(popupsJava.includes("if (!support.isSupported(activity)) return false;") && popupsJava.includes("new AuthTabIntent.Builder().build().launch(authTab, url, redirectScheme);"), "the sign-in Auth Tab returns by the scheme and has no Custom Tab fallback");
   assert(mainJava.split("signIn = ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn);").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSignIn.install(") && mainJava.includes("ShellSignIn signIn() {"), "MainActivity installs the sign-in once, after super.onCreate");
   assert(mainJava.split("boolean loadReturn(Uri data) {").length === 2 && mainJava.split("appendQueryParameter(SHELL_LINK_PARAM").length === 2 && mainJava.indexOf("popups.onReturnLink(data)) return;") < mainJava.indexOf("loadReturn(data);\n    }") && mainJava.indexOf("loadReturn(data);\n    }") < mainJava.indexOf("boolean loadReturn(Uri data) {"), "a link and the Auth Tab result load the return through the same code, after the popups had their turn");
+  assert(mainJava.includes('String appPath = app.getEncodedPath();') && mainJava.includes('app.buildUpon().encodedPath(appPath == null || appPath.isEmpty() ? "/" : appPath)') && !mainJava.includes('path("/")'), "a return by the scheme loads the path of server.url, / when it has none");
+  assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes('components.path = serverURL.path.isEmpty ? "/" : serverURL.path'), "iOS brings a return by the scheme to the path of server.url");
   assert(mainJava.includes("static final String CALLBACK_SCHEME = null;") && mainActivityJava("io.example.app", "io.example.app").includes('static final String CALLBACK_SCHEME = "io.example.app";'), "MainActivity hands the sign-in the callback scheme, or none");
   const signInTest = androidTemplate("ShellSignInTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
   assert(signInTest.startsWith("package io.example.app;") && signInTest.includes('"https://app.example.com/home"') && signInTest.includes("RobolectricTestRunner") && signInTest.includes("MainActivity.CALLBACK_SCHEME") && !/__[A-Z_]+__/.test(signInTest), "the sign-in Robolectric test is written for the app package and host");

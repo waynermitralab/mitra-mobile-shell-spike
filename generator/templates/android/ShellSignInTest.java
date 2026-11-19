@@ -221,12 +221,55 @@ public class ShellSignInTest {
         assertTrue(loaded, loaded.startsWith("https://__APP_HOST__/any/path?x=1&shellLink=") && loaded.endsWith("#codeMitra=abc"));
     }
 
+    // The page a return by the scheme loads, read from server.url as the config wrote it: its path,
+    // or / when it has none. CI generates this project at the root and under /noodle, and names the
+    // path it asked for in SHELL_TEST_APP_PATH, so a config that lost the path does not pass either.
+    private String serverPage() {
+        Uri server = Uri.parse(activity.getBridge().getServerUrl());
+        String expected = System.getenv("SHELL_TEST_APP_PATH");
+        if (expected != null) assertEquals("the project was generated for this path", expected, server.getPath());
+        String path = server.getPath();
+        return server.getScheme() + "://" + server.getEncodedAuthority() + (path == null || path.isEmpty() ? "/" : path);
+    }
+
+    private static void assertLoads(String loaded, String page, String query, String code) {
+        assertNotNull(loaded);
+        String start = page + "?" + (query == null ? "" : query + "&") + "shellLink=";
+        assertTrue(loaded + " starts with " + start, loaded.startsWith(start));
+        assertTrue(loaded, loaded.endsWith("#codeMitra=" + code));
+    }
+
+    @Test
+    public void aReturnByTheSchemeLoadsThePageOfServerUrlPathIncluded() {
+        org.junit.Assume.assumeTrue(BY_SCHEME);
+        String app = serverPage();
+        ScriptLog.loads.clear();
+        // By the Auth Tab.
+        authTabEnds(signInOpens(), AuthTabIntent.RESULT_OK, SCHEME + "://auth?x=4#codeMitra=tab");
+        assertEquals(1, ScriptLog.loads.size());
+        assertLoads(ScriptLog.loads.get(0), app, "x=4", "tab");
+        // As a link, which is the path without an Auth Tab.
+        activity.onNewIntent(new Intent(Intent.ACTION_VIEW, Uri.parse(SCHEME + "://auth#codeMitra=link")));
+        idle();
+        assertEquals(2, ScriptLog.loads.size());
+        assertLoads(ScriptLog.loads.get(1), app, null, "link");
+        // The same link again is the same return, and loads nothing.
+        activity.onNewIntent(new Intent(Intent.ACTION_VIEW, Uri.parse(SCHEME + "://auth#codeMitra=link")));
+        idle();
+        assertEquals("the single-use code is not spent twice", 2, ScriptLog.loads.size());
+        // A return on the app host as an App Link keeps its own path, as it always did.
+        activity.onNewIntent(new Intent(Intent.ACTION_VIEW, Uri.parse("https://__APP_HOST__/other/page?y=1#codeMitra=own")));
+        idle();
+        assertEquals(3, ScriptLog.loads.size());
+        assertLoads(ScriptLog.loads.get(2), "https://__APP_HOST__/other/page", "y=1", "own");
+        assertEquals("a return is not an event", 0, events().size());
+    }
+
     @Test
     public void aReturnReloadsThePageWithItsFragmentLikeALinkDoes() {
         org.junit.Assume.assumeTrue(BY_SCHEME);
         authTabEnds(signInOpens(), AuthTabIntent.RESULT_OK, SCHEME + "://auth?x=2#codeMitra=def");
-        String loaded = shadowOf(page).getLastLoadedUrl();
-        assertTrue(loaded, loaded.startsWith(activity.getBridge().getAppUrl() + "/?x=2&shellLink=") && loaded.endsWith("#codeMitra=def"));
+        assertLoads(shadowOf(page).getLastLoadedUrl(), serverPage(), "x=2", "def");
         // The same return as a link, which is the path without an Auth Tab.
         activity.onNewIntent(new Intent(Intent.ACTION_VIEW, Uri.parse(SCHEME + "://auth?x=3#codeMitra=ghi")));
         idle();

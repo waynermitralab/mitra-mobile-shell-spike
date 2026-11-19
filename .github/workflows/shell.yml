@@ -28,6 +28,10 @@ on:
         description: "Published URL, only when there is no app UUID"
         type: string
         default: ""
+      descriptor:
+        description: "App descriptor in this repository (apps/<name>.json), for an app that is not one platform app: its fields are the defaults, the inputs above and below override them (a boolean input only turns a switch on)"
+        type: string
+        default: ""
       app_id:
         description: "Override the Android application id / iOS bundle id"
         type: string
@@ -81,13 +85,14 @@ permissions:
 # so two runs of the same app would ask for the same number. A queued run waits, it is not
 # cancelled: cancelling after the upload burns the number.
 concurrency:
-  group: shell-${{ inputs.app || inputs.url }}
+  group: shell-${{ inputs.app || inputs.url || inputs.descriptor }}
   cancel-in-progress: false
 
 env:
   INPUT_APP: ${{ inputs.app }}
   INPUT_API: ${{ inputs.api }}
   INPUT_URL: ${{ inputs.url }}
+  INPUT_DESCRIPTOR: ${{ inputs.descriptor }}
   INPUT_APP_ID: ${{ inputs.app_id }}
   INPUT_VERSION: ${{ inputs.version }}
   INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
@@ -123,8 +128,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Resolve the build number
         id: build
@@ -194,8 +200,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Generate the shell
         id: gen
@@ -206,6 +213,7 @@ jobs:
           args=(--build-number "$BUILD_NUMBER" --version "$INPUT_VERSION" --no-ios --verbose)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
           [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
@@ -280,8 +288,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Generate the shell
         id: gen
@@ -291,6 +300,7 @@ jobs:
           args=(--build-number "$BUILD_NUMBER" --version "$INPUT_VERSION" --verbose)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
           [ "$INPUT_ASSOCIATED_DOMAINS" = "true" ] && args+=(--associated-domains)
           [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
@@ -389,6 +399,9 @@ jobs:
           APP_URL: ${{ steps.gen.outputs.url }}
           BUILD_NUMBER: ${{ needs.version.outputs.number }}
           IOS_RESULT: ${{ inputs.upload_testflight && 'uploaded to TestFlight' || 'unsigned device build only' }}
+          PROJECT_DIR: ${{ steps.gen.outputs.project_dir }}
+        # The options come from mitra-shell.json, the configuration the generator wrote into the app,
+        # not from the inputs: a descriptor can turn an option on that its input leaves off.
         run: |
           {
             echo "### $APP_NAME"
@@ -396,8 +409,12 @@ jobs:
             echo "- loads: $APP_URL"
             echo "- build: $INPUT_VERSION ($BUILD_NUMBER)"
             echo "- iOS: $IOS_RESULT"
-            echo "- associated domains: $INPUT_ASSOCIATED_DOMAINS"
-            echo "- background audio: $INPUT_BACKGROUND_AUDIO"
-            echo "- iOS keyboard: $INPUT_IOS_KEYBOARD"
-            echo "- push: $INPUT_PUSH"
+            node -e '
+              const c = require(require("path").resolve(process.argv[1], "mitra-shell.json"));
+              const push = c.push ? Object.entries(c.push).filter(([, on]) => on).map(([p]) => p).join(", ") || "false" : "false";
+              console.log(`- associated domains: ${Boolean(c.associatedDomains)}`);
+              console.log(`- background audio: ${Boolean(c.backgroundAudio)}`);
+              console.log(`- iOS keyboard: ${c.iosKeyboard || "resize"}`);
+              console.log(`- push: ${push}`);
+            ' "$PROJECT_DIR"
           } >> "$GITHUB_STEP_SUMMARY"
