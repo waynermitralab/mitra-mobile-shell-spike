@@ -416,23 +416,19 @@ jobs:
                 || { echo "::error::The exported app lost the entitlement $key"; exit 1; }
             done
           fi
-      - name: Upload to App Store Connect
+      # The .ipa checked above is the one that goes to App Store Connect: altool sends it with the same
+      # API key, so what reaches TestFlight is exactly the signature and entitlements that were verified.
+      - name: Upload the checked .ipa to App Store Connect
         if: ${{ inputs.upload_testflight }}
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          sed 's#<string>export</string>#<string>upload</string>#' "$RUNNER_TEMP/export-export.plist" > "$RUNNER_TEMP/export-upload.plist"
-          grep -q '<string>upload</string>' "$RUNNER_TEMP/export-upload.plist" || { echo "::error::Could not make the upload options"; exit 1; }
-          xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/export-upload.plist" \
-            -exportPath "$RUNNER_TEMP/upload" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" | tail -40
+          ipa="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -1)"
+          [ -n "$ipa" ] || { echo "::error::No checked .ipa to upload"; exit 1; }
+          # altool looks for AuthKey_<id>.p8 in API_PRIVATE_KEYS_DIR.
+          API_PRIVATE_KEYS_DIR="$RUNNER_TEMP/asc" xcrun altool --upload-app --type ios --file "$ipa" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal
       - name: Wait for processing and add the build to the TestFlight group
         if: ${{ inputs.upload_testflight }}
         continue-on-error: true
