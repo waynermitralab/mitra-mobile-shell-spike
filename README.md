@@ -141,9 +141,12 @@ Every generated app declares microphone use, so a page can record audio with `ge
   through the system camera app, and declaring it would make that path require the runtime grant.
   As a consequence `getUserMedia` asking for video, alone or together with audio, is denied on Android;
   file-input capture still works.
-- iOS: `NSMicrophoneUsageDescription` and `NSCameraUsageDescription` in `Info.plist` (the second
-  because the file input offers "Take Photo", and iOS terminates an app that opens the camera
-  without the key). The strings are in Portuguese and carry the app name, which is escaped (control
+- iOS: `NSMicrophoneUsageDescription`, `NSCameraUsageDescription` and
+  `NSSpeechRecognitionUsageDescription` in `Info.plist` (the camera key because the file input
+  offers "Take Photo", and iOS terminates an app that opens the camera without the key; the speech
+  key because the web view's `SpeechRecognition` goes through the Speech framework, and without it
+  iOS never asks and the page gets `service-not-allowed`, so a recorded voice message never turns
+  into text). The strings are in Portuguese and carry the app name, which is escaped (control
   characters are dropped).
 
 On Android only the app's own host can capture audio: a request from an iframe of another host is
@@ -185,7 +188,9 @@ and a download of Robolectric should not be able to block a store release.
 The permission prompt appears only when the page asks for the microphone or camera. Once the OS
 permission is granted, Capacitor grants the page loaded in the web view access without asking
 again (`WebViewDelegationHandler` on iOS, `BridgeWebChromeClient` on Android), so the page is
-trusted with it. The store privacy answers (App Privacy in App Store Connect, Data safety in Play
+trusted with it. Speech recognition on iOS is a separate authorization, owned by the Speech framework: iOS shows
+its own prompt the first time the page starts `SpeechRecognition`, independently of that media
+capture grant. The store privacy answers (App Privacy in App Store Connect, Data safety in Play
 Console) are about data collected or shared, not about access: what changes them is whether
 recorded audio or photos leave the device, which depends on what the published app does with them.
 
