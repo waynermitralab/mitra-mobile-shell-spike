@@ -934,14 +934,17 @@ function withBundleName(plist, appName) {
 }
 
 // Every app can record voice and take photos through the page (getUserMedia, a file input), and
-// iOS terminates an app that touches the microphone or camera without these strings. The app name
+// iOS terminates an app that touches the microphone or camera without these strings. Speech
+// recognition in a WKWebView (webkitSpeechRecognition) also needs its own string: without it iOS
+// never asks and the page gets "service-not-allowed" (WebKit bug 239816). The app name
 // comes from a third party and lands in XML, hence the escaping. Keys already present are kept.
 function withUsageDescriptions(plist, appName) {
   // Control characters other than tab and line feed, and U+FFFE and U+FFFF, are not valid in XML 1.0, even escaped.
   const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
   const wanted = [
     ["NSMicrophoneUsageDescription", `${name} usa o microfone para gravar \u00e1udio que voc\u00ea envia.`],
-    ["NSCameraUsageDescription", `${name} usa a c\u00e2mera para tirar fotos que voc\u00ea envia.`]
+    ["NSCameraUsageDescription", `${name} usa a c\u00e2mera para tirar fotos que voc\u00ea envia.`],
+    ["NSSpeechRecognitionUsageDescription", `${name} usa o reconhecimento de fala para transformar sua grava\u00e7\u00e3o em texto.`]
   ];
   for (const [key, text] of wanted) {
     if (plist.includes(`<key>${key}</key>`)) continue;
@@ -2171,14 +2174,18 @@ async function selftest() {
     const out = withUsageDescriptions("<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>", hostileName);
     const once = (needle) => out.split(needle).length === 2;
     assert(out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa o microfone`) && out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa a c\u00e2mera`), `the name ${hostileName} stays literal in the usage strings`);
-    assert(once("<key>NSMicrophoneUsageDescription</key>") && once("<key>NSCameraUsageDescription</key>") && once("<key>LSRequiresIPhoneOS</key>") && once("<key>CFBundleName</key>"), `the plist keeps one of each key with the name ${hostileName}`);
+    assert(once("<key>NSMicrophoneUsageDescription</key>") && once("<key>NSCameraUsageDescription</key>") && once("<key>NSSpeechRecognitionUsageDescription</key>") && once("<key>LSRequiresIPhoneOS</key>") && once("<key>CFBundleName</key>"), `the plist keeps one of each key with the name ${hostileName}`);
   }
   const usagePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
   const usage = withUsageDescriptions(usagePlist, `Caf\u00e9 & <Co> "x" 'y'`);
   assert(usage.includes("<key>NSMicrophoneUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o microfone para gravar \u00e1udio que voc\u00ea envia.</string>"), "the microphone string names the escaped app");
   assert(withUsageDescriptions(usagePlist, "A\u0000B\u0007\u001fC\tD").includes("<string>ABC\tD usa o microfone"), "control characters are dropped from the name");
   assert(usage.includes("<key>NSCameraUsageDescription</key>") && usage.includes("usa a c\u00e2mera para tirar fotos que voc\u00ea envia."), "the camera string is added");
+  assert(usage.includes("<key>NSSpeechRecognitionUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o reconhecimento de fala para transformar sua grava\u00e7\u00e3o em texto.</string>"), "the speech recognition string is added for webkitSpeechRecognition");
+  assert(usage.split("<key>NSSpeechRecognitionUsageDescription</key>").length === 2, "the speech recognition key appears once");
   assert(withUsageDescriptions(usage, "Other") === usage, "adding the usage strings twice changes nothing");
+  const ownSpeech = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSSpeechRecognitionUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
+  assert(withUsageDescriptions(ownSpeech, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownSpeech, "A").split("NSSpeechRecognitionUsageDescription").length === 2, "an existing speech recognition string is kept");
   const ownMic = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSMicrophoneUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
   assert(withUsageDescriptions(ownMic, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownMic, "A").split("NSMicrophoneUsageDescription").length === 2, "an existing microphone string is kept");
   const androidManifest = `<manifest>\n    <application/>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
