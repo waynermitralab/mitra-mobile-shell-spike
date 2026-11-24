@@ -21,6 +21,20 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      # The permission gate of the Android shell is pure Java: this runs its interleavings on a JVM.
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961  # v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Test the media permission gate
+        run: |
+          javac -d "$RUNNER_TEMP/gate" generator/templates/android/MediaPermissionGate.java generator/test/MediaPermissionGateTest.java
+          java -cp "$RUNNER_TEMP/gate" __PACKAGE__.MediaPermissionGateTest
+      # The popup policy is pure Java too: the same JVM runs its phases and the URL checks.
+      - name: Test the popup policy
+        run: |
+          javac -d "$RUNNER_TEMP/popup" generator/templates/android/PopupPolicy.java generator/test/PopupPolicyTest.java
+          java -cp "$RUNNER_TEMP/popup" __PACKAGE__.PopupPolicyTest
 
   build:
     runs-on: ubuntu-latest
@@ -35,14 +49,39 @@ jobs:
           cache: npm
       - run: npm ci
       # --url mode reads only the published page, so a local page stands in for it and the run
-      # needs neither the platform API nor a secret. The page has no icon, which also exercises
+      # needs neither the platform API nor a secret. /cover serves the same page with a viewport-fit=cover meta. The page has no icon, which also exercises
       # the icon drawn from the initials of the name.
       - name: Serve the fixture page
         run: |
-          node -e 'require("http").createServer((req, res) => res.end("<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
+          node -e 'require("http").createServer((req, res) => res.end(req.url === "/cover" ? `<title>CI Fixture</title><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">` : "<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
           curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$FIXTURE_URL" > /dev/null
       - name: Generate a shell (Android only, no Gradle build)
         run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out"
+      # The generated project carries a Robolectric test of the media permission client on the real
+      # Capacitor classes; the build job has to run it because it is the one that generates a project.
+      # Java and the SDK are installed the way the Android job of shell.yml does it.
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961  # v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd  # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Run the unit tests of the generated Android project
+        working-directory: ${{ runner.temp }}/out/cifixture/android
+        run: ./gradlew --no-daemon testDebugUnitTest
+      # An app served under a path (the Infusion is /noodle on another app's host): a sign-in that
+      # returns by the scheme lands there, by the Auth Tab and as a link. The sign-in test reads the
+      # path from server.url and checks it against SHELL_TEST_APP_PATH, so the run proves both.
+      - name: Generate a shell served under a path (Android only)
+        run: node generator/generate.mjs --url "$FIXTURE_URL/noodle" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-path"
+      - name: Run the sign-in tests of the shell served under a path
+        working-directory: ${{ runner.temp }}/out-path/cifixture/android
+        env:
+          SHELL_TEST_APP_PATH: /noodle
+        run: |
+          node -e 'process.exit(require("../capacitor.config.json").server.url === process.env.FIXTURE_URL + "/noodle" ? 0 : 1)'
+          ./gradlew --no-daemon testDebugUnitTest --tests '*.ShellSignInTest'
       - name: Check the generated project
         working-directory: ${{ runner.temp }}/out/cifixture
         run: |
@@ -53,3 +92,137 @@ jobs:
           grep -q '>CF</text>' assets/logo.svg
           test -f assets/composed/icon-only.png
           test -f android/app/src/main/res/drawable-v31/splash_icon.xml
+          test -f www/shell-bars.js
+          test -f android/app/src/main/assets/public/shell-bars.js
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellSystemBars.java
+          test "$(grep -c 'ShellSystemBars.install(getBridge())' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
+      # The fixture page has no viewport meta, so detection gives "automatic" and nothing is recorded
+      # in mitra-shell.json (only a forced value is).
+      - name: Check the safe area and microphone reach the artifacts
+        working-directory: ${{ runner.temp }}/out/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "automatic" ? 0 : 1)'
+          node -e 'process.exit("iosContentInset" in require("./mitra-shell.json") ? 1 : 0)'
+          grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.hardware.microphone" android:required="false"' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml
+      # The App Link of the shell is the return path of the account connections, not the whole host:
+      # a link to any other page of the site keeps opening in the browser (--callback scheme, the default).
+      - name: Check the App Link is limited to the return path
+        working-directory: ${{ runner.temp }}/out/cifixture
+        run: |
+          grep -q 'android:pathPrefix="/oauth/"' android/app/src/main/AndroidManifest.xml
+          test "$(grep -c 'android:autoVerify="true"' android/app/src/main/AndroidManifest.xml)" = 1
+          ! grep -q 'android:host="[^"]*" />' android/app/src/main/AndroidManifest.xml
+          node -e 'const c = require("./capacitor.config.json").plugins.MitraShell; process.exit(c.returnPath === "/oauth/" && c.consentHosts.includes("accounts.google.com") && c.consentHosts.includes("github.com") && c.consentHosts.includes("slack.com") && !c.consentHosts.includes("beta.mitralab.io") ? 0 : 1)'
+          node -e 'const d = require("./mitra-shell.json"); process.exit(d.returnPath === "/oauth/" && d.consentHosts.includes("api.notion.com") ? 0 : 1)'
+          grep -q 'androidx.browser:browser' android/app/build.gradle
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellPopups.java
+          test -f android/app/src/main/java/cloud/mitra/cifixture/PopupPolicy.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellPopupsTest.java
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellSignIn.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellSignInTest.java
+          test "$(grep -c 'ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn)' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
+      - name: Generate a shell from a page that declares viewport-fit=cover, no override
+        run: node generator/generate.mjs --url "$FIXTURE_URL/cover" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --out "$RUNNER_TEMP/out-cover"
+      - name: Check the detected cover reaches the config
+        working-directory: ${{ runner.temp }}/out-cover/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "never" ? 0 : 1)'
+          node -e 'process.exit(require("./capacitor.config.json").plugins.SystemBars.initialViewportFitValueHint === "cover" ? 0 : 1)'
+          node -e 'process.exit("iosContentInset" in require("./mitra-shell.json") ? 1 : 0)'
+      # With iOS and the opposite of the detected value. The CLI skips CocoaPods and xcodebuild with
+      # a warning when they are missing, so this needs no macOS tooling.
+      - name: Generate a shell with iOS and a forced inset
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --ios-content-inset never --out "$RUNNER_TEMP/out-ios"
+      - name: Check the forced inset and the iOS usage strings
+        working-directory: ${{ runner.temp }}/out-ios/cifixture
+        run: |
+          node -e 'process.exit(require("./capacitor.config.json").ios.contentInset === "never" ? 0 : 1)'
+          node -e 'process.exit(require("./mitra-shell.json").iosContentInset === "never" ? 0 : 1)'
+          test "$(grep -c '<key>NSMicrophoneUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          test "$(grep -c '<key>NSCameraUsageDescription</key>' ios/App/App/Info.plist)" = 1
+          grep -q 'CI Fixture usa o microfone' ios/App/App/Info.plist
+          test -f ios/App/App/public/shell-bars.js
+          test "$(grep -c '<key>UIBackgroundModes</key>' ios/App/App/Info.plist)" = 0
+          ! grep -q 'FOREGROUND_SERVICE' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'WAKE_LOCK' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'POST_NOTIFICATIONS' android/app/src/main/AndroidManifest.xml
+          ! grep -q 'ShellVoiceService' android/app/src/main/AndroidManifest.xml
+          ! test -e android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+          ! test -e www/shell-voice.js
+          ! grep -q 'ShellVoiceCapture' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java
+          ! grep -q 'androidx.webkit' android/app/build.gradle
+          ! test -e android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceCapture.java
+      - name: Generate a shell with background audio
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --background-audio --out "$RUNNER_TEMP/out-audio"
+      - name: Check the audio background mode
+        working-directory: ${{ runner.temp }}/out-audio/cifixture
+        run: |
+          test "$(grep -c '<key>UIBackgroundModes</key>' ios/App/App/Info.plist)" = 1
+          grep -q '<string>audio</string>' ios/App/App/Info.plist
+          node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
+          grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' android/app/src/main/AndroidManifest.xml
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+      # The option is the same on both platforms: with iOS off it still gives Android its foreground
+      # service, which the generated project tests on the real Capacitor classes.
+      - name: Generate a shell with background audio (Android only)
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --no-ios --background-audio --out "$RUNNER_TEMP/out-voice"
+      - name: Run the unit tests of the generated project with the voice service
+        working-directory: ${{ runner.temp }}/out-voice/cifixture/android
+        run: ./gradlew --no-daemon testDebugUnitTest
+      - name: Check the microphone foreground service
+        working-directory: ${{ runner.temp }}/out-voice/cifixture
+        run: |
+          grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.FOREGROUND_SERVICE"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.WAKE_LOCK' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:foregroundServiceType="microphone"' android/app/src/main/AndroidManifest.xml
+          test "$(grep -c 'android:name=".ShellVoiceService"' android/app/src/main/AndroidManifest.xml)" = 1
+          ! test -e ios
+          test -f www/shell-voice.js
+          test -f android/app/src/main/assets/public/shell-voice.js
+          test -f android/app/src/main/java/cloud/mitra/cifixture/ShellVoiceService.java
+          test -f android/app/src/test/java/cloud/mitra/cifixture/ShellVoiceCaptureTest.java
+          test "$(grep -c 'ShellVoiceCapture.install(getBridge())' android/app/src/main/java/cloud/mitra/cifixture/MainActivity.java)" = 1
+          node -e 'process.exit(require("./mitra-shell.json").backgroundAudio === true ? 0 : 1)'
+
+
+  # The sign-in and the keyboard of the iOS shell, in the simulator: the project is generated with
+  # --ios-tests (generator/ios-tests.rb adds the AppTests target, templates/ios-tests has the cases).
+  # The system sheet is replaced by a fake session the test ends by hand, and the keyboard by the
+  # notifications UIKit posts, on the real view controller and web view; nothing here needs a secret.
+  ios:
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+    env:
+      FIXTURE_URL: http://127.0.0.1:8099
+      FIXTURE_APP_ID: cloud.mitra.cifixture
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Serve the fixture page
+        run: |
+          node -e 'require("http").createServer((req, res) => res.end("<title>CI Fixture</title>")).listen(8099, "127.0.0.1")' &
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 "$FIXTURE_URL" > /dev/null
+      - name: Generate a shell with the iOS test target
+        run: node generator/generate.mjs --url "$FIXTURE_URL" --name "CI Fixture" --app-id "$FIXTURE_APP_ID" --ios-tests --out "$RUNNER_TEMP/out"
+      - name: Run the iOS sign-in tests in the simulator
+        working-directory: ${{ runner.temp }}/out/cifixture/ios/App
+        run: |
+          set -o pipefail
+          UDID="$(xcrun simctl list devices available -j | node -e '
+            const d = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
+            const all = Object.entries(d).filter(([k]) => k.includes("iOS")).sort().reverse().flatMap(([, v]) => v);
+            console.log((all.find((x) => /^iPhone/.test(x.name)) || {}).udid || "");
+          ')"
+          [ -n "$UDID" ] || { echo "::error::No iPhone simulator on this runner"; exit 1; }
+          xcodebuild test -project App.xcodeproj -scheme App -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" | grep -E "error:|Test Case|Executed|\*\* TEST"

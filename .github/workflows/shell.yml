@@ -28,6 +28,10 @@ on:
         description: "Published URL, only when there is no app UUID"
         type: string
         default: ""
+      descriptor:
+        description: "App descriptor in this repository (apps/<name>.json), for an app that is not one platform app: its fields are the defaults, the inputs above and below override them (a boolean input only turns a switch on)"
+        type: string
+        default: ""
       app_id:
         description: "Override the Android application id / iOS bundle id"
         type: string
@@ -44,6 +48,15 @@ on:
         description: "Declare applinks and webcredentials for the host on iOS (the host must serve the AASA file for sign-in to return to the app)"
         type: boolean
         default: true
+      background_audio:
+        description: "Keep the microphone of a live voice conversation with the screen locked: the audio background mode on iOS, a microphone foreground service on Android (only for apps that use it: App Review rejects the mode otherwise, and Play asks for a foreground service declaration)"
+        type: boolean
+        default: false
+      ios_keyboard:
+        description: "What the iOS shell does when the keyboard opens: resize (the web view ends at the keyboard), notify (the page moves itself on mitrashell:keyboard) or off (plain WebKit; the page can still ask for another mode)"
+        type: choice
+        options: [resize, notify, "off"]
+        default: resize
       push:
         description: "Push notifications: aps entitlement on iOS; on Android only when the GOOGLE_SERVICES_JSON_B64 secret has this app (else Android is built without the push plugin)"
         type: boolean
@@ -72,18 +85,21 @@ permissions:
 # so two runs of the same app would ask for the same number. A queued run waits, it is not
 # cancelled: cancelling after the upload burns the number.
 concurrency:
-  group: shell-${{ inputs.app || inputs.url }}
+  group: shell-${{ inputs.app || inputs.url || inputs.descriptor }}
   cancel-in-progress: false
 
 env:
   INPUT_APP: ${{ inputs.app }}
   INPUT_API: ${{ inputs.api }}
   INPUT_URL: ${{ inputs.url }}
+  INPUT_DESCRIPTOR: ${{ inputs.descriptor }}
   INPUT_APP_ID: ${{ inputs.app_id }}
   INPUT_VERSION: ${{ inputs.version }}
   INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
   INPUT_ASSOCIATED_DOMAINS: ${{ inputs.associated_domains }}
+  INPUT_BACKGROUND_AUDIO: ${{ inputs.background_audio }}
   INPUT_PUSH: ${{ inputs.push }}
+  INPUT_IOS_KEYBOARD: ${{ inputs.ios_keyboard }}
 
 jobs:
   # The build number is resolved once, before both builds: reading the Play history opens an edit,
@@ -110,8 +126,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Resolve the build number
         id: build
@@ -179,8 +196,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Generate the shell
         id: gen
@@ -191,7 +209,9 @@ jobs:
           args=(--build-number "$BUILD_NUMBER" --version "$INPUT_VERSION" --no-ios --verbose)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
+          [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/generate.mjs "${args[@]}"
       - name: Restore the upload keystore
@@ -264,8 +284,9 @@ jobs:
           args=(--identity)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
-          [ -n "$INPUT_APP$INPUT_URL" ] || { echo "::error::Give app (UUID) or url"; exit 1; }
+          [ -n "$INPUT_APP$INPUT_URL$INPUT_DESCRIPTOR" ] || { echo "::error::Give app (UUID), url or descriptor"; exit 1; }
           node generator/generate.mjs "${args[@]}"
       - name: Generate the shell
         id: gen
@@ -275,8 +296,11 @@ jobs:
           args=(--build-number "$BUILD_NUMBER" --version "$INPUT_VERSION" --verbose)
           [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP" --api "$INPUT_API")
           [ -n "$INPUT_URL" ] && args+=(--url "$INPUT_URL")
+          [ -n "$INPUT_DESCRIPTOR" ] && args+=(--descriptor "$INPUT_DESCRIPTOR")
           [ -n "$INPUT_APP_ID" ] && args+=(--app-id "$INPUT_APP_ID")
           [ "$INPUT_ASSOCIATED_DOMAINS" = "true" ] && args+=(--associated-domains)
+          [ "$INPUT_BACKGROUND_AUDIO" = "true" ] && args+=(--background-audio)
+          args+=(--ios-keyboard "$INPUT_IOS_KEYBOARD")
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/generate.mjs "${args[@]}"
       - name: Unsigned device build
@@ -307,50 +331,104 @@ jobs:
           [ "$INPUT_PUSH" = "true" ] && args+=(--push)
           node generator/asc.mjs ensure-bundle-id "${args[@]}"
           node generator/asc.mjs app-id --bundle-id "$APP_ID"
-      - name: Archive with cloud signing
+      # The archive is built without signing and then signed ad hoc ("-") with the app's entitlements, so
+      # Xcode never needs an Apple Development certificate. With automatic signing every run on a fresh
+      # GitHub-hosted runner asked Apple for one, and since those runners present the same machine the
+      # next run failed with "Revoke certificate" until someone revoked it by hand. The App Store
+      # signature comes only from the export below (cloud signing with the API key), which keeps the
+      # entitlements of the ad hoc signature.
+      - name: Archive without signing
+        if: ${{ inputs.upload_testflight }}
+        working-directory: ${{ steps.gen.outputs.project_dir }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_ID: ${{ steps.gen.outputs.app_id }}
+        run: |
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive | tail -40
+          app="$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app"
+          [ -d "$app" ] || { echo "::error::The archive has no App.app"; exit 1; }
+          ent="$RUNNER_TEMP/App.entitlements"
+          if [ -f ios/App/App/App.entitlements ]; then cp ios/App/App/App.entitlements "$ent"; else plutil -create xml1 "$ent"; fi
+          /usr/libexec/PlistBuddy \
+            -c "Add :application-identifier string $APPLE_TEAM_ID.$APP_ID" \
+            -c "Add :com.apple.developer.team-identifier string $APPLE_TEAM_ID" \
+            -c "Add :get-task-allow bool false" "$ent"
+          if [ -d "$app/Frameworks" ]; then
+            find "$app/Frameworks" -maxdepth 1 \( -name '*.framework' -o -name '*.dylib' \) -print0 |
+              xargs -0 -I{} codesign --force --sign - --timestamp=none {}
+          fi
+          codesign --force --sign - --timestamp=none --entitlements "$ent" --generate-entitlement-der "$app"
+          codesign --verify --deep --strict "$app"
+          echo "Entitlements of the archived app:"
+          codesign -d --entitlements - --xml "$app" 2>/dev/null | plutil -p -
+      - name: Export with cloud signing and check the entitlements
         if: ${{ inputs.upload_testflight }}
         working-directory: ${{ steps.gen.outputs.project_dir }}
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_ID: ${{ steps.gen.outputs.app_id }}
         run: |
-          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            archive | tail -40
-      - name: Export and upload to App Store Connect
-        if: ${{ inputs.upload_testflight }}
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          cat > "$RUNNER_TEMP/export.plist" <<EOF
+          export_plist() {
+            cat > "$RUNNER_TEMP/export-$1.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
             <key>method</key><string>app-store-connect</string>
-            <key>destination</key><string>upload</string>
+            <key>destination</key><string>$1</string>
             <key>teamID</key><string>$APPLE_TEAM_ID</string>
             <key>signingStyle</key><string>automatic</string>
             <key>uploadSymbols</key><true/>
             <key>manageAppVersionAndBuildNumber</key><false/>
           </dict></plist>
           EOF
+          }
+          export_plist export
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-export.plist" \
             -exportPath "$RUNNER_TEMP/export" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" | tail -40
+          ipa="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -1)"
+          [ -n "$ipa" ] || { echo "::error::The export made no .ipa"; exit 1; }
+          rm -rf "$RUNNER_TEMP/ipa" && mkdir "$RUNNER_TEMP/ipa" && unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
+          signed="$(find "$RUNNER_TEMP/ipa/Payload" -maxdepth 1 -name '*.app' | head -1)"
+          codesign -dvv "$signed" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' | head -3
+          codesign -d --entitlements - --xml "$signed" 2>/dev/null > "$RUNNER_TEMP/signed.entitlements"
+          plutil -p "$RUNNER_TEMP/signed.entitlements"
+          codesign -dvv "$signed" 2>&1 | grep -q '^Authority=Apple Distribution' \
+            || { echo "::error::The exported app is not signed with an Apple Distribution certificate"; exit 1; }
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$RUNNER_TEMP/signed.entitlements")" = "$APPLE_TEAM_ID.$APP_ID" ] \
+            || { echo "::error::The exported app has the wrong application-identifier"; exit 1; }
+          # Every capability the project asked for must survive the re-signing.
+          if [ -f ios/App/App/App.entitlements ]; then
+            for key in $(plutil -convert json -o - ios/App/App/App.entitlements | node -e 'for (const k of Object.keys(JSON.parse(require("fs").readFileSync(0, "utf8")))) console.log(k)'); do
+              /usr/libexec/PlistBuddy -c "Print :$key" "$RUNNER_TEMP/signed.entitlements" > /dev/null 2>&1 \
+                || { echo "::error::The exported app lost the entitlement $key"; exit 1; }
+            done
+          fi
+      # The .ipa checked above is the one that goes to App Store Connect: altool sends it with the same
+      # API key, so what reaches TestFlight is exactly the signature and entitlements that were verified.
+      - name: Upload the checked .ipa to App Store Connect
+        if: ${{ inputs.upload_testflight }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          ipa="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -1)"
+          [ -n "$ipa" ] || { echo "::error::No checked .ipa to upload"; exit 1; }
+          # altool looks for AuthKey_<id>.p8 in API_PRIVATE_KEYS_DIR.
+          API_PRIVATE_KEYS_DIR="$RUNNER_TEMP/asc" xcrun altool --upload-app --type ios --file "$ipa" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal
       - name: Wait for processing and add the build to the TestFlight group
         if: ${{ inputs.upload_testflight }}
         continue-on-error: true
@@ -371,6 +449,9 @@ jobs:
           APP_URL: ${{ steps.gen.outputs.url }}
           BUILD_NUMBER: ${{ needs.version.outputs.number }}
           IOS_RESULT: ${{ inputs.upload_testflight && 'uploaded to TestFlight' || 'unsigned device build only' }}
+          PROJECT_DIR: ${{ steps.gen.outputs.project_dir }}
+        # The options come from mitra-shell.json, the configuration the generator wrote into the app,
+        # not from the inputs: a descriptor can turn an option on that its input leaves off.
         run: |
           {
             echo "### $APP_NAME"
@@ -378,6 +459,12 @@ jobs:
             echo "- loads: $APP_URL"
             echo "- build: $INPUT_VERSION ($BUILD_NUMBER)"
             echo "- iOS: $IOS_RESULT"
-            echo "- associated domains: $INPUT_ASSOCIATED_DOMAINS"
-            echo "- push: $INPUT_PUSH"
+            node -e '
+              const c = require(require("path").resolve(process.argv[1], "mitra-shell.json"));
+              const push = c.push ? Object.entries(c.push).filter(([, on]) => on).map(([p]) => p).join(", ") || "false" : "false";
+              console.log(`- associated domains: ${Boolean(c.associatedDomains)}`);
+              console.log(`- background audio: ${Boolean(c.backgroundAudio)}`);
+              console.log(`- iOS keyboard: ${c.iosKeyboard || "resize"}`);
+              console.log(`- push: ${push}`);
+            ' "$PROJECT_DIR"
           } >> "$GITHUB_STEP_SUMMARY"

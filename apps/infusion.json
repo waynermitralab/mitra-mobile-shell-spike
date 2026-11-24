@@ -1,0 +1,30 @@
+{
+  "api": "https://beta.mitralab.io",
+  "url": "https://crew.mitralab.io/noodle",
+  "name": "Infusion",
+  "appId": "cloud.infusion.app",
+  "themeColor": "#141214",
+  "icon": "apps/infusion/icone.svg",
+  "associatedDomains": true,
+  "backgroundAudio": true,
+  "authHosts": [
+    "beta.mitralab.io",
+    "app.infusion.cloud",
+    "accounts.google.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "appleid.apple.com"
+  ],
+  "consentHosts": [
+    "accounts.google.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "appleid.apple.com",
+    "github.com",
+    "api.notion.com",
+    "slack.com"
+  ],
+  "returnPath": "/oauth/",
+  "callback": "scheme",
+  "push": false
+}

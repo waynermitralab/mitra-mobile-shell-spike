@@ -2,10 +2,13 @@
 
 Capacitor shell generator and store pipeline for Mitra platform apps (App Store and Google Play).
 
-One repository serves every app. Nothing about a specific app is stored here: the generator
-takes an app published by the platform and writes a complete Capacitor project for it (a native
-shell whose WebView loads the published URL), and the workflows build that project and hand it
-to the stores.
+One repository serves every app. The generator takes an app published by the platform and writes
+a complete Capacitor project for it (a native shell whose WebView loads the published URL), and the
+workflows build that project and hand it to the stores. A platform app needs nothing stored here:
+its UUID is enough. The one exception is an app that is not a single platform app, such as the
+Infusion, whose page lives under a path of another app's host and whose name, bundle id and icon
+are its own: its descriptor and icon are kept under `apps/` (see Descriptors in this repository),
+because the store workflow can only read files from this repository.
 
 ## Layout
 
@@ -14,6 +17,10 @@ to the stores.
 - `generator/play.mjs`: Google Play Developer API client (AAB upload to a track).
 - `generator/wellknown.mjs`: writes the app association files (`apple-app-site-association`,
   `assetlinks.json`) for a generated project.
+- `generator/test/`: tests that need a JVM (`MediaPermissionGateTest.java`, see Microphone and camera, and
+  `PopupPolicyTest.java`, see Account connections in a popup).
+- `apps/`: descriptors of the apps that are not one platform app (`apps/<name>.json`) and their
+  icons (`apps/<name>/`). Nothing else about a specific app is stored here.
 - `generator/templates/`: files copied into every generated project (iOS `SceneDelegate.swift`,
   its CI workflow, its `.gitignore`).
 - `package.json` and `package-lock.json`: the pinned Capacitor dependencies. The generator copies
@@ -31,14 +38,352 @@ node generator/generate.mjs --url https://<published host> [flags]
 node generator/generate.mjs --descriptor path/to/app.json [flags override the file]
 ```
 
+### Descriptors in this repository
+
+A descriptor is the JSON that `mitra-shell.json` echoes (same keys), so a generated project can be
+generated again from itself. `apps/<name>.json` is the descriptor of an app that the store workflow
+builds without a platform UUID (input `descriptor`). Its rules:
+
+- Precedence: a flag (or a workflow input that gives one) wins over the descriptor, and the
+  descriptor wins over what the platform (`app`) or the page (`url`) says. `url` and `app` may
+  both be in the descriptor; the URL it gives is the one the shell loads.
+- Booleans (`associatedDomains`, `backgroundAudio`, `push`, `debug`): `true` in either the flag or
+  the descriptor turns the option on, and a flag cannot turn off what the descriptor turns on. So
+  in `shell.yml` a boolean input left `false` keeps the descriptor's value; the run summary shows
+  the configuration the app got (read from its `mitra-shell.json`), not the inputs.
+- Lists (`authHosts`, `consentHosts`): the flag adds to the descriptor and to the defaults.
+- `url`: `http(s)://host[:port]` with an optional path (`/noodle`), never a query, a fragment or
+  credentials, and each path segment made of `A-Z a-z 0-9 . _ ~ -` (no `.` or `..` segment). The path
+  is where the shell starts and where a sign-in that returns by the URL scheme lands.
+- `icon`: a path relative to the repository root (the workflow runs there) or a URL.
+- `appId` is checked like `--app-id`, and once an app is in a store it must not change.
+
 With `--app` the identity comes from the platform:
 `GET {api}/code-studio/api/v1/apps/{app}/info` (public, no token) gives the name, the published
 origins, the accent color and the login logo. With `--url` the name, theme color and icon are
-read from the published page. The app id defaults to `cloud.<brand>.<slug>`. The API base URL
-is `--api`, then the `MITRA_API_URL` environment variable, then `https://beta.mitralab.io`.
+read from the published page. The page icon is the SVG if there is one, else the largest PNG,
+among its `<link rel=icon>`, `apple-touch-icon` and the icons of the web manifest it links
+(maskable and monochrome entries are skipped; an unreachable manifest is ignored). When the page's
+icon is used and that manifest declares a hex `background_color`, it is the color behind a logo
+with no background of its own, unless `--theme` (or the descriptor's `themeColor`) is given. An SVG
+is preferred even over a larger PNG, so to use a specific artwork pass `--icon`. An icon that
+fails to download, or is not an SVG or a PNG, is skipped for the next one (at most 6 are tried).
+The manifest and icon downloads time out at 15 s and are capped at 1 MB (manifest) and 10 MB (icons).
+The app id
+defaults to `cloud.<brand>.<slug>`. The API base URL is `--api`, then the `MITRA_API_URL`
+environment variable, then `https://beta.mitralab.io`.
 
-An app without an icon gets one drawn by the generator: the initials of its name (the first
-letter of the first two words, or the first two letters of a single word) on the theme color.
+An app without an icon, or whose page icons are all unusable (an `.ico` only), gets one drawn by
+the generator: the initials of its name (the first letter of the first two words, or the first two
+letters of a single word) on the theme color.
+
+### Safe area
+
+The generator reads the viewport meta of the published page (ignoring comments, `<script>` and
+`<noscript>` blocks). When it declares `viewport-fit=cover`, the page reserves the notch and status
+bar space itself (`env(safe-area-inset-top)`), so the shell writes `ios.contentInset: "never"`;
+otherwise it keeps `"automatic"` and the web view pushes the content below the status bar. With
+`automatic` on a page that already reserves the space, a blank band the height of the status bar
+shows above the header. The run prints the value chosen and why. `mitra-shell.json` records it as
+`iosContentInset` only when it was forced, so that file can be reused as a descriptor without
+freezing the detection. `--ios-content-inset never|automatic` (or `iosContentInset` in the
+descriptor) forces the value; anything else fails the run. The choice is made at generation, so a
+page that later adds or removes `viewport-fit=cover` needs a new generation. Only the HTML the
+server sends is read, and only its first 256 KB: a viewport meta added by script after load, or
+past a very large inline head, is not seen, and the page then gets `automatic`.
+
+On Android, Capacitor's `SystemBars` plugin reads the live page's `viewport-fit=cover` at runtime
+and applies the insets accordingly, so a later change in the page is followed without a new
+generation. When the page declares cover at generation time, the shell also passes
+`plugins.SystemBars.initialViewportFitValueHint: "cover"`, which only spares the first layout a
+shift.
+
+#### Status bar style
+
+A page that draws under the bars has to be readable there, and a style fixed at generation time
+cannot follow a theme the page switches at runtime (an in-app light/dark toggle, independent of the
+device theme, can leave a white clock on a white header). So the bundle carries `shell-bars.js`
+(`public/shell-bars.js`), which samples the color the page paints at the top center of the viewport
+(the element stack there, composited, then `body`, `html` and the theme color), maps it to light or
+dark with the same luminance rule as the generator, and calls `SystemBars.setStyle`. It re-checks
+when the DOM, the device color scheme, the size or the visibility change, and after CSS transitions.
+`plugins.StatusBar.style` from the theme color stays as the first style, until the page reports.
+
+- iOS: the script is a `WKUserScript` added by `SceneDelegate.swift` only when the config has
+  `ios.contentInset: "never"` (the page draws under the bar). `SystemBars.setStyle` on iOS styles
+  the status bar and ignores `bar`, so only the top edge is sampled. The splash overlay keeps the
+  bar on the splash style while it is up, and the style the page asked for in that time is applied
+  when it leaves.
+- Android: `ShellSystemBars` (added to `MainActivity`) runs the script after each page load on the
+  app host, and only when the live viewport meta has `viewport-fit=cover`, the same rule
+  `SystemBars` uses to go edge to edge. The bottom edge is sampled too and styles the navigation
+  bar.
+
+On iOS the probe is injected in any main-frame document of the web view; on Android it runs only
+for pages on the app host, and only on a WebView of major version 140 or newer, the version from
+which Capacitor lets the page under the bars (older ones keep the device-theme style, since the
+bars sit over the native window background). On Android the probe is also asked to report again
+after a configuration change, because the bridge re-applies the stored styles then.
+
+Known limit: background images and gradients are not read, so a top edge painted that way falls
+back to the color of `body`, `html` or the theme color. Elements with `pointer-events: none` are
+not seen either, and an element's own `opacity` counts but opacity inherited from an ancestor does
+not.
+
+### Microphone and camera
+
+Every generated app declares microphone use, so a page can record audio with `getUserMedia`:
+
+- Android: `RECORD_AUDIO` and `MODIFY_AUDIO_SETTINGS` in the manifest, plus the microphone feature
+  as not required (`RECORD_AUDIO` alone would make Play hide the app from devices without a
+  microphone). Capacitor's `BridgeWebChromeClient` asks for the runtime permission when the page
+  requests audio. `CAMERA` is not declared on purpose: a file input that opens the camera then goes
+  through the system camera app, and declaring it would make that path require the runtime grant.
+  As a consequence `getUserMedia` asking for video, alone or together with audio, is denied on Android;
+  file-input capture still works.
+- iOS: `NSMicrophoneUsageDescription`, `NSCameraUsageDescription` and
+  `NSSpeechRecognitionUsageDescription` in `Info.plist` (the camera key because the file input
+  offers "Take Photo", and iOS terminates an app that opens the camera without the key; the speech
+  key because the web view's `SpeechRecognition` goes through the Speech framework, and without it
+  iOS never asks and the page gets `service-not-allowed`, so a recorded voice message never turns
+  into text). The strings are in Portuguese and carry the app name, which is escaped (control
+  characters are dropped).
+
+On Android only the app's own host can capture audio: a request from an iframe of another host is
+denied, and so is any request that needs `CAMERA`, which the manifest does not declare. iOS has no
+such filter: Capacitor 8.6's `WebViewDelegationHandler` grants media capture to whatever is loaded
+in the web view, other hosts included, once the OS permission is granted.
+
+The Android shell installs its own web chrome client (`ShellWebChromeClient`, written next to
+`MainActivity`) for media permissions. Capacitor's `BridgeWebChromeClient` shares one permission
+listener between media, geolocation and the camera of the file chooser, so a second request while a
+dialog is up, or a request the WebView had already cancelled, was answered twice or not at all, and
+the double answer crashed the app. The decision logic is `MediaPermissionGate`, pure Java: one dialog
+in progress for all media requests, and when it closes each queued request is decided by the
+permissions the app holds, whatever the dialog reported. A lost answer is detected by the lifecycle:
+the dialog pauses the activity and its result arrives before the activity resumes, so a request that
+arrives with a dialog in progress after the activity was paused for it and is resumed again means
+the answer is gone, and the queue is settled by the permissions held before a fresh dialog starts.
+Everything else stays Capacitor's. Both classes are templates in `generator/templates/android/`
+(package and app host are substituted); the gate has a behavioral test on a plain JVM,
+`generator/test/MediaPermissionGateTest.java`, which the `test` job of `ci.yml` compiles and runs
+with `javac` and `java`. It is not part of `npm test`, because Java is not guaranteed where that
+runs.
+
+The glue is tested on the real Capacitor classes. Every generated project carries
+`android/app/src/test/java/<package>/ShellWebChromeClientTest.java` (from
+`generator/templates/android/ShellWebChromeClientTest.java`) and the generator adds Robolectric to
+its `build.gradle`. The test starts `MainActivity` with the real Bridge, takes the client that
+`onCreate` installed, and sends it fake web requests. The dialog is played by Robolectric and its
+result goes through `Activity.dispatchRequestPermissionsResult`, `BridgeActivity` and Capacitor's
+own launcher callback and permission listener, so what runs is the path of production. It covers
+queuing, grant and deny, a request the WebView already resolved, a lost answer after another flow
+took Capacitor's listener, cancel, a foreign origin and held permissions. Only the service worker
+controller is replaced (Robolectric has no WebView provider), and the WebView itself is
+Robolectric's stub, so no page is loaded. Run it in a generated project with
+`./gradlew --no-daemon testDebugUnitTest` in its `android/` folder; the `build` job of `ci.yml`
+does that on its fixture project. `shell.yml` does not run it: it is the same code for every app,
+and a download of Robolectric should not be able to block a store release.
+
+The permission prompt appears only when the page asks for the microphone or camera. Once the OS
+permission is granted, Capacitor grants the page loaded in the web view access without asking
+again (`WebViewDelegationHandler` on iOS, `BridgeWebChromeClient` on Android), so the page is
+trusted with it. Speech recognition on iOS is a separate authorization, owned by the Speech framework: iOS shows
+its own prompt the first time the page starts `SpeechRecognition`, independently of that media
+capture grant. The store privacy answers (App Privacy in App Store Connect, Data safety in Play
+Console) are about data collected or shared, not about access: what changes them is whether
+recorded audio or photos leave the device, which depends on what the published app does with them.
+
+### Background audio (`--background-audio`)
+
+A page holding a live voice conversation (getUserMedia audio plus WebRTC playback) keeps playing
+with the phone locked, but both platforms silence the microphone of an app that is not in the
+foreground. With `--background-audio` (descriptor key `backgroundAudio`, workflow input
+`background_audio`) the generator handles both, and the option is the same on both platforms, so it
+also applies with `--no-ios`. It is off by default, and with it off none of what follows is in the
+app. Turn it on only for an app that really keeps audio going in the background.
+
+**iOS.** WebKit mutes microphone capture in a WKWebView app when the phone is locked or the app goes
+to the background (WebKit bugs 226620 and 233419). The generator adds `audio` to `UIBackgroundModes`
+in `Info.plist`, merging into an array that is already there. Apple rejects apps that declare the
+mode without using it (guideline 2.5.4).
+
+**Android.** Android silences capture for an app that is not in the foreground unless it runs a
+foreground service of type `microphone`. The shell runs one exactly while the page is capturing:
+
+- The manifest gets `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `WAKE_LOCK` and
+  `POST_NOTIFICATIONS` (one line even with `--push`), and declares `.ShellVoiceService`
+  (`foregroundServiceType="microphone"`, not exported). On Android 13+ the first "capturing" of a
+  process asks for `POST_NOTIFICATIONS` when it is not granted, because without it the notification
+  is listed only in the Task Manager and not in the shade. The service does not wait for the answer,
+  and a denial only hides the notification (it is not asked again in the same process).
+- Detection needs no change in the page. `shell-voice.js` (bundled as `public/shell-voice.js`, injected by
+  `ShellVoiceCapture` with `addDocumentStartJavaScript` for the app origin when the WebView supports
+  `DOCUMENT_START_SCRIPT`, otherwise with `evaluateJavascript` on the app host's pages at
+  `onPageCommitVisible`, once per document) wraps
+  `navigator.mediaDevices.getUserMedia` and watches the live audio tracks it hands out. It reports
+  "capturing" when a call resolves with at least one live audio track and "idle" when the last one is
+  gone: the track fires `ended`, or the page calls `stop()` (which does not fire `ended`, so the track's
+  `stop` is wrapped on the instance), or a poll every 2 seconds finds a track that ended without
+  either (`stop()` called through the prototype). The wrapper returns the same promise, resolves
+  with the same stream and rejects with the same error; a rejection, a video-only stream or a track
+  that is already ended never reports. Not covered: `getDisplayMedia`, the old callback
+  `getUserMedia`, and a page that stops the original track while a `clone()` of it keeps capturing.
+- The report reaches native code through a `WebMessageListener` named `mitraShellVoice`, added to the
+  main WebView with the origin rules of the Capacitor bridge. The native side then accepts a message
+  only from the main frame of the app host, and only the two literal strings "capturing" and "idle".
+  It is not a `JavascriptInterface`, which every frame of every page could call, and the child windows
+  of the popup contract never get it. If adding the listener fails, one line is logged (tag
+  `ShellVoice`) and the feature stays off. A WebView without `WEB_MESSAGE_LISTENER` support leaves the feature
+  off, and the conversation works as before.
+- On "capturing" the start waits about 1 second, so a page that probes the microphone and lets go
+  of it at once never starts a service ("idle" inside the window cancels it). The service starts only
+  if `RECORD_AUDIO` is granted (Android 14 throws otherwise) and the activity is started (a service
+  started from the background is refused); a start refused for that reason is retried when the activity
+  next starts, as long as the page is still capturing. On "idle" it stops after a grace period of 8
+  seconds (a new "capturing" cancels it), because with the screen locked a stopped service cannot come
+  back and pages reopen the microphone on a reconnect or a device change. A service that did not
+  yet reach `startForeground` is never stopped (Android kills the app for that): `onStartCommand`
+  always goes foreground first and then stops itself if the request was withdrawn. It also stops when the
+  main frame starts loading a page, when the WebView renderer dies and when the activity is destroyed;
+  any exception from the system is caught, leaving the conversation as it was without the service.
+- The page is third-party code and can report "capturing" without recording, so every 30 seconds the
+  service asks `AudioManager.getActiveRecordingConfigurations()` whether the app has an active
+  recording and stops after two checks in a row without one (assumption: the in-process capture of the
+  WebView is listed there for the app). The list cannot be narrowed to this app (other apps' recordings
+  appear with their client details hidden), so the check bounds a page that fakes capture only while no
+  other app is recording. The same check renews the wake lock, which is acquired with a
+  timeout of 75 seconds instead of unbounded.
+- `ShellVoiceService` shows an ongoing, low importance notification on its own channel (the app name and
+  "Conversa por voz em andamento"; a tap brings the app back) with a monochrome microphone icon
+  (`ic_stat_voice`, shipped by the generator), holds a `PARTIAL_WAKE_LOCK` for as long as it runs,
+  releases it on stop and destroy, and is `START_NOT_STICKY`.
+- Capacitor does not pause the WebView when the activity stops (`KeepRunning` defaults to true, see
+  `Bridge.shouldKeepRunning()`; the generator does not set it), so the page's JavaScript and WebRTC
+  keep running under lock. The service is all that is missing.
+
+Google Play requires a foreground service declaration in Play Console (App content, Foreground
+service permissions) for an app that declares `FOREGROUND_SERVICE_MICROPHONE`: the task is a live
+voice conversation the user started, and the app shows the notification while it runs. The console
+also asks for a short demo video of the feature in use. Only a real
+device with the screen locked proves the behavior (the microphone staying live on Android, the
+notification, a start from the background, OEM battery limits on a long call); the selftests, the
+Robolectric tests of the generated project and CI check the manifest, the script and the service
+logic, not Chromium or WebKit.
+
+### Account connections in a popup
+
+A page that connects an account (Google, GitHub, Notion, Slack) uses the popup contract of the
+browser: `window.open(consentUrl, name, features)` on a click, then it keeps the window it gets,
+listens for `message`, and may poll `window.closed`. The page on the way back, on the app host,
+posts to `window.opener` and calls `window.close()`. A shell that sends the consent to the system
+browser without honoring that leaves the return page with no opener, and the page never finishes.
+The shell honors it with a real child window, so the site needs no change and no script is injected:
+
+1. A `window.open` gets a child window (a hidden web view, never on screen) only when it comes from
+   the main frame of a page of the app host, with a user gesture, to an `https` URL whose host is in
+   the consent list, and no other child is pending (one at a time). The page receives a real window,
+   and the page that runs in the child has a real `window.opener`. Any other `window.open` behaves as
+   it did before, whatever the scheme (`mailto:`, `tel:`, `intent:` included): other hosts open in the
+   system browser (Android) or the system (iOS), the app host loads in the page. On Android `data:`
+   and `blob:` in a new window no longer load in the main page: nothing happens.
+2. The consent never runs in a web view. The child's first URL goes to the system browser: on Android
+   the Auth Tab when the default browser has it (androidx.browser 1.9, Chrome 137 and later) and the
+   exact return path is known, else a Custom Tab that comes back by App Link; on iOS 17.4 and later an
+   `ASWebAuthenticationSession` with an https callback (`.https(host:path:)`), again only when the
+   exact path is known, else the window opens outside as before. The Auth Tab matches the redirect
+   path by equality, not by prefix (Chromium `AuthTabVerifier`), and Apple does not say how the
+   session matches it, so the shell never hands either one the prefix and hopes. The exact path is
+   the `redirect_uri` parameter of the consent URL (standard OAuth 2.0), used only when it is, once
+   decoded, an `https` URL of the app host (default port, no user info, no fragment) with a plain
+   path (letters, digits, `. _ ~ -` and `/`, no percent escape and no dot segment) inside the return
+   prefix, and only when the parameter appears once. A missing, repeated or failing `redirect_uri`
+   means no exact path.
+3. What comes back loads in the child, and only if it is an `https` URL of the app host inside the
+   return prefix, from a session the shell itself opened, and when the session has an exact path,
+   only that path. The main page is not reloaded. The page
+   of the return does its own `postMessage` and `close`. The shell's own code does not read, store or
+   log the `code`. Capacitor does hand an App Link URL, `code` and `state` included, to the main page
+   as an `appUrlOpen` event (`@capacitor/app`), which stays inside the app's own origin.
+4. A cancelled or abandoned browser makes the child run `window.close()` and destroys it, so
+   `closed` turns `true` on the opener. A child that never asks for a URL, or that does not close
+   after the return, is destroyed after 15 seconds so it does not hold the slot.
+5. After the return the child only follows `https` URLs of the app host. On Android it has no
+   Capacitor bridge and no JavaScript interface; on iOS it gets a fresh user content controller, so
+   no Capacitor script or message handler. A load that starts without the navigation callback (a
+   form POST with `target=_blank`) is judged by the same rules when it starts. The request has
+   already gone out by then, so what is not allowed is interrupted and the child is closed like on
+   a cancel. A POST to a consent host reopens in the browser as a GET, without the body.
+
+Options, with a flag or a descriptor field, and echoed in `capacitor.config.json`
+(`plugins.MitraShell`) and `mitra-shell.json`:
+
+| Flag | Descriptor | Default |
+|---|---|---|
+| `--consent-hosts a.com,b.com` | `consentHosts` | `accounts.google.com`, `login.microsoftonline.com`, `login.live.com`, `appleid.apple.com`, `github.com`, `api.notion.com`, `slack.com`; the flag and the descriptor add to them, and the app host is never in the list |
+| `--return-path /oauth/` | `returnPath` | `/oauth/`; a path prefix that starts and ends with `/`, and is not `/` itself |
+
+The consent list is not `authHosts` (the sign-in hosts, which include the platform API host
+and the auth page host): a `window.open` to those keeps opening in the system browser.
+
+The return prefix must not cover the path where the sign-in of the app comes back. The sign-in uses
+its own return (the URL scheme, or the whole host with `--callback https`); a sign-in that ended
+under the prefix would be taken as the return of a connection, or, with no connection open, loaded
+in the page without its context. Pick a prefix only the connections use.
+
+The sign-in return by URL scheme (`--callback scheme`) is a separate path and did not change.
+
+What the hosts have to serve, which this repository does not do (`generator/wellknown.mjs` writes
+the files, the site or the platform edge serves them):
+
+- Android: `/.well-known/assetlinks.json`. The manifest's App Link is now limited to the return
+  path (`android:pathPrefix`), so a link to any other page of the site keeps opening in the browser.
+  The exception is `--callback https`, whose sign-in ends on any path of the host and keeps the
+  whole-host filter.
+- iOS: `webcredentials:<host>` (Associated Domains, from `--associated-domains`) and the
+  `apple-app-site-association` file, which the https callback of the session needs.
+
+Rollout order, because the host-wide App Link and the file interact: publish the new version in
+the store first, and serve `assetlinks.json` after most users have it. A version that still has the
+whole-host filter loses the return of its sign-in once the file is live (the browser hands the
+return to the app as a link, and the page that started it is gone), which is the problem of the
+first published version. Test the sign-in on the old version before publishing the file.
+
+Until the file is served, a connection fails without a message on Android: with Chrome 137 or newer
+the Auth Tab reports a failed or timed out verification, and the shell closes the window like a
+cancel; with another browser the Custom Tab shows the return page, which asks to be opened by the
+app, and closing the tab closes the window. On iOS the session fails and the consent opens in the
+system browser, the window closes too.
+
+Limits:
+
+- If Android kills the app while the browser is open, the return arrives in a new process: the page
+  that opened the window does not exist anymore, so the return page has no opener and nothing
+  finishes. There is no way to recover the window.
+- iOS below 17.4 keeps Capacitor's behavior (the system opens the URL, the page gets no window).
+- Android cannot tell which frame called `window.open`: the check is on the URL the web view shows,
+  so an iframe of another origin inside an app page with a user gesture can also get a child.
+- A consent whose URL has no valid `redirect_uri` has no exact path: Android falls back to the Custom
+  Tab and the App Link, and iOS opens it outside as before (the page gets no window). The Auth Tab
+  and the exact path were not exercised in a real browser here; the intent the shell builds is
+  checked in the unit test, what Chrome does with it is not.
+- The child is never attached to a view. A page that depends on being visible in it (for example
+  timers throttled in a hidden web view) can be slower to close; the 15 second limit covers a
+  page that never does.
+
+On Android the logic is `PopupPolicy` (pure Java: phases, host and path checks; JVM test
+`generator/test/PopupPolicyTest.java`, run by the `test` job of `ci.yml`) and `ShellPopups` (the child
+windows and the system browser; `ShellWebChromeClient.onCreateWindow` hands the call to it, and
+`MainActivity.onNewIntent` offers it the App Link first). Both are templates in
+`generator/templates/android/`, and the generated project carries `ShellPopupsTest.java`, a Robolectric
+test on the real Bridge: the child is created only under the conditions above, the rest opens as
+before, the return loads in the child and not in the page, a return outside the host or the prefix
+is discarded, a cancelled browser closes the child, the scheme sign-in return still reloads the
+page, a consent with a valid `redirect_uri` hands the browser its exact path (and any other consent,
+none), and the real Auth Tab and Custom Tab intents are built and inspected (host and path of the Auth
+Tab, the plain Custom Tab otherwise). The system browser is replaced by a recorder in the other cases,
+so what a browser does with the intent is not exercised there. On iOS it is `ShellPopups` in
+`SceneDelegate.swift`, a forwarding `WKUIDelegate` in front of Capacitor's.
 
 ### Icon and splash
 
@@ -68,7 +413,8 @@ The splash takes that color, not the theme color, on both platforms and in
 `SplashScreen.backgroundColor`; the theme color stays the status bar color after load. Over the
 splash the status bar icons fit the splash color: the Android launch theme, and on iOS
 `UIStatusBarStyle` in `Info.plist` plus `SceneDelegate.swift` while the overlay is up. When the
-overlay leaves, the iOS status bar goes back to the style of the app.
+overlay leaves, the iOS status bar goes to the latest style the app asked for (see Status bar
+style above).
 
 If the composition fails for any logo, the run warns and hands the plain logo to `capacitor-assets`
 on the theme color, without the splash entrance, instead of failing the generation.
@@ -94,14 +440,20 @@ The mark comes in with a short entrance (opacity and size, ease-out):
 |---|---|
 | `--name "..."` | App name (default: platform name or page title) |
 | `--app-id x.y.z` | Android application id and iOS bundle id |
-| `--icon <file\|url>` | SVG or PNG icon (default: login logo, page icon, then the initials of the name) |
+| `--icon <file\|url>` | SVG or PNG icon (default: login logo, page icon as above, then the initials of the name). Any raster icon used (page, manifest, login logo or this flag) under 512 px logs a warning, as it will look soft; give an SVG or a 1024 px PNG |
 | `--theme "#0f172a"` | Status bar color, and the splash and icon background when the logo has none of its own, as `#rgb` or `#rrggbb` |
+| `iconBackground` (descriptor only) | Icon and splash background for a logo with none of its own, as a hex color. `mitra-shell.json` records it when the manifest `background_color` was used, so regenerating from that file keeps the color; `--theme` still wins |
 | `--version 1.0`, `--build-number 1` | Marketing version and build number |
 | `--out out` | Output root; the project goes to `<out>/<slug>/` |
 | `--no-ios` | Android project only |
+| `--ios-content-inset never\|automatic` | Force the iOS scroll view inset, see Safe area (default: `never` when the page declares `viewport-fit=cover`) |
+| `--ios-keyboard resize\|notify\|off` | What the iOS shell does when the keyboard opens, see Keyboard (default: `resize`, the web view ends at the keyboard) |
 | `--callback scheme\|https` | How the sign-in returns to the shell, see below |
 | `--associated-domains` | iOS `applinks` and `webcredentials` entitlements for the host |
-| `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session on iOS |
+| `--background-audio` | Keep the microphone of a live voice conversation with the screen locked: the `audio` background mode on iOS, a microphone foreground service on Android, see Background audio |
+| `--auth-hosts a.com,b.com` | Extra hosts opened in the native sign-in session (iOS) and in the Auth Tab (Android) |
+| `--consent-hosts a.com,b.com` | Extra hosts whose `window.open` is an account connection, see Account connections in a popup |
+| `--return-path /oauth/` | Path prefix on the app host where a connection comes back (default `/oauth/`) |
 | `--push`, `--google-services <file>` | Push notifications, see below |
 | `--build debug\|release`, `--install` | Run Gradle, then `adb install` the APK |
 | `--identity` | Resolve and print the identity only, generate nothing |
@@ -120,10 +472,261 @@ URL fragment. The shell has two ways to get it back into the WebView:
   generated project) in the head of its `index.html`, and that script hands the fragment to the
   scheme. Trade-off: another app installed on the device can register the same scheme and
   receive the single-use code.
-- `https`: the return is a Universal Link (iOS) or App Link (Android) on the app host. It needs
-  `--associated-domains` and the host serving `/.well-known/apple-app-site-association` and
+- `https`: the return is a Universal Link (iOS) or App Link (Android) on the app host (on Android
+  this keeps the App Link of the whole host, where the other mode claims only the return path of the
+  account connections). It needs `--associated-domains` and the host serving `/.well-known/apple-app-site-association` and
   `/.well-known/assetlinks.json`, which `generator/wellknown.mjs` writes. No other app can claim
   the host, so this is the path for apps where the scheme risk is not acceptable.
+
+On Android, with `--callback scheme`, the sign-in runs in an Auth Tab when the default browser has
+one (androidx.browser 1.9, Chrome 137 and later): a sheet of the browser over the app, with the
+browser's cookies, that tells the shell how it ended. `ShellSignIn` replaces the bridge's web view
+client and takes a navigation of the main frame to an `https` URL whose host is in `authHosts` and
+is not the app host; the page does not navigate, and asking again while the tab is up opens nothing
+more. A frame, another host, `http` and `window.open` stay with the bridge as before. The Auth Tab
+returns by the URL scheme. What comes back loads in the page through the code a link takes in
+`MainActivity` (`loadReturn`): the app host with the same fragment and a fresh `shellLink` query
+value, so the SDK finishes the sign-in at boot. The same return handed over twice within three
+seconds (as the Auth Tab result and as a link) loads once.
+
+An Auth Tab that ends without a return loads nothing, so the Android shell tells the page, with an
+event on `window` (no detail), once for each sign-in:
+
+- `mitrashell:authcancel`: the user closed the Auth Tab.
+- `mitrashell:authfail`: the Auth Tab gave a result that is neither a return nor a cancel, or a URL
+  that is not a return of the app. On Android a failure is the event only: the shell does not open
+  the sign-in in the system browser afterwards.
+
+On Android the events exist only for a sign-in that ran in an Auth Tab. With `--callback https`, or
+without an Auth Tab (another default browser, an older Chrome, or one that could not start), nothing
+changes and neither event is dispatched: the bridge sends the sign-in to the system browser, and the
+return comes back as a link, by the App Link or the scheme, through `MainActivity.onNewIntent`. The
+https return stays there because the Auth Tab matches an https return by one exact path, and that
+sign-in ends on any path of the host. When Android recreates the activity while the tab is up, the
+return still loads, and a cancel or a failure is not reported, as the page that waited is gone. The
+account connections in a popup do not use the events: there the page sees the child window close.
+The generated project carries `ShellSignInTest.java`, a Robolectric test on the real Bridge, the
+real `AuthTabIntent` and the activity result registry: which navigations are taken, the callback
+handed to the Auth Tab, the reload with `shellLink` and the fragment, the two events, one signal
+for each sign-in, a recreated activity, and the path without an Auth Tab. It has a case for the
+https return too, which only runs in a project generated with `--callback https`; `ci.yml`
+generates with the scheme, so CI does not run it. `ci.yml` runs it twice, on a project served at
+the root and on one served under `/noodle`, where a return by the scheme must load `/noodle` by the
+Auth Tab and as a link (`SHELL_TEST_APP_PATH` names the path the run asked for). What Chrome does
+with the intent was not exercised on a device.
+
+On iOS 17.4 and later the sign-in runs in an `ASWebAuthenticationSession`, and a session that ends
+without a return loads nothing, so a page that shows the sign-in in progress would stay that way.
+The shell tells the page instead, with an event on `window` (no detail), and the page can put its
+button back:
+
+- `mitrashell:authcancel`: the user closed the sign-in sheet.
+- `mitrashell:authfail`: the session failed or could not start, or came back with a URL that is not
+  a return of the app. When it failed, the sign-in then opens in the system browser, as before.
+
+```js
+window.addEventListener("mitrashell:authcancel", resetSignInButton);
+window.addEventListener("mitrashell:authfail", resetSignInButton);
+```
+
+Below iOS 17.4 neither event exists: the sign-in goes to the system browser. The account
+connections in a popup do not use them: there the page sees the child window close.
+
+The iOS sign-in has a test on the real plugin: `generate.mjs --ios-tests` adds an `AppTests` target
+hosted by the app (`generator/ios-tests.rb`, with the xcodeproj gem CocoaPods ships) and a shared
+`App` scheme, and the `ios` job of `ci.yml` runs it in the simulator. The plugin starts its session
+through a seam (`sessionFactory`, `browserOpener`, `pageNotifier`, nil in the app), so the cases in
+`generator/templates/ios-tests/ShellSignInTests.swift` end a fake session by hand: a valid return,
+a cancel, a failure, a return that is not of the app, `start()` false with and without a completion
+inside it, late and duplicate completions, and two sign-ins in a row. Each checks the page event
+(one per sign-in), the browser fallback (at most one) and what loads in the shell. The real factory
+is checked to make a non-ephemeral `ASWebAuthenticationSession` presented by the plugin. The system
+sheet itself is not driven.
+
+The keyboard has its own cases in `generator/templates/ios-tests/ShellKeyboardTests.swift`, on the
+real `ShellBridgeViewController` of the test host, its WKWebView and the Capacitor bridge: the test
+posts the keyboard notifications UIKit posts and loads its own documents, one that fits the
+viewport and one that scrolls. It checks `resize` (the frame ends at the keyboard, `innerHeight` is
+shorter), `notify` and `off` (events and state the page sees), a switch of mode with the keyboard
+up, from the shell and from the page through `setKeyboardMode`, a document that commits (the mode
+of the config again, and with the keyboard up the event a new page needs) and a navigation the
+shell takes over, which does not commit (the document keeps its mode), the pan and the scroll held or left for each kind of document, and
+the state an inline script reads at load. The keyboard itself is not shown: no animation, input
+or real focus is exercised, so the motion is still to be judged on a device.
+
+The keyboard needs nothing from the shell on Android: Capacitor's `SystemBars` plugin (on by
+default, `insetsHandling` not `disable`) pads the window's decor view by the keyboard inset while
+the keyboard is up, with the page under the bars or not, so the web view shrinks and a composer at
+the bottom stays above the keyboard.
+
+### Keyboard form bar (iOS)
+
+WKWebView puts a bar above the keyboard of a form field (previous, next, Done), which reads as a web
+page. Every iOS shell hides it, with no page change and no Keyboard plugin: `SceneDelegate.swift`
+gives the web view's content view a runtime subclass whose `inputAccessoryView` is nil. The
+Capacitor Keyboard plugin can hide the bar too; the shell does it itself so that no app carries a
+plugin, with its JS surface, for this one effect. Without the bar there is no Done button, so a
+field whose keyboard has no return or go key closes only when the page blurs it. The wheel pickers
+lose their Done too (a `<select>`, a date or time input in wheel mode): they close by a tap outside
+them. If a WebKit release renames the content view, the bar just stays.
+
+### Keyboard (iOS, `--ios-keyboard`)
+
+WKWebView keeps its height when the keyboard opens and reveals the focused field by scrolling the
+whole page, so a screen that fills the viewport (a chat: header, messages, composer) slides up,
+header included. The shell has three modes for it, with no Keyboard plugin:
+
+| Mode | Web view | Page event | Choose it when |
+|---|---|---|---|
+| `resize` (default) | Ends at the top of the keyboard | Yes | The page is not written for the shell: the header stays and the composer sits on the keyboard with no page change |
+| `notify` | Keeps its full height | Yes | The page moves itself with the keyboard, for the motion of a native screen |
+| `off` | Keeps its full height | No | The page already handles WebKit's own behavior and wants nothing changed |
+
+The generator sets the mode every document starts in; a page can change it for itself at runtime,
+see Choosing the mode from the page.
+
+`resize` is correct but not fluid: WebKit does not paint the page again on every frame while the
+web view changes size, and the page lays out once, in one step, so a band can flash above the
+keyboard and the conversation jumps. `notify` leaves the motion to the page, which only works if
+the page listens to the event below; without a listener the composer stays under the keyboard.
+
+The mode is set with `--ios-keyboard` (or `iosKeyboard` in the descriptor) and written to
+`plugins.MitraShell.keyboard`; `mitra-shell.json` records it only when it is not `resize`.
+
+In both `resize` and `notify` the keyboard only counts when it is docked across the bottom and
+belongs to the app: a floating, undocked or split keyboard on iPad, a hardware keyboard and the
+keyboard of the sign-in sheet leave the page as it is, with no event (or a `willHide`, if the
+keyboard was up and stops being docked).
+
+#### `resize`: what the page sees
+
+- The viewport is shorter: `window.innerHeight`, `100dvh`, `100vh` and `visualViewport.height` are
+  the height above the keyboard, and the page lays out again (a `resize` event), with the
+  keyboard's own animation. They come back when it closes.
+- `visualViewport.offsetTop` stays 0 and the document is not scrolled for the keyboard, so a page
+  that compensated with `visualViewport` (offsetting its top, or sizing itself to
+  `visualViewport.height`) keeps working: the compensation is now zero.
+- `env(safe-area-inset-bottom)` is 0, since the web view no longer reaches the home indicator.
+- A page that scrolls keeps scrolling, and WebKit still brings the field into view. Only a
+  document that fits the shorter viewport is kept at the top. If the shorter viewport leaves the
+  focused field out of view, the shell scrolls to it once, about half a second after the keyboard
+  starts (`scrollIntoView`, which also reaches a field inside a box with its own overflow). An
+  iframe, an element with no size and a field taller than the viewport are left where they are.
+
+A screen locked to the viewport height should let its content scroll inside it (`overflow: auto`)
+or fit above the keyboard: content it clips with `overflow: hidden` is reached only by that one
+scroll. The window behind the web view takes the page background, which is what shows around the
+rounded corners of the keyboard.
+
+#### `notify`: what the page sees
+
+- The layout is not resized: `window.innerHeight`, `100dvh` and `100vh` stay the full height, and
+  the keyboard covers the bottom of the page. `visualViewport.height` still shrinks, as in plain
+  WebKit, but only once the keyboard has landed.
+- A document that fits the viewport is kept at the top while the keyboard is up: the shell cancels
+  the scroll, and with it the `visualViewport.offsetTop` shift, that WebKit uses to reveal the
+  field. A document taller than the viewport scrolls as usual, and WebKit brings the field into
+  view there. The shell never calls `scrollIntoView` in this mode: the page owns the layout.
+- A finger cannot drag such a document either: while the keyboard is up the shell turns off the
+  pan of the document, which would otherwise travel by the keyboard height and snap back. Boxes
+  that scroll inside the page (`overflow: auto`) keep scrolling, and so does a document taller
+  than the viewport.
+- The safe area is untouched: `env(safe-area-inset-bottom)` keeps the home indicator value. The
+  `height` of the event already includes that area, so while the keyboard is up the page lifts its
+  composer by `height` in place of the safe area inset, not by the sum of the two.
+
+#### The `mitrashell:keyboard` event
+
+Sent on `window` in `resize` and `notify`. The fields are properties of the event itself
+(`event.height`), not of `event.detail`:
+
+| Field | Value |
+|---|---|
+| `mode` | `"resize"` or `"notify"`: whether the web view shrinks by itself or the page must lift its content |
+| `phase` | `"willShow"`, `"didShow"`, `"willHide"` or `"didHide"` |
+| `height` | How much of the bottom of the full-height web view the keyboard covers when the transition ends, home indicator area included; `0` on a hide. In points, which are CSS px for a page at `width=device-width` that is not zoomed |
+| `duration` | Keyboard animation in ms; `0` on `didShow` and `didHide`, and when the keyboard moves with no animation |
+| `curve` | The raw `UIView.AnimationCurve` of the keyboard (`7` for the system keyboard, which is private) |
+| `easing` | A CSS timing function for that curve: `ease-in-out`, `ease-in`, `ease-out` or `linear` for the public curves, and `cubic-bezier(0.38, 0.7, 0.125, 1)` for the keyboard's own, an approximation of its spring |
+
+`willShow` and `willHide` are sent before the keyboard animation starts, so a transition started
+in the listener runs along with it. `willShow` comes again, with the new `height`, when the height
+changes with the keyboard up (emoji, dictation). `didShow` and `didHide` come when the keyboard
+has landed. The same phase with the same height is sent once. In `resize` the page needs none of
+this to lay out; there `height` is how much shorter the viewport gets. A page that may run under
+either mode checks `mode` and lifts its content only in `notify`: lifting in `resize` would count
+the keyboard twice.
+
+A composer fixed to the bottom that travels with the keyboard, in `notify`. Its bottom padding is
+the safe area, and that padding is what goes under the keyboard:
+
+```css
+.composer { position: fixed; bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
+```
+
+```js
+window.addEventListener("mitrashell:keyboard", (event) => {
+  if (event.mode !== "notify") return;
+  if (event.phase !== "willShow" && event.phase !== "willHide") return;
+  // Read here and not once at load: the inset changes with rotation.
+  const safeBottom = parseFloat(getComputedStyle(composer).paddingBottom) || 0;
+  const lift = Math.max(0, event.height - safeBottom);
+  composer.style.transition = `transform ${event.duration}ms ${event.easing}`;
+  composer.style.transform = `translateY(${-lift}px)`;
+});
+```
+
+A page that loads or starts listening with the keyboard already up has missed the event, so the
+shell also leaves the last state on `window.__mitraShellKeyboard`, as `{ phase, mode, height }`.
+It is set before each event is dispatched, and a new document has it before any of its own
+scripts run, inline ones included: a script the shell adds at document start sets it synchronously
+to the mode of the config and no keyboard, which is the state of a new document. When the keyboard
+is up as the document starts (a navigation from a focused field), that first value is corrected a
+moment later, and the page also gets a `mitrashell:keyboard` event with the current phase and
+height, so a listener added by its first scripts hears it. Read `undefined` (an older shell) as no
+keyboard:
+
+```js
+const keyboard = window.__mitraShellKeyboard;
+if (keyboard && keyboard.mode === "notify" && keyboard.height > 0) liftComposer(keyboard.height);
+```
+
+In `off` the state is always `{ phase: "didHide", mode: "off", height: 0 }`: the shell reports no
+keyboard there.
+
+#### Choosing the mode from the page
+
+A page can pick the mode for itself, for example `notify` on a chat screen and `resize` on forms:
+
+```js
+const shell = window.Capacitor?.Plugins?.MitraShell;
+if (typeof shell?.setKeyboardMode === "function") {
+  const state = await shell.setKeyboardMode({ mode: "notify" }); // { phase, mode, height }
+}
+```
+
+- The promise resolves with the state under the new mode, the same object left on
+  `window.__mitraShellKeyboard`, and rejects for a value that is not `resize`, `notify` or `off`.
+- The choice lasts for the current document. Every new document, a reload included, starts again
+  in the mode the app was generated with, so a page that wants another mode calls this on load.
+  Navigation inside a single-page app keeps the choice, and so does a load that fails or is
+  cancelled, since the document stays.
+- Call it on `pageshow` too. A document that comes back from the back/forward cache runs no script
+  again, and the shell does not see it as new: the mode in force is the one the document shown in
+  between left, and `window.__mitraShellKeyboard` is the one this document had when it went away.
+  `window.addEventListener("pageshow", applyKeyboardMode)` covers the first load and the restore.
+- With the keyboard up the switch is immediate and not animated: leaving `resize` gives the web
+  view its full height back, entering it ends the web view at the keyboard. No event is sent for
+  the switch; read `height` from the resolved state, and the events of the new mode start with the
+  next move of the keyboard.
+- The `typeof` check is the feature detection: a shell generated before this method, the Android
+  shell and a browser do not have it, and there the page keeps the behavior it gets.
+
+A descriptor that still has the earlier `iosKeyboardResize` key fails with a message: use
+`"iosKeyboard": "off"` in place of `false`.
+
+The message list needs the same distance (a transform, or bottom padding set on `didShow`), or its
+last messages stay under the keyboard. The event exists only in the iOS shell.
 
 ### Push (`--push`)
 
@@ -162,10 +765,13 @@ cannot be read stops, unless `build_number` is given.
 | `app` | empty | Platform app UUID |
 | `api` | `https://beta.mitralab.io` | Platform API base URL |
 | `url` | empty | Published URL, when there is no app UUID |
+| `descriptor` | empty | Descriptor in this repository (`apps/<name>.json`), see Descriptors in this repository. Its fields are the defaults: `app`, `url` and `app_id` override them when given, `version` and `ios_keyboard` always do (they have defaults), and a boolean input only turns an option on |
 | `app_id` | empty | Override the application id and bundle id |
 | `version` | `1.0` | Marketing version |
 | `build_number` | empty | Override the build number |
 | `associated_domains` | `true` | Declare `applinks` and `webcredentials` on iOS |
+| `background_audio` | `false` | Generate with `--background-audio` (iOS and Android) |
+| `ios_keyboard` | `resize` | Generate with `--ios-keyboard` (`resize`, `notify` or `off`), see Keyboard |
 | `push` | `false` | Generate with `--push` |
 | `upload_testflight` | `false` | Archive, upload to TestFlight and add the build to the group |
 | `testflight_group` | `Mitra shell testers` | TestFlight group that receives the build |
@@ -203,9 +809,10 @@ notification with `simctl push`; the run fails when the page does not receive it
 ### CI (`ci.yml`)
 
 Runs on pull requests and on `main`. `test` runs `npm test` (syntax check of the generator
-scripts and their self-tests). `build` generates a shell from a local fixture page, without the
-platform API or any secret, and checks the generated project, including the icon drawn from the
-initials; it does not run Gradle.
+scripts and their self-tests) and the JVM tests of the permission gate and the popup policy. `build` generates a shell
+from a local fixture page, without the platform API or any secret, checks the generated project,
+including the icon drawn from the initials, and runs the unit tests of the generated Android
+project (`testDebugUnitTest`); it builds no APK.
 
 ### Workflow of the generated project
 

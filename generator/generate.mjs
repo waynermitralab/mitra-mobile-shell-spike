@@ -7,9 +7,13 @@
 //   node generator/generate.mjs --selftest
 //
 //   flags: [--name "..."] [--app-id x.y.z] [--icon <file|url>] [--theme "#0f172a"] [--version 1.0]
-//          [--build-number 1] [--associated-domains] [--auth-hosts a.com,b.com] [--out out]
+//          [--build-number 1] [--associated-domains] [--background-audio] [--auth-hosts a.com,b.com] [--out out]
+//          [--consent-hosts a.com,b.com] [--return-path /oauth/]
 //          [--callback scheme|https] [--build debug|release] [--install] [--no-ios] [--debug]
 //          [--verbose] [--identity] [--push] [--google-services <google-services.json>]
+//          [--ios-tests]
+//          [--ios-content-inset never|automatic]   (default: never when the page declares viewport-fit=cover)
+//          [--ios-keyboard resize|notify|off]      (default: resize, the iOS web view ends at the keyboard)
 //
 // Source of truth for the identity is the platform: GET {api}/code-studio/api/v1/apps/{app}/info
 // (public, no token) gives name, published origins, accent color and the login logo. The page
@@ -18,7 +22,7 @@
 // initials on the theme color. Then it writes package.json +
 // capacitor.config.json + www/ + assets/, npm ci,
 // cap add android/ios, apply the native patches (App Link intent-filter, onNewIntent
-// in MainActivity, release signing from env, exempt encryption, optional Associated Domains,
+// and the sign-in in an Auth Tab in MainActivity, release signing from env, exempt encryption, optional Associated Domains,
 // SceneDelegate with the sign-in session and Universal Link handling on iOS),
 // compose the icon and splash from the logo (composeBrand), generate icons and splash, cap sync,
 // copy the CI workflow. Optionally builds and installs
@@ -31,6 +35,12 @@
 // "https" is the Universal Link callback, which needs the host to serve the
 // apple-app-site-association file and --associated-domains.
 //
+// Popup contract (--consent-hosts, --return-path): a page that connects an account calls
+// window.open(consent url) and waits on the window it gets. The shell gives it a real child window,
+// sends the consent to the system browser (hosts: the sign-in hosts, the common providers and the
+// extras given) and loads the return (a path under --return-path, default /oauth/, on the app host)
+// in the child. See the README, "Account connections in a popup".
+//
 // Push (--push): off by default, and then the push plugin is left out of the native projects, so a
 // page that calls it gets "not implemented". iOS needs only the flag (aps-environment entitlement
 // and the AppDelegate hooks). Android also needs the Firebase config of this application id
@@ -38,10 +48,13 @@
 // because the plugin crashes the app on register() when Firebase is not configured.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, cpSync, readdirSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, join, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const templateRoot = resolve(here, "..");
@@ -90,15 +103,54 @@ const MARK_FRAME = 0.04;
 const BACKGROUND_TOLERANCE = 12;
 const MARK_TOLERANCE = 28;
 const MARK_ALPHA = 40;
+// Below this side a raster logo is upscaled enough to look soft on the 1024 px store icon.
+const SOFT_ICON_PX = 512;
+// A web manifest is a few KB; the cap only keeps a hostile host from filling the memory of the run.
+// Declared up here because the manifest is read during the top-level resolution of the identity.
+const MANIFEST_MAX_BYTES = 1048576;
+const ICON_MAX_BYTES = 10485760;
+// Each attempt is a round trip of up to 15 s, and past the first few the candidates are small
+// variants of the same artwork, so a page with many links cannot hold the generation for minutes.
+const MAX_ICON_ATTEMPTS = 6;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// A failure that is the remote's, as opposed to a bug here: it carries the category to log. The
+// message of a raw error can quote the body or the URL, so it is never logged.
+// Declared with the constants because a class is not hoisted and the downloads run in the
+// top-level flow above the functions that throw it.
+class FetchReason extends Error {}
 // A background that covers less of the picture than this is a gradient or a picture, not a color.
 const MIN_BACKGROUND_SHARE = 0.25;
 // Fringes and soft shadows around the mark are too faint to count as mark, but cut off they leave a hard edge.
 const MARK_PADDING = 0.02;
 // Names SceneDelegate.swift calls on its own types: the view controller members by receiver, plus
 // the ones that live in other types of the file. Definitions are var, func or init, never a local let.
-const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play"];
+// Robolectric 4.16 supports Android API 36 and needs JDK 17 or later.
+const ROBOLECTRIC_VERSION = "4.16";
+const ANDROIDX_TEST_CORE_VERSION = "1.7.0";
+// The Auth Tab (AuthTabIntent with an https redirect host and path) first shipped in 1.9. The
+// browser plugin of Capacitor brings the same version, but only as an implementation detail of its
+// own module, so the app declares it for the code it writes itself.
+const ANDROIDX_BROWSER_VERSION = "1.9.0";
+// The voice channel is a WebMessageListener on the main WebView. Capacitor uses the same artifact,
+// but as an implementation detail of its own module, so the app declares it for its own code.
+const ANDROIDX_WEBKIT_VERSION = "1.14.0";
+// Hosts that ask for consent when a page of the app connects an account. The platform API host and
+// the auth page host of the sign-in are not here: a window.open to them is not a consent and must
+// keep opening in the system browser.
+const DEFAULT_CONSENT_HOSTS = ["accounts.google.com", "login.microsoftonline.com", "login.live.com", "appleid.apple.com", "github.com", "api.notion.com", "slack.com"];
+const DEFAULT_RETURN_PATH = "/oauth/";
+// Shipped only with --background-audio, see withVoiceService.
+const VOICE_CLASSES = ["ShellVoiceService.java", "ShellVoiceCapture.java"];
+const VOICE_TESTS = ["ShellVoiceCaptureTest.java", "ShellVoiceServiceTest.java"];
+// What the iOS shell does when the keyboard opens, see installKeyboard in SceneDelegate.swift.
+const IOS_KEYBOARD_MODES = {
+  resize: "the web view ends at the keyboard (the page viewport shrinks)",
+  notify: "the web view keeps its height and the page moves itself on mitrashell:keyboard",
+  off: "plain WebKit, no keyboard event"
+};
+const SWIFT_MEMBERS = ["appHost", "callbackScheme", "appURL", "loadInShell", "showSplashEntrance", "play", "installBarsProbe", "setStatusBarStyle", "applyStatusBarStyle", "hideFormAccessoryBar", "installKeyboard", "notifyKeyboard", "switchKeyboardMode", "fitToKeyboard", "dropStrayScroll", "holdDocumentPan", "revealFocusedField", "notifyPage"];
 
-if (flags.selftest) { selftest(); process.exit(0); }
+if (flags.selftest) { await selftest(); await selftestIconFlow(); log("selftest ok"); process.exit(0); }
 
 const descriptor = flags.descriptor ? JSON.parse(readFileSync(resolve(flags.descriptor), "utf8")) : {};
 const appUuid = flags.app || descriptor.app;
@@ -114,6 +166,15 @@ if (!url) fail("Missing --app <uuid> (platform app) or --url <published URL>, or
 if (info && !info.origins?.length) fail(`App ${appUuid} has no published origin yet; publish it first or pass --url.`);
 const page = await fetchText(url);
 const scraped = scrape(page, url);
+// The page is already in hand in every mode, so the decision costs no extra request.
+const pageOwnsSafeArea = pageHandlesSafeArea(page);
+// The caller can force the value: the choice is frozen at generation, and a page that later adds or
+// drops viewport-fit=cover is otherwise out of step with the shell until it is generated again.
+const insetOverride = flags["ios-content-inset"] ?? descriptor.iosContentInset ?? undefined;
+let contentInset;
+try {
+  contentInset = resolveContentInset(insetOverride, pageOwnsSafeArea);
+} catch (e) { fail(e.message); }
 const appName = clean(flags.name || descriptor.name || info?.name || scraped.title || new URL(url).hostname);
 const slug = slugify(appName);
 const appId = flags["app-id"] || descriptor.appId || `cloud.${brandSegment(info?.brand)}.${packageSegment(slug)}`;
@@ -127,13 +188,29 @@ if (!isVersionName(versionName)) fail(`--version must look like 1, 1.2 or 1.2.3,
 const buildNumber = Number(flags["build-number"] || descriptor.buildNumber || 1);
 if (!Number.isInteger(buildNumber) || buildNumber < 1) fail("--build-number must be a positive integer");
 const associatedDomains = Boolean(flags["associated-domains"] || descriptor.associatedDomains);
+// SceneDelegate reads it at runtime (plugins.MitraShell.keyboard).
+let iosKeyboard;
+try {
+  iosKeyboard = resolveIosKeyboard(flags["ios-keyboard"], descriptor.iosKeyboard, descriptor.iosKeyboardResize);
+} catch (e) { fail(e.message); }
+// Platform neutral: iOS gets its plist entry (patchIos) and Android its foreground service (patchAndroid).
+const backgroundAudio = Boolean(flags["background-audio"] || descriptor.backgroundAudio);
 const callback = String(flags.callback || descriptor.callback || "scheme");
 if (!["scheme", "https"].includes(callback)) fail(`--callback must be scheme or https, got ${callback}`);
 const wantPush = Boolean(flags.push || descriptor.push);
-const iconSource = flags.icon || descriptor.icon || info?.logoUrl || scraped.icon;
+if (descriptor.iconBackground !== undefined && !HEX_COLOR.test(descriptor.iconBackground)) fail(`iconBackground in the descriptor must be a hex color, got ${JSON.stringify(descriptor.iconBackground)}`);
+let iconSource = flags.icon || descriptor.icon || info?.logoUrl;
+// Only the icons of the page (or its manifest) are paired with the manifest's background color: the
+// other sources carry no promise about what sits behind them.
+let pageIcons = [];
+let manifestBackground;
+if (!iconSource && !flags.identity) ({ icons: pageIcons, backgroundColor: manifestBackground } = await pageIcon(scraped));
 const host = new URL(url).host;
 // The host is written into AndroidManifest.xml and the iOS entitlements as is.
 if (!isPlainHost(host)) fail(`Unsupported host in the app URL: ${JSON.stringify(host)}`);
+// The URL may carry a path (an app served under a route of another host, like /noodle): the shell
+// loads it and brings a sign-in back to it. A query or fragment would be dropped on that return.
+if (!isAppUrl(url)) fail(`The app URL must be https://host[/path], without query or fragment, got ${JSON.stringify(url)}`);
 // A bundle id is a valid URL scheme (letters, digits, dot, hyphen), unique per app on the device.
 const callbackScheme = callback === "scheme" ? appId.toLowerCase() : undefined;
 // Hosts whose top-level navigation is a sign-in: the shell opens them in a native auth session
@@ -150,6 +227,25 @@ const authHosts = [...new Set([
   ...String(flags["auth-hosts"] || "").split(",").map((s) => s.trim()).filter(Boolean),
   ...DEFAULT_AUTH_HOSTS
 ].map((h) => h.toLowerCase()))];
+// Popup contract (see templates/android/ShellPopups.java): a window.open to one of these hosts, made
+// from a page of the app, gets a real child window and its consent goes to the system browser. The
+// list is the default providers plus what the descriptor and the flag add; the app host never is
+// (a window.open to it is the app talking to itself), and the sign-in hosts of --auth-hosts are a
+// different list.
+const appHostName = host.replace(/:\d+$/, "");
+if (descriptor.consentHosts !== undefined && !Array.isArray(descriptor.consentHosts)) fail("consentHosts in the descriptor must be an array of host names");
+const consentHosts = [...new Set([
+  ...DEFAULT_CONSENT_HOSTS,
+  ...(descriptor.consentHosts || []),
+  ...String(flags["consent-hosts"] || "").split(",").map((s) => s.trim()).filter(Boolean)
+].map((h) => String(h).toLowerCase()))].filter((h) => h !== appHostName);
+for (const h of consentHosts) if (!isConsentHost(h)) fail(`consent hosts must be plain host names without port or path, got ${JSON.stringify(h)}`);
+// Where the consent comes back on the app host, and what the App Link of the shell covers.
+const returnPath = String(flags["return-path"] || descriptor.returnPath || DEFAULT_RETURN_PATH);
+// "/" would give the shell the App Link of the whole host again, which takes the return of the sign-in
+// away from an app already in the stores once the host serves assetlinks.json.
+if (returnPath === "/") fail("--return-path must not be /: it would make the App Link cover the whole host, including the return of the sign-in");
+if (!isReturnPath(returnPath)) fail(`--return-path must be a path prefix that starts and ends with / (letters, digits, . _ ~ -), got ${JSON.stringify(returnPath)}`);
 const projectDir = join(outRoot, slug);
 
 validateAppId(appId);
@@ -162,7 +258,16 @@ log(`slug     ${slug}`);
 log(`appId    ${appId}`);
 log(`url      ${url}`);
 log(`theme    ${themeColor}`);
-log(`icon     ${iconSource ? describe(iconSource) : `(none, drawing the initials ${initials(appName, slug)})`}`);
+log(`inset    ios contentInset ${contentInset} (${insetOverride ? "set by --ios-content-inset or the descriptor" : pageOwnsSafeArea ? "the page declares viewport-fit=cover, so it reserves the safe area itself" : "the page does not declare viewport-fit=cover, so the web view reserves the safe area"})`);
+if (!flags.identity) {
+  let iconLine;
+  if (iconSource) iconLine = describe(iconSource);
+  else if (pageIcons.length) iconLine = `${describe(pageIcons[0]).slice(0, 120)} (first of ${pageIcons.length} from the page and its manifest)`;
+  else iconLine = `(none, drawing the initials ${initials(appName, slug)})`;
+  log(`icon     ${iconLine}`);
+}
+log(`keyboard ios ${iosKeyboard}: ${IOS_KEYBOARD_MODES[iosKeyboard]}`);
+log(`audio    background audio ${backgroundAudio ? "on (ios audio mode, android microphone service)" : "off"}`);
 log(`push     ${wantPush ? `ios ${pushIos ? "on" : "off"}, android ${pushAndroid ? "on" : "off (no Firebase config for " + appId + ")"}` : "off"}`);
 log(`out      ${projectDir}`);
 
@@ -210,36 +315,61 @@ const capPlugins = Object.keys(templatePkg.dependencies)
 const pluginsFor = (push) => capPlugins.filter((d) => push || d !== PUSH_PLUGIN);
 
 writeFileSync(join(projectDir, "www", "index.html"), offlinePage(appName, themeColor));
+// The bar probe travels in the bundle (public/shell-bars.js on both platforms) because the page
+// does not know the shell exists; the native side injects it, see templates/shared/shell-bars.js.
+cpSync(join(here, "templates", "shared", "shell-bars.js"), join(projectDir, "www", "shell-bars.js"));
+// Only an app that asked for background audio ships the capture probe (see templates/android/shell-voice.js).
+if (backgroundAudio) cpSync(join(here, "templates", "android", "shell-voice.js"), join(projectDir, "www", "shell-voice.js"));
 
 // Icon: the source logo is kept in assets/ as it came. The files capacitor-assets reads are
 // composed from it in assets/composed/ (see composeBrand), which needs sharp from npm ci.
-const logoPath = await materializeIcon(iconSource, join(projectDir, "assets"), initialsLogoSvg(initials(appName, slug), themeColor));
+const initialsSvg = initialsLogoSvg(initials(appName, slug), themeColor);
+let logoPath;
+if (iconSource) {
+  logoPath = await materializeIcon(iconSource, join(projectDir, "assets"), initialsSvg);
+} else {
+  const used = await materializePageIcon(pageIcons, join(projectDir, "assets"));
+  if (used) {
+    logoPath = used.path;
+    iconSource = used.url;
+  } else {
+    // No page icon worked, so the manifest color has no logo to sit behind.
+    manifestBackground = undefined;
+    logoPath = await materializeIcon(undefined, join(projectDir, "assets"), initialsSvg);
+  }
+}
+const logoBackground = resolveLogoBackground(flags.theme, descriptor.iconBackground, descriptor.themeColor, manifestBackground, themeColor);
+if (logoBackground !== themeColor) log(`backdrop ${logoBackground} (${!flags.theme && descriptor.iconBackground ? "iconBackground of the descriptor" : "manifest background_color"}, behind a logo with no background of its own)`);
 log(`logo     ${logoPath}`);
 run("npm", ["ci", "--no-audit", "--no-fund", "--loglevel=error"], projectDir);
 // Logos are third-party input and any logo used to generate an app, so a composition that fails
 // falls back to handing the plain logo to capacitor-assets, without the entrance.
 let brand;
 try {
-  brand = await composeBrand(projectDir, logoPath, normalizeHex(themeColor));
+  brand = await composeBrand(projectDir, logoPath, normalizeHex(logoBackground));
 } catch (e) {
-  log(`WARNING  the icon could not be composed (${e.message}); using the logo as it is on the theme color, without the splash entrance`);
-  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(themeColor));
+  log(`WARNING  the icon could not be composed (${e.message}); using the logo as it is on ${logoBackground}, without the splash entrance`);
+  brand = useLogoAsIs(projectDir, logoPath, normalizeHex(logoBackground));
 }
-log(`brand    ${{ "fallback": "plain logo on the theme color", "own-background": "the logo has its own background", "transparent-mark": "transparent mark on the theme color", "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
+log(`brand    ${{ "fallback": `plain logo on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "own-background": "the logo has its own background", "transparent-mark": `transparent mark on the ${logoBackground === themeColor ? "theme" : "manifest background"} color`, "full-bleed": "full-bleed logo, used as the whole icon" }[brand.branch]}; splash color ${brand.bg}${brand.branch === "fallback" ? "" : `, mark box ${brand.box.w}x${brand.box.h} of ${brand.side}${brand.markFound || brand.branch === "full-bleed" ? "" : " (none found, whole image)"}`}`);
 
 writeJson(join(projectDir, "capacitor.config.json"), {
   appId,
   appName,
   webDir: "www",
   server: { url, cleartext: false },
-  ios: { contentInset: "automatic", includePlugins: pluginsFor(pushIos) },
+  ios: { contentInset, includePlugins: pluginsFor(pushIos) },
   android: { allowMixedContent: false, webContentsDebuggingEnabled: Boolean(flags.debug || descriptor.debug), includePlugins: pluginsFor(pushAndroid) },
   plugins: {
-    // The splash sits behind the mark, so it takes the color behind the mark; the theme color is
-    // the app chrome after load (status bar).
+    // The splash sits behind the mark, so it takes the color behind the mark; the theme color
+    // gives the status bar its first style, and a page that draws under the bar then corrects it
+    // at runtime from what it paints there (shell-bars.js).
     SplashScreen: { launchShowDuration: 1500, launchAutoHide: true, backgroundColor: brand.bg, showSpinner: false },
+    // Android reads the live page's viewport-fit at runtime; the hint only spares the first layout
+    // a shift when the page is known to declare cover.
+    ...(pageOwnsSafeArea ? { SystemBars: { initialViewportFitValueHint: "cover" } } : {}),
     StatusBar: { style: isDark(themeColor) ? "DARK" : "LIGHT", backgroundColor: themeColor },
-    MitraShell: { authHosts, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
+    MitraShell: { authHosts, consentHosts, returnPath, keyboard: iosKeyboard, splashBackground: brand.bg, splashDark: brand.isDarkBg, splashMarkCircle: IOS_MARK_CIRCLE_PX, ...(callbackScheme ? { callbackScheme } : {}) },
     ...(wantPush ? { PushNotifications: { presentationOptions: ["badge", "sound", "alert"] } } : {})
   }
 });
@@ -247,7 +377,7 @@ writeJson(join(projectDir, "capacitor.config.json"), {
 // Descriptor echo, so the generated project is reproducible from itself.
 writeJson(join(projectDir, "mitra-shell.json"), {
   app: appUuid, api: appUuid ? apiBase : undefined,
-  url, name: appName, appId, themeColor, version: versionName, buildNumber, associatedDomains, authHosts, callback,
+  url, name: appName, appId, themeColor, iconBackground: logoBackground !== themeColor ? logoBackground : undefined, iosContentInset: insetOverride, iosKeyboard: iosKeyboard === "resize" ? undefined : iosKeyboard, version: versionName, buildNumber, associatedDomains, backgroundAudio, authHosts, consentHosts, returnPath, callback,
   push: wantPush ? { ios: pushIos, android: pushAndroid } : false,
   icon: iconSource && !String(iconSource).startsWith("data:") ? iconSource : undefined,
   generatedAt: new Date().toISOString()
@@ -258,11 +388,17 @@ run("npx", ["cap", "add", "android"], projectDir);
 if (wantIos) run("npx", ["cap", "add", "ios"], projectDir);
 
 // ---------- 4. Android patches ----------
-patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand });
+patchAndroid(projectDir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, authHosts, consentHosts, returnPath, backgroundAudio });
 
 // ---------- 5. iOS patches ----------
-if (wantIos) patchIos(projectDir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push: pushIos, brand });
+if (wantIos) patchIos(projectDir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push: pushIos, brand });
 if (wantIos) log(`ios      SceneDelegate with sign-in session for ${authHosts.join(", ")}, callback ${callbackScheme ? callbackScheme + "://" : "https://" + host + "/"}`);
+// --ios-tests (CI): the XCTest target of the shell's sign-in, see generator/ios-tests.rb. Never in a
+// store build, which archives the App target alone anyway.
+if (wantIos && flags["ios-tests"]) {
+  run("ruby", [join(here, "ios-tests.rb"), join(projectDir, "ios", "App", "App.xcodeproj"), join(here, "templates", "ios-tests")], projectDir);
+  log("ios      AppTests target (generator/templates/ios-tests), shared App scheme with the test action");
+}
 
 // ---------- 6. Assets, sync, CI ----------
 run("npx", capacitorAssetsArgs(brand), projectDir);
@@ -270,7 +406,7 @@ if (brand.branch !== "fallback") await finishIcons(projectDir, brand, wantIos);
 run("npx", ["cap", "sync"], projectDir);
 mkdirSync(join(projectDir, ".github", "workflows"), { recursive: true });
 cpSync(join(here, "templates", "github", "mobile.yml"), join(projectDir, ".github", "workflows", "mobile.yml"));
-writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }));
+writeFileSync(join(projectDir, "README.md"), readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }));
 if (wantPush) {
   mkdirSync(join(projectDir, "app-snippet"), { recursive: true });
   writeFileSync(join(projectDir, "app-snippet", "push-example.html"), pushExampleSnippet());
@@ -307,21 +443,235 @@ githubOutputs(summary);
 log("done");
 
 // ======================================================================
+// The caller's value when there is one (null counts as none), else what the page asks for.
+function resolveContentInset(override, pageOwnsSafeArea) {
+  if (override == null) return pageOwnsSafeArea ? "never" : "automatic";
+  if (!["never", "automatic"].includes(override)) throw new Error(`--ios-content-inset must be never or automatic, got ${JSON.stringify(override)}`);
+  return override;
+}
+// The flag wins over the descriptor (null counts as none), and resize is the default: it is the
+// mode that needs nothing from the page.
+// iosKeyboardResize is the boolean of a version that was never released: a descriptor that still
+// carries it fails, since ignoring it would turn a shell that asked for no resize into one that resizes.
+function resolveIosKeyboard(flag, descriptorValue, retiredResize) {
+  if (retiredResize !== undefined) throw new Error(`iosKeyboardResize in the descriptor was replaced by iosKeyboard: use "iosKeyboard": "off" for false, and drop the key for true`);
+  const mode = flag ?? descriptorValue ?? "resize";
+  if (!Object.hasOwn(IOS_KEYBOARD_MODES, mode)) throw new Error(`--ios-keyboard must be resize, notify or off, got ${JSON.stringify(mode)}`);
+  return mode;
+}
+// Whether the page reserves the safe area itself: its viewport meta carries viewport-fit=cover.
+// Then the native scroll view must not add the inset too, or the status bar height shows up twice
+// on iOS. The text is third-party and only matched, never evaluated. Comments, scripts and
+// noscript blocks are dropped first (a viewport meta inside a string or a fallback block is not the
+// page's), and the meta is read attribute by attribute, so viewport-fit inside the content of some
+// other meta does not count either. An unterminated block runs to the end of the text, which keeps
+// every pattern linear: tag patterns exclude "<", so a run of unclosed tags is not rescanned from
+// each start. Only the first 256 KB are looked at, which also bounds the work.
+function withoutInertBlocks(html, limit = html.length) {
+  return html.slice(0, limit).replace(
+    /<!--(?:-?>|[\s\S]*?(?:-->|$))|<script\b[^<>]*>[\s\S]*?(?:<\/script\s*>|$)|<noscript\b[^<>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, "");
+}
+function pageHandlesSafeArea(html) {
+  const head = withoutInertBlocks(html, 262144);
+  let content = null;
+  for (const [tag] of head.matchAll(/<meta\b[^<>]*>/gi)) {
+    const attrs = tagAttrs(tag);
+    // Browsers apply the last viewport meta.
+    if ((attrs.name || "").trim().toLowerCase() === "viewport") content = attrs.content ?? "";
+  }
+  if (content === null) return false;
+  return content.split(/[,;]/).some((part) => /^viewport-fit\s*=\s*cover$/i.test(part.trim()));
+}
+
+// Attributes of one tag, lowercase names, first occurrence wins (as in a browser).
+function tagAttrs(tag) {
+  const attrs = {};
+  for (const m of tag.replace(/^<[^\s>]*/, "").matchAll(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+    const key = m[1].toLowerCase();
+    if (!(key in attrs)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? "";
+  }
+  return attrs;
+}
+
+// Only http(s) and data: leave the page or the manifest; materializeIcon would refuse the rest anyway.
+function resolveIconUrl(href, base) {
+  const h = decodeEntities(String(href).trim());
+  if (/^data:/i.test(h)) return `data:${h.slice(5)}`;
+  try {
+    const u = new URL(h, base);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.toString() : undefined;
+  } catch { return undefined; }
+}
+
+// kind is "svg" or "png", the formats materializeIcon takes, "" for anything that says it is
+// something else, or "unknown" when nothing says (no type, no extension): materializeIcon then
+// decides from the content-type. A declared type wins over the extension, and a data: URI carries
+// its own mime.
+function iconCandidate({ href, type, sizes, base, touch }) {
+  if (!href) return null;
+  const url = resolveIconUrl(href, base);
+  if (!url) return null;
+  const declared = String(type || "").toLowerCase();
+  const label = declared || (url.startsWith("data:") ? (url.match(/^data:([^;,]*)/) || [])[1] : extname(new URL(url).pathname).slice(1).toLowerCase());
+  const kind = !label ? "unknown" : declared || url.startsWith("data:") ? mimeToExt(label) : ["svg", "png"].includes(label) ? label : "";
+  const side = Math.max(0, ...[...String(sizes || "").matchAll(/(\d+)x(\d+)/gi)].map((m) => Math.max(Number(m[1]), Number(m[2]))));
+  return { url, kind, size: side || (touch ? 180 : 32), touch };
+}
+
 function scrape(html, baseUrl) {
   const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
   const themeColor = (html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i) || [])[1];
-  // Prefer the apple-touch-icon (square, no transparency expected), then any rel=icon.
-  const links = [...html.matchAll(/<link\s+[^>]*>/gi)].map((m) => m[0]);
-  const pick = (test) => {
-    for (const tag of links) {
-      const rel = (tag.match(/rel=["']([^"']+)["']/i) || [])[1] || "";
-      if (!test(rel.toLowerCase())) continue;
-      const href = (tag.match(/href=["']([^"']+)["']/i) || [])[1];
-      if (href) return href.startsWith("data:") ? href : new URL(href, baseUrl).toString();
+  const iconCandidates = [];
+  let manifestUrl;
+  for (const [tag] of withoutInertBlocks(html).matchAll(/<link\s+[^>]*>/gi)) {
+    const attrs = tagAttrs(tag);
+    const rel = (attrs.rel || "").toLowerCase();
+    const tokens = rel.split(/\s+/);
+    if (tokens.includes("manifest") && attrs.href && !manifestUrl) {
+      const m = resolveIconUrl(attrs.href, baseUrl);
+      if (m && !m.startsWith("data:")) manifestUrl = m;
     }
+    const touch = rel.includes("apple-touch-icon");
+    // A media-bound icon (a dark scheme variant) is not the app's icon.
+    if ((!touch && !tokens.includes("icon")) || attrs.media) continue;
+    const c = iconCandidate({ href: attrs.href, type: attrs.type, sizes: attrs.sizes, base: baseUrl, touch });
+    if (c) iconCandidates.push(c);
+  }
+  return { title: title && decodeEntities(title.trim()), themeColor, iconCandidates, manifestUrl };
+}
+
+// Maskable and monochrome entries are left out: the generator composes its own safe zone.
+function manifestIconCandidates(manifest, manifestUrl) {
+  const icons = manifest?.icons;
+  if (!Array.isArray(icons)) return [];
+  return icons.flatMap((icon) => {
+    if (!icon || typeof icon.src !== "string") return [];
+    const purposes = typeof icon.purpose === "string" ? icon.purpose.toLowerCase().split(/\s+/).filter(Boolean) : [];
+    if (purposes.length && purposes.every((p) => p === "maskable" || p === "monochrome")) return [];
+    const c = iconCandidate({ href: icon.src, type: icon.type, sizes: icon.sizes, base: manifestUrl, touch: false });
+    return c ? [c] : [];
+  });
+}
+
+// Timeout and size cap for third-party downloads. Any failure of the request or of the body read
+// comes out as a FetchReason; anything else is a bug and propagates.
+async function fetchCapped(url, maxBytes) {
+  let res;
+  const chunks = [];
+  let total = 0;
+  try {
+    res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new FetchReason(`HTTP ${res.status}`);
+    if (Number(res.headers.get("content-length")) > maxBytes) throw new FetchReason(`over ${maxBytes / 1048576} MB`);
+    if (!res.body) throw new FetchReason("no body");
+    for await (const chunk of res.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new FetchReason(`over ${maxBytes / 1048576} MB`);
+      chunks.push(chunk);
+    }
+  } catch (e) {
+    throw e instanceof FetchReason ? e : new FetchReason(`network error (${e.name})`);
+  }
+  return { res, bytes: Buffer.concat(chunks) };
+}
+
+async function pageIcon(scraped) {
+  const manifest = await fetchManifest(scraped.manifestUrl);
+  return { icons: rankIcons([...scraped.iconCandidates, ...manifest.icons]), backgroundColor: manifest.backgroundColor };
+}
+
+// Only a hex color counts: the value ends up in the icon and splash, and a named color would need
+// resolving. The explicit theme of the caller wins, as it does for the theme color itself.
+function manifestBackgroundColor(manifest) {
+  const c = typeof manifest?.background_color === "string" ? manifest.background_color.trim() : "";
+  return HEX_COLOR.test(c) ? c : undefined;
+}
+// --theme, then the iconBackground a previous run recorded, then a themeColor given by the
+// descriptor, then what the manifest asked for, then the resolved theme.
+function resolveLogoBackground(flagTheme, descriptorBackdrop, descriptorTheme, manifestBackground, theme) {
+  if (flagTheme) return theme;
+  if (descriptorBackdrop) return descriptorBackdrop;
+  return descriptorTheme ? theme : manifestBackground || theme;
+}
+
+// The manifest is third-party input and only a better source for the icon, so any failure
+// leaves the page icons to decide.
+async function fetchManifest(manifestUrl) {
+  const none = { icons: [], backgroundColor: undefined };
+  if (!manifestUrl) return none;
+  const note = (why) => log(`manifest ignored (${describe(manifestUrl).slice(0, 120)}): ${why}`);
+  let fetched;
+  try {
+    fetched = await fetchCapped(manifestUrl, MANIFEST_MAX_BYTES);
+  } catch (e) {
+    if (!(e instanceof FetchReason)) throw e;
+    note(e.message);
+    return none;
+  }
+  let json;
+  try { json = JSON.parse(fetched.bytes.toString("utf8")); } catch { note("not JSON"); return none; }
+  if (!Array.isArray(json?.icons)) note("no icons array");
+  return { icons: manifestIconCandidates(json, fetched.res.url || manifestUrl), backgroundColor: manifestBackgroundColor(json) };
+}
+
+// The icon is scaled to 1024 px for the store, so resolution decides how it looks: a vector never
+// goes soft, and among rasters the largest has the least to upscale. The apple-touch-icon wins a
+// tie because it is meant to be an opaque square. The caller tries the list in order, since a
+// candidate can still fail to download or turn out to be something else; a page whose only icons
+// are neither SVG nor PNG (a favicon.ico) has an empty list and gets the drawn initials.
+function rankIcons(candidates) {
+  const byQuality = (a, b) => {
+    if (a.kind === "svg" || b.kind === "svg") return (b.kind === "svg") - (a.kind === "svg");
+    return b.size - a.size
+      || (a.kind === "unknown") - (b.kind === "unknown")
+      || b.touch - a.touch;
   };
-  const icon = pick((r) => r.includes("apple-touch-icon")) || pick((r) => r.split(/\s+/).includes("icon"));
-  return { title: title && decodeEntities(title.trim()), themeColor, icon };
+  return [...new Set(candidates.filter((c) => c.kind).sort(byQuality).map((c) => c.url))];
+}
+
+// What the bytes are, not what the server or the page said.
+// An SVG must have <svg> as its root: an HTML page that merely embeds one (a single-page app
+// answering 200 with its index for a missing icon) is not an icon.
+function sniffIcon(bytes) {
+  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "png";
+  const text = bytes.subarray(0, 65536).toString("utf8").replace(/^\uFEFF/, "");
+  const root = text.replace(/^(?:\s+|<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE\s+svg\b[^>\[]*(?:\[[\s\S]*?\])?\s*>)*/i, "");
+  return /^<svg[\s>/]/i.test(root) ? "svg" : "";
+}
+
+// data: and http(s) sources. The extension comes from the mime or the URL, which is enough for a
+// caller-given source and is checked against the bytes for the icons of the page.
+async function loadIcon(source) {
+  if (source.startsWith("data:")) {
+    const m = source.match(/^data:([^;,]+)(;base64)?,(.*)$/s);
+    if (!m) throw new FetchReason("unreadable data: URI");
+    let bytes;
+    try { bytes = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]), "utf8"); } catch { throw new FetchReason("unreadable data: URI"); }
+    return { bytes, ext: mimeToExt(m[1]) };
+  }
+  const { res, bytes } = await fetchCapped(source, ICON_MAX_BYTES);
+  return { bytes, ext: mimeToExt(res.headers.get("content-type") || "") || extname(new URL(source).pathname).slice(1) || "png" };
+}
+
+// Tries the ranked icons of the page in order and keeps the first that downloads and really is an
+// SVG or a PNG, so one dead link (a stock manifest pointing at a missing logo512.png) does not cost
+// the generation. null when none works.
+async function materializePageIcon(urls, assetsDir) {
+  if (urls.length > MAX_ICON_ATTEMPTS) log(`icon     ${urls.length - MAX_ICON_ATTEMPTS} more candidates will not be tried`);
+  for (const url of urls.slice(0, MAX_ICON_ATTEMPTS)) {
+    try {
+      const { bytes } = await loadIcon(url);
+      const ext = sniffIcon(bytes);
+      if (!ext) throw new FetchReason("not an SVG or a PNG");
+      const target = join(assetsDir, `logo.${ext}`);
+      writeFileSync(target, bytes);
+      return { path: target, url };
+    } catch (e) {
+      if (!(e instanceof FetchReason)) throw e;
+      log(`icon     skipped ${describe(url).slice(0, 120)}: ${e.message}`);
+    }
+  }
+  return null;
 }
 
 async function materializeIcon(source, assetsDir, fallbackSvg) {
@@ -331,16 +681,13 @@ async function materializeIcon(source, assetsDir, fallbackSvg) {
   }
   let bytes;
   let ext;
-  if (String(source).startsWith("data:")) {
-    const m = String(source).match(/^data:([^;,]+)(;base64)?,(.*)$/s);
-    if (!m) fail("Unreadable data: URI in the icon");
-    ext = mimeToExt(m[1]);
-    bytes = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]), "utf8");
-  } else if (/^https?:/.test(source)) {
-    const res = await fetch(source);
-    if (!res.ok) fail(`Icon download failed: ${res.status} ${source}`);
-    ext = mimeToExt(res.headers.get("content-type") || "") || extname(new URL(source).pathname).slice(1) || "png";
-    bytes = Buffer.from(await res.arrayBuffer());
+  if (/^(data:|https?:)/.test(source)) {
+    try {
+      ({ bytes, ext } = await loadIcon(source));
+    } catch (e) {
+      if (e instanceof FetchReason) fail(`Icon download failed: ${e.message}${source.startsWith("data:") ? "" : ` ${describe(source)}`}`);
+      throw e;
+    }
   } else {
     // A path is only read when the caller gave it; the platform and the page are third parties.
     if (source !== (flags.icon || descriptor.icon)) fail(`Icon must be an http(s) or data: URL, got ${JSON.stringify(source)}`);
@@ -368,6 +715,13 @@ async function composeBrand(dir, logoPath, theme) {
     data = await rasterizeLogo(sharp, logoPath, side);
   } catch (e) {
     throw new Error(`the icon could not be read as an image: ${e.message}`);
+  }
+  // Only a warning: a failure here must not send a readable image to the fallback.
+  if (extname(logoPath) !== ".svg") {
+    try {
+      const { width, height } = await sharp(readFileSync(logoPath)).metadata();
+      if (Math.min(width, height) < SOFT_ICON_PX) log(`WARNING  the icon is ${width}x${height} px and will look soft on the store icon and the splash; give an SVG or a PNG of 1024 px (--icon)`);
+    } catch { /* size unknown, no warning */ }
   }
   let px = pixels(data);
   let kind = analyzeLogo(side, px);
@@ -569,6 +923,96 @@ function withLaunchStatusBar(plist, dark) {
 \t<key>LSRequiresIPhoneOS</key>`);
 }
 
+// CFBundleName is $(PRODUCT_NAME) from cap add, which is "App" for every shell. iOS shows it in
+// system prompts, as the sign-in sheet's "\"App\" Wants to Use ... to Sign In", so it gets the app
+// name, the same one CFBundleDisplayName carries on the home screen. Escaped like the usage strings.
+function withBundleName(plist, appName) {
+  const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
+  const named = plist.replace(/(<key>CFBundleName<\/key>\s*<string>)\$\(PRODUCT_NAME\)(<\/string>)/, (_, open, close) => `${open}${name}${close}`);
+  if (named === plist && !plist.includes(`<key>CFBundleName</key>\n\t<string>${name}</string>`)) fail("Info.plist layout changed, CFBundleName was not set");
+  return named;
+}
+
+// Every app can record voice and take photos through the page (getUserMedia, a file input), and
+// iOS terminates an app that touches the microphone or camera without these strings. Speech
+// recognition in a WKWebView (webkitSpeechRecognition) also needs its own string: without it iOS
+// never asks and the page gets "service-not-allowed" (WebKit bug 239816). The app name
+// comes from a third party and lands in XML, hence the escaping. Keys already present are kept.
+function withUsageDescriptions(plist, appName) {
+  // Control characters other than tab and line feed, and U+FFFE and U+FFFF, are not valid in XML 1.0, even escaped.
+  const name = escapeHtml(appName.replace(/[\u0000-\u0008\u000b-\u001f\ufffe\uffff]/g, ""));
+  const wanted = [
+    ["NSMicrophoneUsageDescription", `${name} usa o microfone para gravar \u00e1udio que voc\u00ea envia.`],
+    ["NSCameraUsageDescription", `${name} usa a c\u00e2mera para tirar fotos que voc\u00ea envia.`],
+    ["NSSpeechRecognitionUsageDescription", `${name} usa o reconhecimento de fala para transformar sua grava\u00e7\u00e3o em texto.`]
+  ];
+  for (const [key, text] of wanted) {
+    if (plist.includes(`<key>${key}</key>`)) continue;
+    // A callback, not a replacement string: "$&" or "$'" in the app name must stay literal.
+    const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>${key}</key>\n\t<string>${text}</string>\n\t<key>LSRequiresIPhoneOS</key>`);
+    if (anchored === plist) fail(`Info.plist layout changed, ${key} was not added`);
+    plist = anchored;
+  }
+  return plist;
+}
+
+// WebKit mutes microphone capture in a WKWebView app once the screen locks or the app goes to the
+// background, unless Info.plist declares the audio background mode (WebKit bugs 226620 and 233419).
+// It is opt-in because App Review rejects apps that declare the mode without playing or recording in
+// the background (guideline 2.5.4). An existing UIBackgroundModes array is extended, never replaced.
+function withBackgroundAudio(plist, enabled) {
+  if (!enabled) return plist;
+  const existing = /(<key>UIBackgroundModes<\/key>\s*<array>)([\s\S]*?)(<\/array>)/;
+  if (existing.test(plist)) {
+    return plist.replace(existing, (whole, open, items, close) =>
+      /<string>audio<\/string>/.test(items) ? whole : `${open}${items.replace(/\s*$/, "")}\n\t\t<string>audio</string>\n\t${close}`);
+  }
+  if (plist.includes("<key>UIBackgroundModes</key>")) fail("Info.plist has a UIBackgroundModes that is not an array with items, audio was not added");
+  const anchored = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  if (anchored === plist) fail("Info.plist layout changed, UIBackgroundModes was not added");
+  return anchored;
+}
+
+// Capacitor's BridgeWebChromeClient asks for these two at runtime when the page calls
+// getUserMedia({ audio: true }), but only a declared permission can be requested. CAMERA is left
+// out on purpose: declaring it makes the camera capture of a file input require the runtime grant,
+// while without it the system camera app handles the capture. RECORD_AUDIO alone implies a required
+// microphone feature, which would make Play hide the app from devices without one.
+function withAudioPermissions(manifest) {
+  for (const [name, element] of [
+    ["android.permission.RECORD_AUDIO", `<uses-permission android:name="android.permission.RECORD_AUDIO" />`],
+    ["android.permission.MODIFY_AUDIO_SETTINGS", `<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />`],
+    ["android.hardware.microphone", `<uses-feature android:name="android.hardware.microphone" android:required="false" />`]
+  ]) {
+    if (manifest.includes(`android:name="${name}"`)) continue;
+    const anchored = manifest.replace(/([ \t]*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+      `$&\n$1${element}`);
+    if (anchored === manifest) fail(`AndroidManifest layout changed, ${name} was not added`);
+    manifest = anchored;
+  }
+  return manifest;
+}
+
+// Background audio on Android: a foreground service of type microphone, which Android 14 only
+// accepts with the two foreground service permissions declared, a wake lock so the device does
+// not sleep under the conversation, and POST_NOTIFICATIONS, without which Android 13+ lists the
+// service's notification only in the Task Manager, not in the shade. The service is declared only here, so an app without the option
+// has neither the permissions nor the class (see ShellVoiceService).
+function withVoiceService(manifest) {
+  for (const name of ["android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_MICROPHONE", "android.permission.WAKE_LOCK", "android.permission.POST_NOTIFICATIONS"]) {
+    if (manifest.includes(`android:name="${name}"`)) continue;
+    const anchored = manifest.replace(/([ \t]*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+      `$&\n$1<uses-permission android:name="${name}" />`);
+    if (anchored === manifest) fail(`AndroidManifest layout changed, ${name} was not added`);
+    manifest = anchored;
+  }
+  if (manifest.includes('android:name=".ShellVoiceService"')) return manifest;
+  const anchored = manifest.replace(/([ \t]*)<\/application>/,
+    (closing, indent) => `${indent}    <service android:name=".ShellVoiceService" android:foregroundServiceType="microphone" android:exported="false" />\n${closing}`);
+  if (anchored === manifest) fail("AndroidManifest layout changed, the voice service was not declared");
+  return anchored;
+}
+
 // The mark SceneDelegate animates in over the launch image (see templates/ios/SceneDelegate.swift).
 function patchIosSplash(appDir, brand) {
   if (!brand.iosMark) return;
@@ -581,35 +1025,29 @@ function patchIosSplash(appDir, brand) {
   });
 }
 
-function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand }) {
+function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackScheme, googleServices, brand, authHosts, consentHosts, returnPath, backgroundAudio }) {
   const app = join(dir, "android", "app");
   patchAndroidSplash(join(app, "src", "main", "res"), brand);
+  if (backgroundAudio) writeVoiceNotificationIcon(join(app, "src", "main", "res"));
 
-  // Manifest: App Link for the published host, so the sign-in that ends on this host comes
-  // back to the shell instead of staying in Chrome.
+  // Manifest: App Link on the published host, so what ends there in the system browser comes back
+  // to the shell instead of staying in Chrome. With the https sign-in return (no URL scheme) that
+  // is the whole host, because the sign-in ends on any path of it. Otherwise only the return path
+  // of the account connections is claimed, so a link to any other page of the site still opens in
+  // the browser.
   const manifestPath = join(app, "src", "main", "AndroidManifest.xml");
   let manifest = readFileSync(manifestPath, "utf8");
-  const filter = `
-            <!-- App Link for the published app host (needs /.well-known/assetlinks.json there) -->
-            <intent-filter android:autoVerify="true">
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="${host}" />
-            </intent-filter>${callbackScheme ? `
-            <!-- Sign-in return by URL scheme: the app page bounces the SDK fragment here (see app-snippet/) -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="${callbackScheme}" />
-            </intent-filter>` : ""}
+  const filter = `${intentFilters({ host, callbackScheme, returnPath })}
         </activity>`;
-  manifest = manifest.replace(/\s*<\/activity>/, filter);
+  manifest = manifest.replace(/\s*<\/activity>/, () => filter);
+  manifest = withAudioPermissions(manifest);
+  manifest = withBrowserQueries(manifest);
+  if (backgroundAudio) manifest = withVoiceService(manifest);
   if (googleServices) {
     // Android 13+ shows a notification only with this permission, which the page asks for with
     // PushNotifications.requestPermissions().
-    manifest = manifest.replace(/(\s*)<uses-permission android:name="android.permission.INTERNET" \/>/,
+    // --background-audio declares it too, and one line is enough.
+    if (!manifest.includes('android:name="android.permission.POST_NOTIFICATIONS"')) manifest = manifest.replace(/(\s*)<uses-permission android:name="android.permission.INTERNET" \/>/,
       `$&$1<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />`);
     if (!manifest.includes("POST_NOTIFICATIONS")) fail("AndroidManifest layout changed, the notification permission was not added");
     // The Capacitor template applies the google-services Gradle plugin when this file exists.
@@ -621,7 +1059,16 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   const javaDir = join(app, "src", "main", "java", ...appId.split("."));
   const mainActivity = join(javaDir, "MainActivity.java");
   if (!existsSync(mainActivity)) fail(`cap add did not create ${mainActivity}`);
-  writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme));
+  writeFileSync(mainActivity, mainActivityJava(appId, callbackScheme, backgroundAudio));
+  for (const name of ["MediaPermissionGate.java", "PopupPolicy.java", "ShellPopups.java", "ShellSignIn.java", "ShellWebChromeClient.java", "ShellSystemBars.java", ...(backgroundAudio ? VOICE_CLASSES : [])]) {
+    writeFileSync(join(javaDir, name), androidTemplate(name, { appId, host, authHosts, consentHosts, returnPath }));
+  }
+  // The unit test runs the client above on the real Capacitor classes (Robolectric).
+  const testDir = join(app, "src", "test", "java", ...appId.split("."));
+  mkdirSync(testDir, { recursive: true });
+  for (const name of ["ShellWebChromeClientTest.java", "ShellSystemBarsTest.java", "ShellPopupsTest.java", "ShellSignInTest.java", ...(backgroundAudio ? VOICE_TESTS : [])]) {
+    writeFileSync(join(testDir, name), androidTemplate(name, { appId, host, authHosts, consentHosts, returnPath }));
+  }
 
   // build.gradle: version and release signing from the environment.
   const gradlePath = join(app, "build.gradle");
@@ -650,6 +1097,11 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
 `);
     if (!gradle.includes("signingConfigs {")) fail("build.gradle layout changed, signing patch did not apply");
   }
+  gradle = withBrowserDependency(withUnitTestSupport(gradle));
+  if (backgroundAudio) {
+    const variables = join(dirname(app), "variables.gradle");
+    gradle = withWebkitDependency(gradle, existsSync(variables) && readFileSync(variables, "utf8").includes("androidxWebkitVersion"));
+  }
   writeFileSync(gradlePath, gradle);
 
   // local.properties: point Gradle at the SDK on this machine (CI sets ANDROID_HOME itself).
@@ -660,7 +1112,7 @@ function patchAndroid(dir, { appId, host, versionName, buildNumber, callbackSche
   if (sdk) writeFileSync(join(dir, "android", "local.properties"), `sdk.dir=${sdk}\n`);
 }
 
-function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomains, callbackScheme, push, brand }) {
+function patchIos(dir, { appName, appId, host, versionName, buildNumber, associatedDomains, backgroundAudio, callbackScheme, push, brand }) {
   const appDir = join(dir, "ios", "App", "App");
   patchIosSplash(appDir, brand);
   const plistPath = join(appDir, "Info.plist");
@@ -668,7 +1120,7 @@ function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomain
   if (callbackScheme && !plist.includes("CFBundleURLTypes")) {
     // The sign-in return by scheme. ASWebAuthenticationSession catches it by itself; registering it
     // also brings a tap on the fallback link of the app page back to the shell.
-    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", `\t<key>CFBundleURLTypes</key>
+    plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", () => `\t<key>CFBundleURLTypes</key>
 \t<array>
 \t\t<dict>
 \t\t\t<key>CFBundleURLName</key>
@@ -682,6 +1134,9 @@ function patchIos(dir, { appId, host, versionName, buildNumber, associatedDomain
 \t<key>LSRequiresIPhoneOS</key>`);
   }
   plist = withLaunchStatusBar(plist, brand.isDarkBg);
+  plist = withBundleName(plist, appName);
+  plist = withUsageDescriptions(plist, appName);
+  plist = withBackgroundAudio(plist, backgroundAudio);
   if (!plist.includes("ITSAppUsesNonExemptEncryption")) {
     plist = plist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t<false/>\n\t<key>LSRequiresIPhoneOS</key>");
   }
@@ -718,7 +1173,7 @@ ${entitlements.join("\n")}
 </plist>
 `);
     pbx = pbx.replace(new RegExp(`(\\t+)PRODUCT_BUNDLE_IDENTIFIER = ${appId.replace(/\./g, "\\.")};`, "g"),
-      `$1CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n$1PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
+      (_, indent) => `${indent}CODE_SIGN_ENTITLEMENTS = App/App.entitlements;\n${indent}PRODUCT_BUNDLE_IDENTIFIER = ${appId};`);
   }
   if (push) {
     // The push plugin learns the device token (or the failure) from these two AppDelegate calls.
@@ -744,11 +1199,14 @@ ${entitlements.join("\n")}
   writeFileSync(pbxPath, pbx);
 }
 
-function mainActivityJava(appId, callbackScheme) {
+function mainActivityJava(appId, callbackScheme, backgroundAudio = false) {
   return `package ${appId};
 
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.net.Uri;
+import android.os.Bundle;
+import android.os.SystemClock;
 import android.webkit.WebView;
 
 import com.getcapacitor.BridgeActivity;
@@ -757,7 +1215,74 @@ public class MainActivity extends BridgeActivity {
 
     private static final String SHELL_LINK_PARAM = "shellLink";
     // Sign-in return by URL scheme (null when the shell relies on the App Link alone).
-    private static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+    static final String CALLBACK_SCHEME = ${callbackScheme ? JSON.stringify(callbackScheme) : "null"};
+    // A browser may hand the same scheme return over twice, as the result of the Auth Tab and as a
+    // link to the intent filter. The code in it is single use, so the second load would fail the
+    // sign-in the first one finished. The memory is of this instance: both deliveries come while
+    // the activity that launched the tab is in front. One recreated in between (a configuration
+    // change is not one, the manifest keeps the activity) loads the return again, and the page
+    // then reports the used code as a failed sign-in, which the person retries.
+    private static final long SAME_RETURN_WINDOW_MS = 3_000;
+    private String lastReturn;
+    private long lastReturnAt;
+
+    // The popup contract for the pages that connect an account (see ShellPopups).
+    private ShellPopups popups;
+
+    // The sign-in of the app in an Auth Tab (see ShellSignIn).
+    private ShellSignIn signIn;${backgroundAudio ? `
+
+    // Runs the foreground service while the page captures audio (see ShellVoiceCapture).
+    private ShellVoiceCapture voice;` : ""}
+
+    // Replaces the bridge's own chrome client, once, to make media permission requests safe and to
+    // give window.open a real child window (see ShellWebChromeClient and ShellPopups), and the
+    // bridge's web view client, once, to open the sign-in in an Auth Tab (see ShellSignIn). Done here,
+    // before the activity starts, because they register activity result launchers when they are
+    // created. The same block registers the system bars listener (see ShellSystemBars), once,
+    // because it adds a listener to the bridge.
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getBridge() != null && getBridge().getWebView() != null) {
+            popups = new ShellPopups(getBridge());
+            getBridge().getWebView().setWebChromeClient(new ShellWebChromeClient(getBridge(), popups));
+            signIn = ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn);
+            ShellSystemBars.install(getBridge());${backgroundAudio ? `
+            voice = ShellVoiceCapture.install(getBridge());` : ""}
+        }
+    }
+
+    // Lets the unit test replace the system browser, which it cannot run.
+    ShellPopups popups() {
+        return popups;
+    }
+
+    // Lets the unit test stand in for the Auth Tab and play its result.
+    ShellSignIn signIn() {
+        return signIn;
+    }${backgroundAudio ? `
+
+    // Lets the unit test play the messages of the page.
+    ShellVoiceCapture voice() {
+        return voice;
+    }
+
+    // Capacitor's routing stays first. The answer to the notification permission the voice capture
+    // asked for is the only thing taken from here (see ShellVoiceCapture.onPermissionResult).
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (voice != null) voice.onPermissionResult(requestCode, permissions, grantResults);
+    }` : ""}
+
+    // The bridge re-applies the stored bar styles on a configuration change, which can undo the
+    // style the page asked for: see ShellSystemBars.recheck.
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        ShellSystemBars.recheck(getBridge());
+    }
 
     // Capacitor only tells the web app about an incoming link (appUrlOpen); the app published
     // by the platform does not know the shell exists. So when the link is on the app's own host,
@@ -768,27 +1293,183 @@ public class MainActivity extends BridgeActivity {
         if (intent == null || getBridge() == null) return;
         Uri data = intent.getData();
         if (data == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        // The return of an account connection the shell sent to the system browser belongs to the
+        // child window of the page, not to the page itself, which must not reload.
+        if (popups != null && popups.onReturnLink(data)) return;
+        loadReturn(data);
+    }
+
+    // Loads in the page what came back to the shell, as a link (onNewIntent) or as the result of the
+    // Auth Tab (ShellSignIn). False when it is not a return of the app, and then nothing loads.
+    boolean loadReturn(Uri data) {
+        String returned = data.toString();
+        long now = SystemClock.elapsedRealtime();
+        if (returned.equals(lastReturn) && now - lastReturnAt < SAME_RETURN_WINDOW_MS) return true;
 
         String serverUrl = getBridge().getServerUrl();
         Uri app = Uri.parse(serverUrl != null ? serverUrl : getBridge().getAppUrl());
         if (CALLBACK_SCHEME != null && CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())) {
             // The app page bounced the SDK fragment to the shell by its scheme: carry the fragment
-            // to the app host, where the SDK finishes the sign-in at boot.
-            data = app.buildUpon().path("/").encodedQuery(data.getEncodedQuery())
+            // to the page the shell loads (server.url, path included: an app served under a path,
+            // like /noodle, signs in there), where the SDK finishes the sign-in at boot.
+            String appPath = app.getEncodedPath();
+            data = app.buildUpon().encodedPath(appPath == null || appPath.isEmpty() ? "/" : appPath)
+                .encodedQuery(data.getEncodedQuery())
                 .encodedFragment(data.getEncodedFragment()).build();
         }
-        if (data.getHost() == null || !data.getHost().equalsIgnoreCase(app.getHost())) return;
+        if (data.getHost() == null || !data.getHost().equalsIgnoreCase(app.getHost())) return false;
 
         // A fragment-only change would not reload the document, and the sign-in completes
         // only when the app boots. A fresh query value forces a full load.
         Uri target = data.buildUpon()
             .appendQueryParameter(SHELL_LINK_PARAM, String.valueOf(System.currentTimeMillis()))
             .build();
+        lastReturn = returned;
+        lastReturnAt = now;
         WebView webView = getBridge().getWebView();
         webView.post(() -> webView.loadUrl(target.toString()));
+        return true;
     }
 }
 `;
+}
+
+// The intent filters after the launcher one. Only a return path of the app host is claimed when the
+// sign-in returns by URL scheme; the https sign-in return needs the whole host.
+function intentFilters({ host, callbackScheme, returnPath }) {
+  const appLink = callbackScheme
+    ? `
+            <!-- App Link for the return of an account connection (needs /.well-known/assetlinks.json on the host) -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${host}" android:pathPrefix="${returnPath}" />
+            </intent-filter>`
+    : `
+            <!-- App Link for the published app host (needs /.well-known/assetlinks.json there) -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${host}" />
+            </intent-filter>`;
+  return `${appLink}${callbackScheme ? `
+            <!-- Sign-in return by URL scheme: the app page bounces the SDK fragment here (see app-snippet/) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="${callbackScheme}" />
+            </intent-filter>` : ""}`;
+}
+
+// Auth Tab and Custom Tab are found through the package manager, which on Android 11+ only shows
+// what the manifest declares: a browser that handles https and the Custom Tabs service. The browser
+// plugin of Capacitor already merges the second; declared here too so the app does not depend on it.
+function withBrowserQueries(manifest) {
+  if (manifest.includes("android.support.customtabs.action.CustomTabsService") && manifest.includes("<queries>")) return manifest;
+  const queries = `
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+`;
+  const anchored = manifest.replace(/\s*<\/manifest>\s*$/, (tail) => `\n${queries}</manifest>${tail.endsWith("\n") ? "\n" : ""}`);
+  if (anchored === manifest) fail("AndroidManifest layout changed, the browser queries were not added");
+  return anchored;
+}
+
+// The app compiles ShellPopups against androidx.browser, which Capacitor's browser plugin only
+// brings as an implementation detail of its own module. Patching twice changes nothing.
+function withBrowserDependency(gradle) {
+  if (gradle.includes("androidx.browser:browser")) return gradle;
+  const anchored = gradle.replace(/(\n\s*)implementation project\(':capacitor-android'\)/,
+    (line, gap) => `${line}${gap}implementation "androidx.browser:browser:${ANDROIDX_BROWSER_VERSION}"`);
+  if (anchored === gradle) fail("build.gradle layout changed, the browser dependency was not added");
+  return anchored;
+}
+
+// ShellVoiceCapture compiles against androidx.webkit, which Capacitor only brings as an
+// implementation detail of its own module. Patching twice changes nothing.
+// The version comes from the variable Capacitor's variables.gradle defines when it does, so the app
+// and Capacitor never resolve two webkit versions; the pinned constant is the fallback.
+function withWebkitDependency(gradle, useCapacitorVariable = false) {
+  if (gradle.includes("androidx.webkit:webkit")) return gradle;
+  const version = useCapacitorVariable ? "$androidxWebkitVersion" : ANDROIDX_WEBKIT_VERSION;
+  const anchored = gradle.replace(/(\n\s*)implementation project\(':capacitor-android'\)/,
+    (line, gap) => `${line}${gap}implementation "androidx.webkit:webkit:${version}"`);
+  if (anchored === gradle) fail("build.gradle layout changed, the webkit dependency was not added");
+  return anchored;
+}
+
+// Status bar icons are drawn from the alpha channel only, so the notification of the voice service
+// needs its own monochrome mark; a system drawable would change with the Android version.
+function writeVoiceNotificationIcon(res) {
+  mkdirSync(join(res, "drawable"), { recursive: true });
+  writeFileSync(join(res, "drawable", "ic_stat_voice.xml"), `<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,14c1.66,0 3,-1.34 3,-3L15,5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17.3,11c0,3 -2.54,5.1 -5.3,5.1S6.7,14 6.7,11L5,11c0,3.41 2.72,6.23 6,6.72L11,21h2v-3.28c3.28,-0.48 6,-3.3 6,-6.72h-1.7z" />
+</vector>
+`);
+}
+
+// Robolectric runs the generated unit test on a JVM. The resources are needed so that the merged
+// manifest (declared permissions) and the Capacitor assets are visible to it. Patching twice
+// changes nothing.
+function withUnitTestSupport(gradle) {
+  if (!gradle.includes("org.robolectric:robolectric")) {
+    const anchored = gradle.replace(/(\n\s*)testImplementation "junit:junit:\$junitVersion"/,
+      (line, gap) => `${line}${gap}testImplementation "org.robolectric:robolectric:${ROBOLECTRIC_VERSION}"${gap}testImplementation "androidx.test:core:${ANDROIDX_TEST_CORE_VERSION}"`);
+    if (anchored === gradle) fail("build.gradle layout changed, the unit test dependencies were not added");
+    gradle = anchored;
+  }
+  if (!gradle.includes("includeAndroidResources")) {
+    const anchored = gradle.replace(/\n    buildTypes \{/, (head) => `
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }${head}`);
+    if (anchored === gradle) fail("build.gradle layout changed, testOptions was not added");
+    gradle = anchored;
+  }
+  return gradle;
+}
+
+// The Java the shell adds for media permissions lives in templates/android (MediaPermissionGate is
+// pure Java and has a JVM test in generator/test). The package and the app host are substituted
+// through a callback, so no character of them is read as a replacement pattern.
+// A sign-in host may be given with a port (the API on :8443), and Uri.getHost() on the device
+// returns the name alone: the list the app compares against carries names only.
+function hostnameOf(host) {
+  try { return new URL(`https://${host}`).hostname.toLowerCase(); } catch { return String(host).toLowerCase(); }
+}
+
+function androidTemplate(name, { appId, host, authHosts = [], consentHosts = DEFAULT_CONSENT_HOSTS, returnPath = DEFAULT_RETURN_PATH }) {
+  const text = readFileSync(join(here, "templates", "android", name), "utf8")
+    .replace(/__PACKAGE__/g, () => appId)
+    .replace(/__APP_HOST__/g, () => host.replace(/:\d+$/, ""))
+    .replace(/__APP_PORT__/g, () => (host.match(/:(\d+)$/) || [, "-1"])[1])
+    // Both are validated plain names (isConsentHost, isReturnPath), so JSON.stringify gives valid Java string literals.
+    .replace(/__CONSENT_HOSTS__/g, () => consentHosts.map((h) => JSON.stringify(h)).join(", "))
+    // Host names from URLs, the descriptor and a flag, lowercased: a JSON string is a valid Java one.
+    .replace(/__AUTH_HOSTS__/g, () => [...new Set(authHosts.map(hostnameOf))].map((h) => JSON.stringify(h)).join(", "))
+    .replace(/__RETURN_PATH__/g, () => returnPath);
+  if (/__[A-Z_]+__/.test(text)) fail(`${name} has a placeholder that was not substituted`);
+  return text;
 }
 
 // The return snippet of the published app. A sign-in the shell started ends in the system browser
@@ -893,7 +1574,7 @@ function offlinePage(name, color) {
 `;
 }
 
-function readme({ appName, appId, url, slug, associatedDomains, callbackScheme, pushIos, pushAndroid }) {
+function readme({ appName, appId, url, slug, associatedDomains, backgroundAudio, callbackScheme, pushIos, pushAndroid }) {
   return `# ${appName} (mobile shell)
 
 Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: change
@@ -909,6 +1590,7 @@ Generated by \`mitra-mobile-shell/generator\` from ${url}. Do not edit by hand: 
   \`app-snippet/shell-return.html\` in the head of its index.html, and for Android App Links its
   \`public/.well-known/assetlinks.json\` (from \`generator/wellknown.mjs\`).` : `by https callback on the app host (Universal Link),
   which needs the host to serve the apple-app-site-association file.`}
+- Background audio: ${backgroundAudio ? "ON (iOS: UIBackgroundModes audio; Android: a foreground service of type microphone, with a notification, while the page captures audio; so a live voice conversation keeps the microphone with the screen locked)" : "off (pass --background-audio only for apps that keep audio going in the background)"}.
 - Push: iOS ${pushIos ? "on (aps-environment entitlement, AppDelegate hooks)" : "off"}, Android ${pushAndroid ? "on (Firebase config in android/app/google-services.json, not to be committed)" : "off"}.${pushIos || pushAndroid ? " The page uses Capacitor's PushNotifications plugin through the bridge, see \`app-snippet/push-example.html\`." : ""}
 - CI: \`.github/workflows/mobile.yml\` (secrets: Android keystore, App Store Connect API key).
 
@@ -965,7 +1647,17 @@ function packageSegment(seg) {
   return seg;
 }
 function isVersionName(v) { return /^\d+(\.\d+){0,2}$/.test(v); }
+function isConsentHost(h) { return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(h); }
+// A path prefix of plain segments, so it is safe in the manifest and in a Java string, and the
+// App Link prefix cannot match a sibling ("/oauth/" does not cover "/oauthx").
+function isReturnPath(p) { return /^\/([A-Za-z0-9._~-]+\/)+$/.test(p) && !p.split("/").some((seg) => seg === "." || seg === ".."); }
 function isPlainHost(h) { return /^[a-z0-9.-]+(:\d+)?$/.test(h); }
+function isAppUrl(u) {
+  let p;
+  try { p = new URL(u); } catch { return false; }
+  if (!/^https?:$/.test(p.protocol) || p.search || p.hash || p.username || p.password || /[?#]/.test(u)) return false;
+  return p.pathname === "/" || (/^(\/[A-Za-z0-9._~-]+)+\/?$/.test(p.pathname) && !p.pathname.split("/").some((seg) => seg === "." || seg === ".."));
+}
 function validateAppId(id) {
   const parts = id.split(".");
   if (parts.length < 2 || parts.some((p) => !/^[a-zA-Z][a-zA-Z0-9_]*$/.test(p))) fail(`Invalid app id for Android/iOS: ${id}`);
@@ -1072,7 +1764,7 @@ function planMark(side, isMark, frame) {
 // Names SceneDelegate.swift calls on its own types, besides those called on the view controller by
 // receiver. Definitions are var, func or init, never a local let.
 function missingSwiftMembers(swift) {
-  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle", "setStatusBarStyle"]);
+  const inherited = new Set(["webView", "bridge", "view", "statusBarStyle"]);
   const called = [...swift.matchAll(/\b(?:shell\??|ShellBridgeViewController\)\?)\.(\w+)/g)].map((m) => m[1]);
   const names = [...new Set([...called, ...SWIFT_MEMBERS])].filter((n) => !inherited.has(n));
   const missing = names.filter((n) => !new RegExp(`\\b(?:var|func) ${n}\\b`).test(swift));
@@ -1165,7 +1857,7 @@ function mimeToExt(mime) {
   if (/png/.test(mime)) return "png";
   return "";
 }
-function describe(src) { return String(src).startsWith("data:") ? "inline data: URI from the page" : String(src); }
+function describe(src) { return String(src).startsWith("data:") ? "inline data: URI" : String(src); }
 function decodeEntities(s) { return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'"); }
 function escapeHtml(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function writeJson(p, obj) { writeFileSync(p, JSON.stringify(obj, null, 2) + "\n"); }
@@ -1189,7 +1881,7 @@ function githubOutputs(obj) {
   try { lines = githubOutputLines(obj); } catch (e) { fail(e.message); }
   writeFileSync(process.env.GITHUB_OUTPUT, lines, { flag: "a" });
 }
-function selftest() {
+async function selftest() {
   const assert = (cond, msg) => { if (!cond) fail(`selftest: ${msg}`); };
   const throws = (fn) => { try { fn(); return false; } catch { return true; } };
   for (const [name, expected] of [["Minha Casa", "MC"], ["ROUTER", "RO"], ["x", "X"], ["Ação Já", "AJ"],
@@ -1201,6 +1893,54 @@ function selftest() {
   const svg = initialsLogoSvg("MC", "#ffffff");
   assert(svg.includes(">MC</text>") && svg.includes('fill="#ffffff"') && svg.includes('fill="#0f172a"'), "light logo has dark letters");
   assert(initialsLogoSvg("MC", "#000").includes('fill="#ffffff"'), "dark logo has light letters");
+  const base = "https://crew.mitralab.io/";
+  const pick = (html, manifest) => {
+    const sc = scrape(html, base);
+    return rankIcons([...sc.iconCandidates, ...(manifest ? manifestIconCandidates(manifest, "https://crew.mitralab.io/assets/manifest.webmanifest") : [])])[0];
+  };
+  const PNG180 = "data:image/png;base64,iVBORw0KGgo=";
+  const crew = `<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" sizes="180x180" href="${PNG180}"><link rel="manifest" href="/assets/manifest.webmanifest">`;
+  assert(scrape(crew, base).manifestUrl === "https://crew.mitralab.io/assets/manifest.webmanifest", "the manifest link is found");
+  const crewManifest = { icons: [{ src: "/icone.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }, { src: "/icone-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" }] };
+  assert(pick(crew, crewManifest) === "https://crew.mitralab.io/assets/favicon.svg", "a vector beats the 180 px apple-touch-icon, page before manifest");
+  assert(pick(`<link rel="apple-touch-icon" href="/t.png"><link rel="icon" href="/f.png" sizes="32x32">`) === "https://crew.mitralab.io/t.png", "apple-touch 180 beats icon 32");
+  assert(pick(`<link rel="apple-touch-icon" sizes="180x180" href="/t.png">`, { icons: [{ src: "i512.png", sizes: "512x512", type: "image/png" }] }) === "https://crew.mitralab.io/assets/i512.png", "manifest PNG 512 beats apple-touch 180, resolved against the manifest");
+  assert(pick(`<link rel="icon" href="/f.png" sizes="32x32">`, { icons: [{ src: "/m.svg", purpose: "maskable" }, { src: "/m.png", sizes: "512x512", purpose: "monochrome" }] }) === "https://crew.mitralab.io/f.png", "maskable-only and monochrome-only icons are ignored");
+  assert(pick(`<link rel="shortcut icon" href="/favicon.ico"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/f.png", "an .ico is not chosen over a PNG");
+  assert(pick(`<link rel="icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/t.ico">`) === undefined, "without SVG or PNG there is no candidate");
+  assert(pick(`<link rel="icon" href="/favicon.ico">`) === undefined, "an .ico-only page has no usable icon, so the initials are drawn");
+  assert(pick(`<link rel="icon" type="image/png" sizes="192x192 512x512 48x48" href="/a.png"><link rel="icon" type="image/png" sizes="256x256" href="/b.png">`) === "https://crew.mitralab.io/a.png", "the largest of several sizes in one attribute counts");
+  assert(pick(`<link rel="apple-touch-icon" href="${PNG180}">`) === PNG180, "a data: URI is kept as is");
+  assert(pick(`<link rel='icon' href='img/f.png?v=1&amp;x=2'>`) === "https://crew.mitralab.io/img/f.png?v=1&x=2", "a relative href is resolved against the base and entities decoded");
+  assert(pick(`<link rel="icon" href="javascript:alert(1)"><link rel="icon" href="file:///etc/x.png">`) === undefined, "only http(s) and data: hrefs are taken");
+  assert(pick(`<link rel="icon" type="image/svg+xml" href="/v"><link rel="icon" href="/big.png" sizes="1024x1024">`) === "https://crew.mitralab.io/v", "a typed vector without extension wins over any raster");
+  assert(pick(`<link rel="apple-touch-icon" href="/apple-icon"><link rel="icon" href="/f.png" sizes="16x16">`) === "https://crew.mitralab.io/apple-icon", "a link with no type and no extension ranks as a raster of its default size");
+  assert(pick(`<link rel="icon" href="/u" sizes="64x64"><link rel="icon" href="/k.png" sizes="64x64">`) === "https://crew.mitralab.io/k.png", "an unknown kind loses a tie to a known one");
+  assert(pick(`<link rel="icon" type="image/jpeg" href="/a"><link rel="icon" href="/b.jpg">`) === undefined, "a declared other type or extension is unusable");
+  assert(pick(`<!-- <link rel="icon" type="image/svg+xml" href="/dead.svg"> --><script>var x='<link rel="icon" type="image/svg+xml" href="/js.svg">'</script><link rel="icon" href="/live.png" sizes="32x32">`) === "https://crew.mitralab.io/live.png", "links in comments and scripts are not candidates");
+  assert(pick(`<link rel="icon" href="DATA:image/png;base64,AAAA">`) === "data:image/png;base64,AAAA", "an uppercase DATA: scheme is accepted and normalized");
+  assert(pick(`<link rel="icon" href="HTTPS://crew.mitralab.io/u.png">`) === "https://crew.mitralab.io/u.png", "an uppercase HTTPS: scheme is accepted");
+  assert(scrape(`<link rel="manifest" href="data:application/json,{}">`, base).manifestUrl === undefined, "only an http(s) manifest link is followed");
+  assert(manifestIconCandidates({ icons: [{ src: "/p.png", sizes: "512x512", purpose: "any maskable" }] }, base).length === 1, "purpose any maskable is kept");
+  assert(manifestBackgroundColor({ background_color: "#ffffff" }) === "#ffffff" && manifestBackgroundColor({ background_color: " #FFF " }) === "#FFF", "a valid hex manifest background is kept");
+  assert(["white", "rgb(1,2,3)", "#12345", "", 7, null].every((v) => manifestBackgroundColor({ background_color: v }) === undefined) && manifestBackgroundColor({}) === undefined && manifestBackgroundColor(null) === undefined, "a named color, garbage or a missing key is ignored");
+  assert(resolveLogoBackground(undefined, undefined, undefined, "#ffffff", "#009a86") === "#ffffff", "the manifest background beats the resolved theme");
+  assert(resolveLogoBackground("#123456", "#abcdef", "#123456", "#ffffff", "#123456") === "#123456", "--theme beats everything");
+  assert(resolveLogoBackground(undefined, undefined, "#123456", "#ffffff", "#123456") === "#123456", "a descriptor themeColor beats the manifest background");
+  assert(resolveLogoBackground(undefined, "#ffffff", "#009a86", undefined, "#009a86") === "#ffffff", "a recorded iconBackground beats the descriptor themeColor it was recorded with");
+  assert(resolveLogoBackground(undefined, undefined, undefined, undefined, "#009a86") === "#009a86", "no manifest background keeps the theme");
+  assert(manifestIconCandidates({ icons: "x" }, base).length === 0 && manifestIconCandidates(null, base).length === 0, "a manifest without an icons array gives no candidates");
+  const ranked = rankIcons(scrape(`<link rel="icon" href="/f.png" sizes="32x32"><link rel="apple-touch-icon" href="/t.png"><link rel="icon" type="image/svg+xml" href="/v.svg"><link rel="icon" href="/u">`, base).iconCandidates
+    .concat(manifestIconCandidates({ icons: [{ src: "/m512.png", sizes: "512x512" }, { src: "/m.svg", type: "image/svg+xml" }] }, base)));
+  assert(ranked.join(" ") === ["/v.svg", "/m.svg", "/m512.png", "/t.png", "/f.png", "/u"].map((x) => base.slice(0, -1) + x).join(" "), `ranked order is ${ranked.join(" ")}`);
+  assert(sniffIcon(Buffer.from("<?xml version='1.0'?><svg xmlns='x'/>")) === "svg" && sniffIcon(Buffer.concat([PNG_SIGNATURE, Buffer.alloc(4)])) === "png" && sniffIcon(Buffer.from([0, 0, 1, 0, 1, 0])) === "", "the bytes decide whether an icon is SVG or PNG");
+  const sniff = (t) => sniffIcon(Buffer.from(t));
+  assert(sniff("<html><body><svg width='1'></svg></body></html>") === "" && sniff("<!doctype html><svg></svg>") === "", "an HTML page with an embedded svg is not an icon");
+  assert(sniff("<svg xmlns='x'/>") === "svg" && sniff("\uFEFF  \n<?xml version='1.0'?>\n<svg xmlns='x'/>") === "svg" && sniff("<!-- made by x --><svg/>") === "svg" && sniff("<?xml version='1.0'?><!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg/>") === "svg", "a plain svg, with a prolog, a comment or a doctype, is an icon");
+  assert(rankIcons(scrape(`<link rel="icon" href="/a.png" sizes="64x64"><link rel="icon" href="/a.png" sizes="64x64"><link rel="icon" href="/b.png" sizes="32x32">`, base).iconCandidates).length === 2, "the ranked list has no duplicate URLs");
+  assert(pick(`<link rel="icon" href="/dark.svg" type="image/svg+xml" media="(prefers-color-scheme: dark)"><link rel="icon" href="/l.png" sizes="32x32">`) === "https://crew.mitralab.io/l.png", "a media-bound icon is ignored");
+  assert(pick(`<style>${"a{}".repeat(100000)}</style><link rel="icon" href="/late.png">`) === "https://crew.mitralab.io/late.png", "a link after more than 256 KB of markup is still found");
+  assert(manifestIconCandidates({ icons: [null, { src: 3 }, { src: "/ok.png" }] }, base).length === 1, "malformed manifest entries are skipped");
   assert(resolveThemeColor("#ABC", ["#111111"]) === "#ABC", "own color wins");
   assert(throws(() => resolveThemeColor("red", [])), "own color must be hex");
   assert(throws(() => resolveThemeColor("#12345", [])), "5 hex digits are refused");
@@ -1212,6 +1952,7 @@ function selftest() {
   assert(throws(() => githubOutputLines({ appName: "A\rB" })), "carriage return in an output is refused");
   assert(clean("My\n  App | tagline") === "My App", "clean collapses line breaks");
   assert(isVersionName("1") && isVersionName("1.2.3") && !isVersionName("1.0${x}") && !isVersionName('1.0"') && !isVersionName("1.2.3.4"), "isVersionName");
+  assert(isAppUrl("https://crew.mitralab.io") && isAppUrl("https://crew.mitralab.io/") && isAppUrl("https://crew.mitralab.io/noodle") && isAppUrl("http://127.0.0.1:8099/a/b/") && !isAppUrl("https://h.com/noodle?x=1") && !isAppUrl("https://h.com/#a") && !isAppUrl("https://u@h.com/") && !isAppUrl("ftp://h.com/") && !isAppUrl("https://h.com/a b"), "isAppUrl takes a path, never a query or fragment");
   assert(isPlainHost("a-1.example.com") && isPlainHost("127.0.0.1:8099") && !isPlainHost('a"b.com') && !isPlainHost("a b"), "isPlainHost");
   // Synthetic 100x100 logos, as px(x, y) -> [r, g, b, a].
   const white = [255, 255, 255, 255];
@@ -1308,22 +2049,599 @@ function selftest() {
   assert(withBar.includes("UIStatusBarStyleDarkContent") && withBar.split("<key>UIStatusBarStyle</key>").length === 2, "the launch status bar style is added once");
   assert(withLaunchStatusBar(withBar, true) === withBar, "an Info.plist that has the style is left alone");
   assert(withLaunchStatusBar(plist, true).includes("UIStatusBarStyleLightContent"), "a dark splash gets light status bar content");
+  const namePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>\n</dict>";
+  assert(withBundleName(namePlist, "Infusion").includes("<key>CFBundleName</key>\n\t<string>Infusion</string>"), "CFBundleName gets the app name");
+  assert(withBundleName(namePlist, "A & $& B").includes("<string>A &amp; $&amp; B</string>"), "the bundle name is escaped and literal");
+  assert(withBundleName(withBundleName(namePlist, "Infusion"), "Infusion") === withBundleName(namePlist, "Infusion"), "setting the bundle name twice changes nothing");
+  const modesPlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  assert(withBackgroundAudio(modesPlist, false) === modesPlist, "background audio off leaves the Info.plist untouched");
+  const modes = withBackgroundAudio(modesPlist, true);
+  assert(modes.includes("<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>audio</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>"), "background audio on declares the audio mode before the anchor");
+  assert(withBackgroundAudio(modes, true) === modes, "declaring background audio twice changes nothing");
+  const pushModes = modesPlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>UIBackgroundModes</key>\n\t<array>\n\t\t<string>remote-notification</string>\n\t</array>\n\t<key>LSRequiresIPhoneOS</key>");
+  const merged = withBackgroundAudio(pushModes, true);
+  assert(merged.includes("<string>remote-notification</string>\n\t\t<string>audio</string>\n\t</array>") && merged.split("<key>UIBackgroundModes</key>").length === 2, "audio joins an existing UIBackgroundModes array and keeps its entries");
+  assert(withBackgroundAudio(merged, true) === merged, "merging into an existing array is idempotent");
+  // fail() exits the process, so it is swapped for a throw while the missing anchor is tried.
+  const realExit = process.exit, realError = console.error;
+  let anchorMissing = false;
+  process.exit = () => { throw new Error("fail() called"); };
+  console.error = () => {};
+  try { withBackgroundAudio("<dict>\n\t<key>CFBundleName</key>\n</dict>", true); } catch (e) { anchorMissing = e.message === "fail() called"; }
+  finally { process.exit = realExit; console.error = realError; }
+  assert(anchorMissing, "a plist without the anchor fails loudly");
   // Nothing compiles the Swift here, so check that every member the file calls is still defined in
   // it (a past edit dropped four of them). The check itself is tried on a mutated copy per name.
   const swift = readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8");
   assert(!missingSwiftMembers(swift).length, `SceneDelegate.swift calls ${missingSwiftMembers(swift)} but does not define it`);
   for (const name of SWIFT_MEMBERS) {
-    const broken = swift.replace(new RegExp(`(var|func) ${name}\\b`), "let $1_x").replace("init?(hex:", "init?(hexx:");
+    const broken = swift.replace(new RegExp(`(var|func) ${name}\\b`, "g"), "let $1_x").replace("init?(hex:", "init?(hexx:");
     assert(missingSwiftMembers(broken).includes(name), `the Swift check does not notice ${name} going missing`);
   }
   assert(missingSwiftMembers(swift.replace("init?(hex:", "init?(hexx:")).includes("init?(hex"), "the Swift check does not notice init?(hex going missing");
-  assert(missingSwiftMembers(swift.replace("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
+  assert(missingSwiftMembers(swift.replaceAll("func appURL(fromReturn", "func other(fromReturn") + "\nlet appHost = 1").includes("appURL"), "a local let does not stand in for a member");
+  const didLoad = swift.slice(swift.indexOf("override func capacitorDidLoad()"), swift.indexOf("private func hideFormAccessoryBar()"));
+  assert(didLoad.includes("hideFormAccessoryBar()") && swift.includes('NSStringFromClass($0).hasPrefix("WKContent")') && swift.includes("objc_allocateClassPair(base, name, 0)") && swift.includes("#selector(getter: UIResponder.inputAccessoryView)") && swift.includes("object_setClass(content, subclass)"), "iOS hides the form accessory bar of the web view from capacitorDidLoad");
+  const keyboard = swift.slice(swift.indexOf("private func installKeyboard()"), swift.indexOf("// The popup contract needs"));
+  assert(didLoad.includes("installKeyboard()") && swift.includes("private enum KeyboardMode: String { case resize, notify, off }") && keyboard.includes('KeyboardMode(rawValue: bridge?.config.getPluginConfig("MitraShell").getString("keyboard") ?? "") ?? .resize') && keyboard.includes("defaultKeyboardMode = mode") && !keyboard.includes("guard mode != .off"), "iOS reads the default keyboard mode from the config in capacitorDidLoad, resize when it is missing, and follows the keyboard in every mode");
+  assert(!swift.includes("isLoading") && keyboard.includes("content.add(documents, name: KeyboardDocumentHandler.name)") && keyboard.includes("source: Self.documentStartScript(mode: mode.rawValue),") && /return "window\.__mitraShellKeyboard = \\\(state\);\\n"\s*\+ "window\.webkit\.messageHandlers\.\\\(KeyboardDocumentHandler\.name\)\.postMessage\(\\"\\"\)"/.test(keyboard) && keyboard.includes('json(["phase": "didHide", "mode": mode, "height": 0])') && keyboard.includes("injectionTime: .atDocumentStart, forMainFrameOnly: true))") && /fileprivate func keyboardDocumentStarted\(\) \{\s*applyKeyboardMode\(defaultKeyboardMode\)\s*publishKeyboardState\(\)\s*if keyboardMode != \.off && keyboardOverlap > 0 \{ sendKeyboardEvent\(keyboardPhase, duration: 0, curve: 0\) \}/.test(keyboard), "a committed document, not the start of a load, has the state of a new document before the page's scripts, then puts the configured mode back, gets the real state and, with the keyboard up, the event");
+  assert(swift.includes('static let name = "mitraShellDocument"') && swift.includes("weak var shell: ShellBridgeViewController?") && /guard message\.frameInfo\.isMainFrame else \{ return \}\s*shell\?\.keyboardDocumentStarted\(\)/.test(swift), "the new document message counts only from the main frame and does not keep the controller alive");
+  assert(/keyboardPhase = phase\s*announcedHeight = height\s*sendKeyboardEvent\(phase, duration: duration, curve: curve\)/.test(keyboard) && /private func sendKeyboardEvent\(_ phase: String, duration: Double, curve: UInt\) \{\s*let height = Double\(keyboardOverlap\)\s*guard keyboardMode != \.off, height\.isFinite, duration\.isFinite else \{ return \}/.test(keyboard) && keyboard.includes("guard keyboardOverlap > 0, keyboardMode != .off, let scrollView") && keyboard.includes('["phase": silent ? "didHide" : keyboardPhase, "mode": keyboardMode.rawValue, "height": silent ? 0 : announcedHeight]'), "off sends no event, leaves the scroll alone and never reports a keyboard, while the shell still tracks it");
+  const apply = keyboard.slice(keyboard.indexOf("private func applyKeyboardMode("), keyboard.indexOf("// The keyboard reports curve 7"));
+  assert(apply.includes("guard mode != keyboardMode else { return }") && apply.includes("if let container = view.superview, view.frame != container.bounds { view.frame = container.bounds }") && apply.includes("if mode == .resize { resizeForKeyboard(taller: keyboardOverlap > 0, duration: 0, curve: 0) }") && apply.includes("publishKeyboardState()") && !apply.includes("notifyKeyboard("), "a mode switch restores or applies the frame at once, publishes the state and makes up no event");
+  assert(keyboard.includes("guard let mode = KeyboardMode(rawValue: name) else { return nil }"), "a name that is not a mode changes nothing");
+  assert(Object.keys(IOS_KEYBOARD_MODES).join() === "resize,notify,off", "the generator and the Swift enum name the same keyboard modes");
+  assert(keyboard.includes('static let keyboardEvent = "mitrashell:keyboard"') && keyboard.includes('var event = new Event("\\(Self.keyboardEvent)");') && keyboard.includes("for (var name in fields) event[name] = fields[name];") && keyboard.includes("window.dispatchEvent(event);") && !keyboard.includes("triggerWindowJSEvent(eventName: Self.keyboardEvent") && ["willShow", "didShow", "willHide", "didHide"].every((phase) => keyboard.includes(`"${phase}"`)) && ["mode", "phase", "height", "duration", "curve", "easing"].every((field) => keyboard.includes(`"${field}":`)) && keyboard.includes('"mode": keyboardMode.rawValue'), "the page gets mitrashell:keyboard with the mode, the four phases and the other fields, as JSON");
+  assert(keyboard.includes("guard phase != keyboardPhase || height != announcedHeight, height.isFinite, duration.isFinite else { return }") && keyboard.indexOf('notifyKeyboard(overlap > 0 ? "willShow" : "willHide"') < keyboard.indexOf("resizeForKeyboard(taller: taller") && keyboard.includes("if shown == (keyboardOverlap > 0)"), "a keyboard event is sent once, before the frame moves, and a late didShow or didHide that does not match the state is dropped");
+  assert(keyboard.includes('default: return "cubic-bezier(0.38, 0.7, 0.125, 1)"') && ['case 0: return "ease-in-out"', 'case 1: return "ease-in"', 'case 2: return "ease-out"', 'case 3: return "linear"'].every((c) => keyboard.includes(c)), "the public curves map to their CSS names and the keyboard's own to a bezier");
+  assert(keyboard.includes("guard keyboardMode == .resize, let container = view.superview else { return }") && /if keyboardMode == \.resize \{\s*resizeForKeyboard\(taller: taller, duration: duration, curve: curve\)\s*\} else \{\s*dropStrayScroll\(\)/.test(keyboard) && keyboard.indexOf("revealFocusedField()") > keyboard.indexOf("private func beginSettling()"), "notify mode never touches the frame and never scrolls to the field: it only drops the stray scroll");
+  assert(keyboard.includes("let hold = keyboardMode == .notify && keyboardOverlap > 0 && documentFits(scrollView)") && keyboard.includes("scrollView.panGestureRecognizer.isEnabled = !hold") && keyboard.indexOf("holdDocumentPan()", keyboard.indexOf('notifyKeyboard(overlap > 0 ? "willShow" : "willHide"')) > 0 && apply.includes("holdDocumentPan()"), "in notify a document that fits cannot be dragged while the keyboard is up, and the pan comes back with the keyboard down or another mode");
+  assert(swift.includes("var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)") && !swift.includes('URLComponents(string: "https://\\(appHost)/")'), "a return on the scheme goes to server.url, scheme, port and path included");
+  assert(["keyboardWillChangeFrameNotification", "keyboardWillShowNotification", "keyboardWillHideNotification", "keyboardDidShowNotification", "keyboardDidHideNotification"].every((n) => keyboard.includes(`UIResponder.${n}`)) && keyboard.includes("keyboardAnimationDurationUserInfoKey") && keyboard.includes("UIView.AnimationOptions(rawValue: curve << 16)"), "the resize follows every keyboard frame change with the keyboard's own duration and curve");
+  assert(keyboard.includes("keyboardIsLocalUserInfoKey") && keyboard.includes("window.convert(end, from: window.screen.coordinateSpace)") && keyboard.includes("keyboard.intersects(bounds), keyboard.maxY >= bounds.maxY - 1"), "only a docked keyboard of this app, measured in the window, takes space from the page");
+  assert(/override func viewDidLayoutSubviews\(\) \{\s*super\.viewDidLayoutSubviews\(\)\s*fitToKeyboard\(\)/.test(keyboard) && /super\.viewDidAppear\(animated\)\s*fitToKeyboard\(\)/.test(swift), "the frame is applied again on every layout and when the view comes back, so a hide missed off screen cannot leave it short");
+  assert(keyboard.includes("UIResponder.keyboardDidChangeFrameNotification") && keyboard.includes("settleTimer?.cancel()") && keyboard.includes('field.tagName === "IFRAME"') && keyboard.includes("if (!box.width || !box.height || box.height > window.innerHeight) return;"), "the keyboard is measured again after rotation, the settle timer is cancellable, and an iframe, an empty box or one taller than the viewport is not scrolled to");
+  assert(/guard abs\(scrollView\.contentOffset\.y - top\) > 0\.5, holdsTop \|\| documentFits\(scrollView\) else \{ return \}/.test(keyboard) && !keyboard.includes("isScrollEnabled"), "the scroll offset is put back only for a document that fits the viewport, and scrolling stays on");
+  assert(keyboard.includes("box.top < 0 || box.bottom > window.innerHeight") && keyboard.includes('field.scrollIntoView({ block: "center" })'), "a focused field is scrolled to only when the shorter viewport left it out of view");
+  const plugin = swift.slice(swift.indexOf("class MitraShellPlugin"));
+  assert(/pluginMethods: \[CAPPluginMethod\] = \[\s*CAPPluginMethod\(name: "setKeyboardMode", returnType: CAPPluginReturnPromise\)\s*\]/.test(plugin) && plugin.includes("@objc func setKeyboardMode(_ call: CAPPluginCall)") && plugin.includes('return call.reject("mode must be resize, notify or off")') && plugin.includes('return call.reject("the shell is not ready")') && plugin.includes("call.resolve(state)") && /DispatchQueue\.main\.async \{\s*guard let shell = self\.bridge\?\.viewController as\? ShellBridgeViewController/.test(plugin), "setKeyboardMode is the only plugin method: it runs on the main thread, resolves with the state and rejects a value that is not a mode");
+  assert(plugin.includes('authCancelEvent = "mitrashell:authcancel"') && plugin.includes('authFailEvent = "mitrashell:authfail"') && plugin.includes("bridge?.triggerWindowJSEvent(eventName: event)"), "the sign-in session names the two events it dispatches in the page");
+  assert(plugin.includes("guard !finished else { return }") && plugin.includes("if !session.start(), !finished {"), "a sign-in session ends once: one event and at most one browser fallback");
+  const fallbacks = plugin.split("openInBrowser(url)");
+  assert(fallbacks.length === 3 && fallbacks.slice(0, -1).every((before) => /notifyPage\(MitraShellPlugin\.authFailEvent\)\s*(self\?\.)?$/.test(before)), "every fallback of the sign-in to the browser tells the page first");
+  assert(plugin.split("UIApplication.shared.open(").length === 2, "the browser fallback opens the system browser in one place");
+  assert(/if cancelled \{\s*self\?\.notifyPage\(MitraShellPlugin\.authCancelEvent\)/.test(plugin), "a cancelled sign-in tells the page");
   // The plain-logo fallback keeps the theme color and drops the entrance.
   const asIs = { bg: "#0f172a", isDarkBg: true, frames: [], branch: "fallback" };
   const plainTheme = patchLaunchTheme(capacitorStyles, asIs);
   assert(plainTheme.includes("windowSplashScreenBackground") && !plainTheme.includes("windowSplashScreenAnimatedIcon"), "the fallback theme has the color and no animated icon");
   assert(capacitorAssetsArgs(asIs).includes("--splashBackgroundColor") && !capacitorAssetsArgs({ branch: "own-background" }).includes("--splashBackgroundColor"), "only the fallback gives capacitor-assets the colors");
-  console.log("[generate] selftest ok");
+  const viewport = (content, extra = "") => `<html><head><meta charset="utf-8">${extra}<meta name="viewport" content="${content}"></head></html>`;
+  for (const [html, expected, why] of [
+    [viewport("width=device-width, initial-scale=1, viewport-fit=cover"), true, "the usual cover viewport"],
+    ['<meta content="width=device-width,viewport-fit=cover" name="viewport">', true, "content before name"],
+    ["<meta name='viewport' content='width=device-width, viewport-fit=cover'>", true, "single quotes"],
+    ['<META  NAME = "Viewport"   CONTENT = "viewport-fit = COVER" />', true, "case and extra spaces"],
+    ['<meta name=viewport content="viewport-fit=cover">', true, "unquoted name"],
+    ['<meta name="viewport" content="width=device-width; viewport-fit=cover">', true, "semicolon separator"],
+    [viewport("width=device-width, viewport-fit=contain"), false, "contain"],
+    [viewport("width=device-width, viewport-fit=auto"), false, "auto"],
+    [viewport("width=device-width, initial-scale=1"), false, "no viewport-fit"],
+    [viewport("width=device-width, x-viewport-fit=cover"), false, "a longer key is not viewport-fit"],
+    ["<html><head><title>x</title></head></html>", false, "no viewport meta"],
+    ['<!-- <meta name="viewport" content="viewport-fit=cover"> --><meta name="viewport" content="width=device-width">', false, "a commented meta"],
+    ['<!-- never closed <meta name="viewport" content="viewport-fit=cover">', false, "an unterminated comment"],
+    ['<meta name="description" content="try viewport-fit=cover">', false, "viewport-fit in another meta"],
+    ['<meta name="description" content=\'name="viewport" content="viewport-fit=cover"\'>', false, "a viewport meta quoted inside another attribute"],
+    [viewport("width=device-width", '<meta name="x" content="viewport-fit=cover">'), false, "another meta before the viewport"],
+    [`${viewport("viewport-fit=cover")}${viewport("width=device-width")}`, false, "the last viewport meta wins"],
+    ["", false, "empty page"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  assert(pageHandlesSafeArea(`${"<!--".repeat(50000)}${viewport("viewport-fit=cover")}`) === false, "many unterminated comments finish and hide the meta");
+  assert(resolveContentInset(undefined, true) === "never" && resolveContentInset(null, false) === "automatic" && resolveContentInset(null, true) === "never", "a null or missing override falls back to detection");
+  assert(keyboard.includes("if landed, let announced = announcedFrame, end != announced, bounds == announcedBounds { return }"), "a didChangeFrame whose frame is not the announced one is dropped unless the window changed size");
+  assert(keyboard.includes("window.__mitraShellKeyboard = \\(state);") && keyboard.indexOf("window.__mitraShellKeyboard = \\(state);") < keyboard.indexOf("window.dispatchEvent(event);") && keyboard.includes("return Self.json(keyboardStateFields())"), "the last keyboard state is left on window before each event and again when a document finishes loading");
+  assert(throws(() => resolveIosKeyboard(undefined, undefined, false)) && throws(() => resolveIosKeyboard("off", undefined, true)), "a descriptor with the retired iosKeyboardResize key fails instead of being ignored");
+  assert(resolveIosKeyboard(undefined, undefined) === "resize" && resolveIosKeyboard(undefined, null) === "resize", "the iOS keyboard mode is resize by default");
+  assert(resolveIosKeyboard("notify", undefined) === "notify" && resolveIosKeyboard(undefined, "off") === "off" && resolveIosKeyboard("off", "notify") === "off", "the iOS keyboard mode comes from the flag, then from the descriptor");
+  assert(throws(() => resolveIosKeyboard("native", undefined)) && throws(() => resolveIosKeyboard(undefined, false)) && throws(() => resolveIosKeyboard(true, "notify")) && throws(() => resolveIosKeyboard("toString", undefined)), "an iOS keyboard mode must be resize, notify or off, and the flag needs a value");
+  assert(resolveContentInset("automatic", true) === "automatic" && throws(() => resolveContentInset("always", true)), "an override wins and must be never or automatic");
+  for (const [html, expected, why] of [
+    [`<!-->${viewport("viewport-fit=cover")}`, true, "an empty comment <!--> does not swallow the meta"],
+    [`<!--->${viewport("viewport-fit=cover")}`, true, "an empty comment <!---> does not swallow the meta"],
+    [`<!--x-->${viewport("viewport-fit=cover")}`, true, "a normal comment still ends at -->"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why}`);
+  }
+  assert(withUsageDescriptions("<dict>\n\t<key>LSRequiresIPhoneOS</key>\n</dict>", "A\ufffeB\uffffC").includes("<string>ABC usa o microfone"), "U+FFFE and U+FFFF are dropped from the name");
+  const hostile = `${"<meta ".repeat(50000)}${viewport("viewport-fit=cover")}`;
+  const started = Date.now();
+  pageHandlesSafeArea(hostile);
+  pageHandlesSafeArea(`${"<script ".repeat(40000)}${"<noscript ".repeat(40000)}${"<!--".repeat(40000)}`);
+  assert(Date.now() - started < 1000, `a page of unclosed tags is scanned in linear time (${Date.now() - started} ms)`);
+  for (const [html, expected, why] of [
+    [`<script>var s = '<meta name="viewport" content="viewport-fit=cover">';</script>${viewport("width=device-width")}`, false, "a meta inside a script string"],
+    [`<script type="module">x</script><noscript><meta name="viewport" content="viewport-fit=cover"></noscript>`, false, "a meta inside noscript"],
+    [`<noscript><meta name="viewport" content="viewport-fit=cover">`, false, "an unterminated noscript"],
+    [`<SCRIPT src=a></SCRIPT>${viewport("viewport-fit=cover")}`, true, "a real meta after an empty script"],
+    [`<script>${viewport("viewport-fit=cover")}`, false, "an unterminated script"]
+  ]) {
+    assert(pageHandlesSafeArea(html) === expected, `pageHandlesSafeArea: ${why} should be ${expected}`);
+  }
+  for (const hostileName of ["Caixa $& Co", "A$'B", "A$`B", "A$1B", "A$$B", "$&$'$`$1$$"]) {
+    const out = withUsageDescriptions("<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>", hostileName);
+    const once = (needle) => out.split(needle).length === 2;
+    assert(out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa o microfone`) && out.includes(`<string>${hostileName.replace(/&/g, "&amp;")} usa a c\u00e2mera`), `the name ${hostileName} stays literal in the usage strings`);
+    assert(once("<key>NSMicrophoneUsageDescription</key>") && once("<key>NSCameraUsageDescription</key>") && once("<key>NSSpeechRecognitionUsageDescription</key>") && once("<key>LSRequiresIPhoneOS</key>") && once("<key>CFBundleName</key>"), `the plist keeps one of each key with the name ${hostileName}`);
+  }
+  const usagePlist = "<dict>\n\t<key>CFBundleName</key>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>";
+  const usage = withUsageDescriptions(usagePlist, `Caf\u00e9 & <Co> "x" 'y'`);
+  assert(usage.includes("<key>NSMicrophoneUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o microfone para gravar \u00e1udio que voc\u00ea envia.</string>"), "the microphone string names the escaped app");
+  assert(withUsageDescriptions(usagePlist, "A\u0000B\u0007\u001fC\tD").includes("<string>ABC\tD usa o microfone"), "control characters are dropped from the name");
+  assert(usage.includes("<key>NSCameraUsageDescription</key>") && usage.includes("usa a c\u00e2mera para tirar fotos que voc\u00ea envia."), "the camera string is added");
+  assert(usage.includes("<key>NSSpeechRecognitionUsageDescription</key>\n\t<string>Caf\u00e9 &amp; &lt;Co&gt; \"x\" 'y' usa o reconhecimento de fala para transformar sua grava\u00e7\u00e3o em texto.</string>"), "the speech recognition string is added for webkitSpeechRecognition");
+  assert(usage.split("<key>NSSpeechRecognitionUsageDescription</key>").length === 2, "the speech recognition key appears once");
+  assert(withUsageDescriptions(usage, "Other") === usage, "adding the usage strings twice changes nothing");
+  const ownSpeech = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSSpeechRecognitionUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
+  assert(withUsageDescriptions(ownSpeech, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownSpeech, "A").split("NSSpeechRecognitionUsageDescription").length === 2, "an existing speech recognition string is kept");
+  const ownMic = usagePlist.replace("\t<key>LSRequiresIPhoneOS</key>", "\t<key>NSMicrophoneUsageDescription</key>\n\t<string>Mine</string>\n\t<key>LSRequiresIPhoneOS</key>");
+  assert(withUsageDescriptions(ownMic, "A").includes("<string>Mine</string>") && withUsageDescriptions(ownMic, "A").split("NSMicrophoneUsageDescription").length === 2, "an existing microphone string is kept");
+  const androidManifest = `<manifest>\n    <application/>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
+  const audio = withAudioPermissions(androidManifest);
+  assert(audio.includes('android.permission.RECORD_AUDIO" />') && audio.includes('android.permission.MODIFY_AUDIO_SETTINGS" />'), "the audio permissions are declared");
+  assert(audio.includes('<uses-feature android:name="android.hardware.microphone" android:required="false" />'), "the microphone feature is optional");
+  assert(!audio.includes("CAMERA"), "the camera permission is not declared");
+  const mainJava = mainActivityJava("io.example.app", undefined);
+  const clientJava = androidTemplate("ShellWebChromeClient.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  const gateJava = androidTemplate("MediaPermissionGate.java", { appId: "io.example.app", host: "app.example.com" });
+  assert(mainJava.split("setWebChromeClient(new ShellWebChromeClient(").length === 2 && mainJava.includes("super.onCreate(savedInstanceState);"), "MainActivity installs the media-safe chrome client once, after super.onCreate");
+  assert(clientJava.startsWith("package io.example.app;") && gateJava.startsWith("package io.example.app;"), "both classes are in the app package");
+  assert(clientJava.includes('APP_HOST = "app.example.com";') && clientJava.includes("class ShellWebChromeClient extends BridgeWebChromeClient") && clientJava.includes("super.onPermissionRequest(") && clientJava.includes("gate.cancel(request)"), "the client gates by the app host without the port and hands the rest to the bridge");
+  assert(!/^import (android|androidx|com\.getcapacitor)/m.test(gateJava), "the gate has no Android or Capacitor imports, so a plain JVM can test it");
+  assert(androidTemplate("ShellWebChromeClient.java", { appId: "io.a.b", host: "h.example.com" }).includes('"h.example.com"') && !clientJava.includes("__"), "the placeholders are substituted");
+  assert(androidTemplate("MediaPermissionGate.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the substitution is literal, not a replacement pattern");
+  assert(mainActivityJava("io.example.app", undefined) === mainJava, "writing MainActivity twice gives the same file");
+  const unitTest = androidTemplate("ShellWebChromeClientTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(unitTest.startsWith("package io.example.app;") && unitTest.includes('Uri.parse("https://app.example.com")') && unitTest.includes("RobolectricTestRunner") && !unitTest.includes("__"), "the Robolectric test is written for the app package and host");
+  const barsJava = androidTemplate("ShellSystemBars.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsJava.startsWith("package io.example.app;") && barsJava.includes('APP_HOST = "app.example.com";') && !/__[A-Z_]+__/.test(barsJava), "the system bars class is in the app package and takes the host without the port");
+  assert(barsJava.includes('"public/shell-bars.js"') && barsJava.includes("onPageCommitVisible(WebView webView, String url)") && barsJava.includes("isAppPage(url)") && barsJava.includes("return null;"), "the system bars class runs the bundled script on app pages as they become visible and tolerates a missing asset");
+  assert(barsJava.includes("WEBVIEW_VERSION_WITH_SAFE_AREA_FIX = 140") && barsJava.includes("webViewMajorVersion() < WEBVIEW_VERSION_WITH_SAFE_AREA_FIX) return;") && barsJava.includes("WebView.getCurrentWebViewPackage()"), "the system bars class stays out below the WebView version Capacitor needs for edge to edge");
+  assert(mainJava.includes("public void onConfigurationChanged(Configuration newConfig)") && mainJava.split("ShellSystemBars.recheck(getBridge());").length === 2 && mainJava.indexOf("super.onConfigurationChanged(newConfig);") < mainJava.indexOf("ShellSystemBars.recheck("), "MainActivity asks the probe to report again after a configuration change");
+  assert(androidTemplate("ShellSystemBars.java", { appId: "io.a$&b", host: "h.example.com" }).startsWith("package io.a$&b;"), "the system bars substitution is literal");
+  assert(mainJava.split("ShellSystemBars.install(getBridge());").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSystemBars.install("), "MainActivity installs the system bars listener once, after super.onCreate");
+  assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes("contentInsetAdjustmentBehavior == .never"), "iOS injects the bar probe only for a page that draws under the bar");
+  probeSelftest(assert);
+  const barsTest = androidTemplate("ShellSystemBarsTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(barsTest.startsWith("package io.example.app;") && barsTest.includes('"https://app.example.com/home"') && barsTest.includes("RobolectricTestRunner") && barsTest.includes("onPageCommitVisible") && barsTest.includes("onConfigurationChanged") && !/__[A-Z_]+__/.test(barsTest), "the system bars Robolectric test is written for the app package and host");
+  const gradleFixture = `android {
+    buildTypes {
+        release {
+        }
+    }
+}
+dependencies {
+    testImplementation "junit:junit:$junitVersion"
+}`;
+  const withTests = withUnitTestSupport(gradleFixture);
+  assert(withTests.includes(`org.robolectric:robolectric:${ROBOLECTRIC_VERSION}`) && withTests.includes("includeAndroidResources = true") && withTests.includes("androidx.test:core"), "build.gradle gets Robolectric and Android resources for unit tests");
+  assert(withUnitTestSupport(withTests) === withTests, "patching build.gradle for unit tests twice changes nothing");
+  assert(withUnitTestSupport(`// keep $& and $' as they are\n${gradleFixture}`).startsWith("// keep $& and $' as they are"), "the gradle patch does not read the existing text as a replacement pattern");
+  const crlf = withAudioPermissions(androidManifest.replace(/\n/g, "\r\n"));
+  assert(crlf.includes("RECORD_AUDIO") && withAudioPermissions(crlf) === crlf, "a CRLF manifest is patched, once");
+  assert(withAudioPermissions(audio) === audio, "adding the audio permissions twice changes nothing");
+  // Popup contract: options, manifest, dependency, templates.
+  assert(isReturnPath("/oauth/") && !isReturnPath("/") && isReturnPath("/a-b/c_d.e/"), "plain path prefixes are accepted");
+  assert(!isReturnPath("/oauth") && !isReturnPath("oauth/") && !isReturnPath("/a//b/") && !isReturnPath("/../") && !isReturnPath("/a/./") && !isReturnPath('/a"b/') && !isReturnPath("/a b/") && !isReturnPath("/a?x=1/"), "a return path must be a clean prefix that ends with /");
+  assert(isConsentHost("github.com") && isConsentHost("api.notion.com") && !isConsentHost("github.com:443") && !isConsentHost("github.com/x") && !isConsentHost('a"b.com') && !isConsentHost("") && !isConsentHost("-a.com"), "consent hosts are plain names");
+  assert(DEFAULT_CONSENT_HOSTS.includes("github.com") && DEFAULT_CONSENT_HOSTS.includes("api.notion.com") && DEFAULT_CONSENT_HOSTS.includes("slack.com") && DEFAULT_RETURN_PATH === "/oauth/", "the defaults are the common providers and /oauth/");
+  const byScheme = intentFilters({ host: "app.example.com", callbackScheme: "io.example.app", returnPath: "/oauth/" });
+  assert(byScheme.includes('<data android:scheme="https" android:host="app.example.com" android:pathPrefix="/oauth/" />') && !byScheme.includes('android:host="app.example.com" />'), "with the scheme return only the return path is an App Link");
+  assert(byScheme.includes('<data android:scheme="io.example.app" />') && byScheme.split('android:autoVerify="true"').length === 2, "the scheme return stays, and one filter is verified");
+  const byHttps = intentFilters({ host: "app.example.com", callbackScheme: undefined, returnPath: "/oauth/" });
+  assert(byHttps.includes('<data android:scheme="https" android:host="app.example.com" />') && !byHttps.includes("pathPrefix") && !byHttps.includes("io.example.app"), "the https sign-in return keeps the whole host");
+  const queries = withBrowserQueries(androidManifest);
+  assert(queries.includes("<queries>") && queries.includes('<data android:scheme="https" />') && queries.includes("android.support.customtabs.action.CustomTabsService") && queries.trimEnd().endsWith("</manifest>"), "the manifest declares the browser queries");
+  assert(withBrowserQueries(queries) === queries, "adding the browser queries twice changes nothing");
+  const withBrowser = withBrowserDependency(withTests.replace("dependencies {", "dependencies {\n    implementation project(':capacitor-android')"));
+  assert(withBrowser.includes(`androidx.browser:browser:${ANDROIDX_BROWSER_VERSION}`) && withBrowserDependency(withBrowser) === withBrowser, "the app depends on androidx.browser, once");
+  const popupsJava = androidTemplate("ShellPopups.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com", "github.com"], returnPath: "/oauth/" });
+  assert(popupsJava.includes('APP_HOST = "app.example.com";') && popupsJava.includes('CONSENT_HOSTS = { "accounts.google.com", "github.com" };') && popupsJava.includes('RETURN_PATH = "/oauth/";') && !/__[A-Z_]+__/.test(popupsJava), "the popup class takes the host, the consent hosts and the return path");
+  assert(androidTemplate("PopupPolicy.java", { appId: "io.example.app", host: "app.example.com" }).startsWith("package io.example.app;") && !/^import (android|androidx|com\.getcapacitor)/m.test(androidTemplate("PopupPolicy.java", { appId: "io.example.app", host: "app.example.com" })), "the policy has no Android or Capacitor imports, so a plain JVM can test it");
+  assert(mainJava.indexOf("popups = new ShellPopups(getBridge());") > mainJava.indexOf("super.onCreate(savedInstanceState);") && mainJava.indexOf("popups = new ShellPopups(getBridge());") < mainJava.indexOf("setWebChromeClient(new ShellWebChromeClient(getBridge(), popups))"), "MainActivity creates the popups before the chrome client that uses them, after super.onCreate");
+  assert(mainJava.split("popups.onReturnLink(data)").length === 2 && mainJava.indexOf("popups.onReturnLink(data)") < mainJava.indexOf("CALLBACK_SCHEME.equalsIgnoreCase(data.getScheme())"), "a return of the popup is taken before the sign-in return logic, which is left as it was");
+  assert(androidTemplate("ShellPopupsTest.java", { appId: "io.example.app", host: "app.example.com:8443", consentHosts: ["accounts.google.com"], returnPath: "/oauth/" }).includes('RETURN_PATH = "/oauth/";'), "the popup Robolectric test is written for the app");
+  // Sign-in in an Auth Tab (Android): template, MainActivity wiring, one return path, the fallback.
+  const signInJava = androidTemplate("ShellSignIn.java", { appId: "io.example.app", host: "app.example.com:8443", authHosts: ["beta.mitralab.io", "accounts.google.com"] });
+  assert(signInJava.startsWith("package io.example.app;") && signInJava.includes('APP_HOST = "app.example.com";') && signInJava.includes('AUTH_HOSTS = { "beta.mitralab.io", "accounts.google.com" };') && !/__[A-Z_]+__/.test(signInJava), "the sign-in class is written for the app package, the app host without the port and the sign-in hosts");
+  assert(androidTemplate("ShellSignIn.java", { appId: "io.example.app", host: "app.example.com", authHosts: ["api.example.com:8443", "API.example.com", "accounts.google.com"] }).includes('{ "api.example.com", "accounts.google.com" }'), "a sign-in host given with a port or in another case is compared by its name, once");
+  assert(androidTemplate("ShellSignIn.java", { appId: "io.a$&b", host: "h.example.com", authHosts: ["a$&b.example"] }).includes('{ "a$&b.example" }'), "the sign-in hosts substitution is literal");
+  assert(signInJava.includes('AUTH_CANCEL_EVENT = "mitrashell:authcancel"') && signInJava.includes('AUTH_FAIL_EVENT = "mitrashell:authfail"') && signInJava.includes("bridge.triggerWindowJSEvent(resultCode == AuthTabIntent.RESULT_CANCELED ? AUTH_CANCEL_EVENT : AUTH_FAIL_EVENT);"), "the Android sign-in names the two events it dispatches in the page, a cancel apart from a failure");
+  assert(signInJava.includes("if (request.isForMainFrame() && signIn.start(request.getUrl())) return true;") && signInJava.includes("return super.shouldOverrideUrlLoading(view, request);") && signInJava.includes("class Client extends BridgeWebViewClient"), "only a main frame navigation is taken, and the rest stays with the bridge's client");
+  assert(signInJava.includes("!APP_HOST.equalsIgnoreCase(host) && Arrays.asList(AUTH_HOSTS).contains(host)") && signInJava.includes('!"https".equalsIgnoreCase(url.getScheme())'), "a sign-in is an https URL of a sign-in host that is not the app host");
+  assert(signInJava.indexOf("returnLoader.load(resultUri)) return;") < signInJava.indexOf("if (!wasOpen) return;") && signInJava.indexOf("if (!wasOpen) return;") < signInJava.indexOf("bridge.triggerWindowJSEvent("), "a return always loads through the activity, and only a sign-in this instance opened tells the page, once");
+  assert(signInJava.indexOf("if (inAuthTab) return true;") > 0 && signInJava.indexOf("if (inAuthTab) return true;") < signInJava.indexOf("browser.launchSignIn("), "a second sign-in navigation while the Auth Tab is up opens nothing");
+  assert(mainJava.includes("if (returned.equals(lastReturn) && now - lastReturnAt < SAME_RETURN_WINDOW_MS) return true;") && mainJava.indexOf("SAME_RETURN_WINDOW_MS) return true;") < mainJava.indexOf("String serverUrl"), "the same return handed over twice loads once");
+  assert(signInJava.includes("if (callbackScheme == null || !isSignIn(url)) return false;") && signInJava.includes("if (!browser.launchSignIn(url, callbackScheme)) return false;") && !signInJava.includes("EXTRA_HTTPS_REDIRECT"), "without a URL scheme or an Auth Tab the navigation is left to the bridge");
+  assert(popupsJava.includes("if (!support.isSupported(activity)) return false;") && popupsJava.includes("new AuthTabIntent.Builder().build().launch(authTab, url, redirectScheme);"), "the sign-in Auth Tab returns by the scheme and has no Custom Tab fallback");
+  assert(mainJava.split("signIn = ShellSignIn.install(getBridge(), CALLBACK_SCHEME, this::loadReturn);").length === 2 && mainJava.indexOf("super.onCreate(savedInstanceState);") < mainJava.indexOf("ShellSignIn.install(") && mainJava.includes("ShellSignIn signIn() {"), "MainActivity installs the sign-in once, after super.onCreate");
+  assert(mainJava.split("boolean loadReturn(Uri data) {").length === 2 && mainJava.split("appendQueryParameter(SHELL_LINK_PARAM").length === 2 && mainJava.indexOf("popups.onReturnLink(data)) return;") < mainJava.indexOf("loadReturn(data);\n    }") && mainJava.indexOf("loadReturn(data);\n    }") < mainJava.indexOf("boolean loadReturn(Uri data) {"), "a link and the Auth Tab result load the return through the same code, after the popups had their turn");
+  assert(mainJava.includes('String appPath = app.getEncodedPath();') && mainJava.includes('app.buildUpon().encodedPath(appPath == null || appPath.isEmpty() ? "/" : appPath)') && !mainJava.includes('path("/")'), "a return by the scheme loads the path of server.url, / when it has none");
+  assert(readFileSync(join(here, "templates", "ios", "SceneDelegate.swift"), "utf8").includes('components.path = serverURL.path.isEmpty ? "/" : serverURL.path'), "iOS brings a return by the scheme to the path of server.url");
+  assert(mainJava.includes("static final String CALLBACK_SCHEME = null;") && mainActivityJava("io.example.app", "io.example.app").includes('static final String CALLBACK_SCHEME = "io.example.app";'), "MainActivity hands the sign-in the callback scheme, or none");
+  const signInTest = androidTemplate("ShellSignInTest.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(signInTest.startsWith("package io.example.app;") && signInTest.includes('"https://app.example.com/home"') && signInTest.includes("RobolectricTestRunner") && signInTest.includes("MainActivity.CALLBACK_SCHEME") && !/__[A-Z_]+__/.test(signInTest), "the sign-in Robolectric test is written for the app package and host");
+  assert(swift.includes("createWebViewWith") && swift.includes("Callback.https(host:"), "the iOS template implements the popup contract");
+  // Background audio on Android: manifest, classes, activity wiring, dependency, the script.
+  const appManifest = `<manifest>\n    <application>\n        <activity android:name=".MainActivity" />\n    </application>\n\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>`;
+  const voiceManifest = withVoiceService(withAudioPermissions(appManifest));
+  const voicePermissions = ["FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MICROPHONE", "WAKE_LOCK", "POST_NOTIFICATIONS"].map((n) => `<uses-permission android:name="android.permission.${n}" />`);
+  assert(voicePermissions.every((p) => voiceManifest.includes(p)), "the voice service permissions are declared");
+  assert(voiceManifest.includes('<service android:name=".ShellVoiceService" android:foregroundServiceType="microphone" android:exported="false" />') && voiceManifest.indexOf("<service") < voiceManifest.indexOf("</application>"), "the voice service is declared inside the application, of type microphone and not exported");
+  assert(withVoiceService(voiceManifest) === voiceManifest, "declaring the voice service twice changes nothing");
+  assert(withVoiceService(withVoiceService(appManifest.replace(/\n/g, "\r\n"))).split("ShellVoiceService").length === 2, "a CRLF manifest is patched, once");
+  assert(voiceManifest.split("POST_NOTIFICATIONS").length === 2, "the notification permission is declared once");
+  assert(withVoiceService(appManifest.replace("</manifest>", '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>')).split("POST_NOTIFICATIONS").length === 2, "a manifest that already has the permission (push) is not given a second line");
+  assert(!audio.includes("POST_NOTIFICATIONS"), "without the option and without push the manifest does not declare the notification permission");
+  assert(!audio.includes("FOREGROUND_SERVICE") && !audio.includes("WAKE_LOCK") && !audio.includes("ShellVoiceService"), "without the option the manifest has none of it");
+  const missingAnchor = (fn, text) => {
+    const exit = process.exit, error = console.error;
+    let failed = false;
+    process.exit = () => { throw new Error("fail() called"); };
+    console.error = () => {};
+    try { fn(text); } catch (e) { failed = e.message === "fail() called"; }
+    finally { process.exit = exit; console.error = error; }
+    return failed;
+  };
+  assert(missingAnchor(withVoiceService, "<manifest>\n    <application/>\n</manifest>"), "a manifest without the INTERNET anchor fails loudly");
+  assert(missingAnchor(withVoiceService, '<manifest>\n    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>'), "a manifest without </application> fails loudly");
+  const voiceMain = mainActivityJava("io.example.app", undefined, true);
+  assert(voiceMain.split("voice = ShellVoiceCapture.install(getBridge());").length === 2 && voiceMain.indexOf("ShellSystemBars.install(getBridge());") < voiceMain.indexOf("ShellVoiceCapture.install(") && voiceMain.includes("ShellVoiceCapture voice() {"), "MainActivity installs the voice capture once, with the option");
+  assert(voiceMain.indexOf("super.onRequestPermissionsResult(requestCode, permissions, grantResults);") < voiceMain.indexOf("voice.onPermissionResult(") && !mainJava.includes("onRequestPermissionsResult"), "the voice MainActivity forwards the permission answer after Capacitor's routing, and only with the option");
+  assert(!mainJava.includes("ShellVoice"), "MainActivity has nothing of the voice service without the option");
+  const voiceVars = { appId: "io.example.app", host: "app.example.com:8443" };
+  const captureJava = androidTemplate("ShellVoiceCapture.java", voiceVars);
+  assert(captureJava.includes('APP_HOST = "app.example.com";') && captureJava.includes('"public/shell-voice.js"') && !/__[A-Z_]+__/.test(captureJava), "the capture class takes the app host and the bundled script");
+  assert(captureJava.includes("RECORD_AUDIO") && captureJava.includes("Lifecycle.State.STARTED") && captureJava.includes("if (!isMainFrame || !matches(origin, APP_HOST, APP_PORT)) return;") && captureJava.includes("addWebMessageListener(bridge.getWebView(), CHANNEL, bridge.getAllowedOriginRules()") && !captureJava.includes("addJavascriptInterface"), "the capture starts only with the permission and a started activity, reads the main frame of the app origin, and uses no JavascriptInterface");
+  assert(captureJava.includes("public void onPageStarted(WebView webView)") && captureJava.includes("onRenderProcessGone") && captureJava.includes("Lifecycle.Event.ON_DESTROY"), "the capture stops on a new page, a dead renderer and a destroyed activity");
+  assert(!androidTemplate("ShellPopups.java", voiceVars).includes("mitraShellVoice") && !androidTemplate("ShellPopups.java", voiceVars).includes("ShellVoice"), "the popup child windows never get the voice channel");
+  const serviceJava = androidTemplate("ShellVoiceService.java", voiceVars);
+  assert(serviceJava.includes("FOREGROUND_SERVICE_TYPE_MICROPHONE") && serviceJava.includes("START_NOT_STICKY") && serviceJava.includes("PARTIAL_WAKE_LOCK") && serviceJava.includes("wakeLock.release()") && serviceJava.includes("IMPORTANCE_LOW") && serviceJava.includes("Conversa por voz em andamento") && serviceJava.includes("FOREGROUND_SERVICE_IMMEDIATE") && !serviceJava.includes("POST_NOTIFICATIONS"), "the service is a sticky-less microphone service with a low importance notification shown at once, a wake lock released on destroy, and no runtime permission request of its own");
+  assert(captureJava.includes("POST_NOTIFICATIONS") && captureJava.includes("TIRAMISU"), "the capture asks for the notification permission on Android 13+");
+  for (const name of [...VOICE_TESTS]) assert(androidTemplate(name, voiceVars).startsWith("package io.example.app;") && !/__[A-Z_]+__/.test(androidTemplate(name, voiceVars)), `${name} is written for the app`);
+  const webkitGradle = withWebkitDependency(withBrowser);
+  assert(webkitGradle.includes(`androidx.webkit:webkit:${ANDROIDX_WEBKIT_VERSION}`) && withWebkitDependency(webkitGradle) === webkitGradle, "the app depends on androidx.webkit, once");
+  const variableGradle = withWebkitDependency(withBrowser, true);
+  assert(variableGradle.includes('androidx.webkit:webkit:$androidxWebkitVersion"') && !variableGradle.includes(ANDROIDX_WEBKIT_VERSION), "the webkit version comes from Capacitor's variable when it defines one");
+  assert(serviceJava.includes("R.drawable.ic_stat_voice") && !serviceJava.includes("android.R.drawable"), "the notification uses the shipped monochrome icon");
+  assert(captureJava.includes("addDocumentStartJavaScript") && captureJava.includes("DOCUMENT_START_SCRIPT") && captureJava.includes("START_DELAY_MS"), "the capture injects at document start when it can and debounces the start");
+  const portCapture = androidTemplate("ShellVoiceCapture.java", { appId: "io.example.app", host: "app.example.com:8443" });
+  assert(portCapture.includes('APP_HOST = "app.example.com";') && portCapture.includes("APP_PORT = 8443;") && androidTemplate("ShellVoiceCapture.java", { appId: "io.example.app", host: "app.example.com" }).includes("APP_PORT = -1;"), "the capture keeps the port of the published URL, and -1 without one");
+  assert(portCapture.includes("originRule(APP_HOST, APP_PORT)") && !portCapture.includes('"https://" + APP_HOST)'), "the document start rule is built from host and port");
+  await voiceSelftest(assert);
+}
+// Runs templates/android/shell-voice.js in a vm against a fake getUserMedia. A track is a plain
+// object with readyState, an "ended" listener list and the browser's own stop(), which ends it
+// without firing "ended", as the real one does.
+async function voiceSelftest(assert) {
+  const source = readFileSync(join(here, "templates", "android", "shell-voice.js"), "utf8");
+  assert(!/[^\x00-\x7f]/.test(source), "shell-voice.js is ASCII");
+  const makeTrack = (kind) => {
+    const track = { kind, readyState: "live", listeners: [], addEventListener(name, fn) { if (name === "ended") this.listeners.push(fn); } };
+    track.stop = function () { this.readyState = "ended"; };
+    track.end = function () { this.readyState = "ended"; this.listeners.forEach((fn) => fn()); };
+    return track;
+  };
+  const makeStream = (...tracks) => ({ tracks, getAudioTracks: () => tracks.filter((t) => t.kind === "audio") });
+  const run = ({ channel = true, framed = false, mediaDevices = true } = {}) => {
+    const messages = [], intervals = [];
+    const world = { next: null };
+    const devices = {
+      calls: [],
+      getUserMedia(...args) { this.calls.push({ self: this, args }); return world.next; }
+    };
+    const win = {
+      setInterval: (fn) => { intervals.push(fn); return intervals.length; },
+      clearInterval: (id) => { intervals[id - 1] = null; },
+      navigator: mediaDevices ? { mediaDevices: devices } : {},
+      mitraShellVoice: channel ? { postMessage: (m) => messages.push(m) } : undefined
+    };
+    win.window = win;
+    win.top = framed ? {} : win;
+    vm.createContext(win);
+    const load = () => vm.runInContext(source, win);
+    load();
+    // The page's call: the promise it gets, awaited the way a page does, so the script's own
+    // handler has run when this returns.
+    const call = async (outcome, ...args) => {
+      world.next = outcome;
+      const promise = win.navigator.mediaDevices.getUserMedia(...args);
+      return { promise, settled: await promise.then((v) => ({ value: v }), (e) => ({ error: e })) };
+    };
+    return { win, devices, messages, intervals, load, call };
+  };
+  // The page's side: same promise, same stream, receiver and arguments handed through.
+  let r = run();
+  let a = makeTrack("audio");
+  const stream = makeStream(a);
+  const resolved = Promise.resolve(stream);
+  const first = await r.call(resolved, { audio: true }, "extra");
+  assert(first.promise === resolved && first.settled.value === stream, "the page gets the same promise and the same stream");
+  assert(r.devices.calls.length === 1 && r.devices.calls[0].self === r.devices && r.devices.calls[0].args[1] === "extra", "the original is called with the same receiver and arguments");
+  assert(r.messages.join() === "capturing", "a resolved call with a live audio track reports capturing, once");
+  {
+    // stop() through the wrapper installed on the track.
+    r = run();
+    a = makeTrack("audio");
+    const originalStop = a.stop;
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(a.stop !== originalStop && r.messages.join() === "capturing", "the track is watched");
+    a.stop();
+    assert(r.messages.join() === "capturing,idle" && a.readyState === "ended", "stop() called by the page reports idle and still stops the track");
+    // ended event.
+    r = run();
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    a.end();
+    assert(r.messages.join() === "capturing,idle", "an ended track reports idle");
+    // Two tracks: idle only after the last one.
+    r = run();
+    a = makeTrack("audio");
+    const b = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a, b)), { audio: true });
+    a.stop();
+    assert(r.messages.join() === "capturing", "one live track left is still capturing");
+    b.end();
+    assert(r.messages.join() === "capturing,idle", "the last one ends it");
+    // A second call while the first is live does not report twice.
+    r = run();
+    a = makeTrack("audio");
+    const c = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    await r.call(Promise.resolve(makeStream(c)), { audio: true });
+    assert(r.messages.join() === "capturing", "a second stream while capturing reports nothing new");
+    a.stop();
+    c.stop();
+    assert(r.messages.join() === "capturing,idle", "both stopped is idle");
+    // The poll finds a track stopped through the prototype.
+    r = run();
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(r.intervals.length === 1 && r.intervals[0], "a poll runs while something is live");
+    a.readyState = "ended";
+    r.intervals[0]();
+    assert(r.messages.join() === "capturing,idle" && r.intervals[0] === null, "the poll reports a track that ended silently and stops itself");
+    // Video only, and no live track.
+    r = run();
+    await r.call(Promise.resolve(makeStream(makeTrack("video"))), { video: true });
+    const dead = makeTrack("audio");
+    dead.readyState = "ended";
+    await r.call(Promise.resolve(makeStream(dead)), { audio: true });
+    assert(r.messages.length === 0, "a video-only stream and an ended audio track never report");
+    // Rejection: same promise, same error, nothing reported.
+    r = run();
+    const failure = new Error("NotAllowedError");
+    const rejected = Promise.reject(failure);
+    const out = await r.call(rejected, { audio: true });
+    assert(out.promise === rejected && out.settled.error === failure && r.messages.length === 0, "a rejection reaches the page unchanged and reports nothing");
+    // Double injection is one wrapper.
+    r = run();
+    const wrapper = r.win.navigator.mediaDevices.getUserMedia;
+    r.load();
+    assert(r.win.navigator.mediaDevices.getUserMedia === wrapper, "a second injection leaves the same wrapper");
+    a = makeTrack("audio");
+    await r.call(Promise.resolve(makeStream(a)), { audio: true });
+    assert(r.messages.join() === "capturing" && r.devices.calls.length === 1, "one wrapper means one report and one underlying call");
+    // Nothing to do without the channel, in a frame, or without mediaDevices.
+    for (const [name, options] of [["a channel", { channel: false }], ["the top window", { framed: true }], ["mediaDevices", { mediaDevices: false }]]) {
+      const bare = run(options);
+      assert(!bare.win.__mitraShellVoice, `without ${name} the script does not install`);
+    }
+    const noChannel = run({ channel: false });
+    noChannel.win.mitraShellVoice = { postMessage: (m) => noChannel.messages.push(m) };
+    noChannel.load();
+    assert(noChannel.win.__mitraShellVoice === true, "a later injection that finds the channel installs");
+  }
+}
+// Runs templates/shared/shell-bars.js in a vm against a small fake of the page. A layer is the
+// background-color the page reports for an element; the canvas fake reads "#rrggbb" and
+// "oklch(L ...)" (grey of lightness L) and ignores anything else, as a real one does.
+function probeSelftest(assert) {
+  const source = readFileSync(join(here, "templates", "shared", "shell-bars.js"), "utf8");
+  assert(!/[^\x00-\x7f]/.test(source), "shell-bars.js is ASCII");
+  const run = ({ platform = "ios", viewport = "width=device-width, viewport-fit=cover", top = [], bottom, body, html, theme = [], capacitor = true, framed = false, reject = false } = {}) => {
+    const el = (bg) => ({ bg });
+    const world = { body: el(body), html: el(html) };
+    // "body" and "html" in a stack stand for those elements, as elementsFromPoint returns them.
+    const stack = (list) => list.map((e) => (e === "body" ? world.body : e === "html" ? world.html : e));
+    world.top = stack(top);
+    world.bottom = stack(bottom || top);
+    const timers = [], listeners = [], calls = [];
+    const parse = (css) => {
+      const hex = /^#([0-9a-f]{6})$/i.exec(css), ok = /^oklch\(([\d.]+)/.exec(css);
+      if (hex) return [0, 2, 4].map((i) => parseInt(hex[1].slice(i, i + 2), 16));
+      if (ok) return [0, 0, 0].map(() => Math.round(parseFloat(ok[1]) * 255));
+      return null;
+    };
+    const ctx = {
+      cur: [0, 0, 0], pixel: [0, 0, 0, 0],
+      set fillStyle(css) { const c = parse(css); if (c) this.cur = c; },
+      clearRect() { this.pixel = [0, 0, 0, 0]; },
+      fillRect() { this.pixel = [...this.cur, 255]; },
+      getImageData() { return { data: this.pixel }; }
+    };
+    const metaOf = (list) => list.map((content) => ({ content, getAttribute: (n) => (n === "content" ? content : null) }));
+    const win = {
+      innerWidth: 400, innerHeight: 800, calls, listeners, timers,
+      setTimeout: (fn) => { timers.push(fn); return timers.length; },
+      clearTimeout: () => {},
+      addEventListener: (name) => listeners.push(["win", name]),
+      matchMedia: () => ({ matches: false, addEventListener: () => listeners.push(["win", "scheme"]) }),
+      getComputedStyle: (e) => ({ backgroundColor: e.bg || "rgba(0, 0, 0, 0)", opacity: e.opacity === undefined ? "1" : String(e.opacity) }),
+      MutationObserver: class { constructor(cb) { win.mutate = cb; } observe() { listeners.push(["mutation"]); } },
+      Capacitor: capacitor ? {
+        getPlatform: () => platform,
+        nativePromise: (plugin, method, options) => { calls.push({ plugin, method, ...options }); return reject ? Promise.reject(new Error("no")) : Promise.resolve(); }
+      } : undefined
+    };
+    win.window = win;
+    win.top = framed ? {} : win;
+    win.document = {
+      body: world.body, documentElement: world.html,
+      addEventListener: (name) => listeners.push(["doc", name]),
+      createElement: () => ({ getContext: () => ctx }),
+      elementsFromPoint: (x, y) => (y < 100 ? world.top : world.bottom),
+      querySelectorAll: (sel) => (sel === "meta[name=viewport]" ? metaOf(viewport === null ? [] : [viewport]) : sel === "meta[name=theme-color]" ? metaOf(theme) : [])
+    };
+    vm.createContext(win);
+    const load = () => vm.runInContext(source, win);
+    const flush = () => { while (timers.length) timers.shift()(); };
+    load();
+    flush();
+    return { win, world, calls, listeners, load, flush };
+  };
+  const styles = (r) => r.calls.map((c) => `${c.bar}:${c.style}`).join();
+  const page = (bg) => ({ top: [{ bg: "rgba(0, 0, 0, 0)" }], body: bg });
+
+  assert(styles(run(page("rgb(255, 255, 255)"))) === "StatusBar:LIGHT", "a light page gets dark bar content");
+  assert(styles(run(page("rgb(15, 23, 42)"))) === "StatusBar:DARK", "a dark page gets light bar content");
+  const call = run(page("rgb(15, 23, 42)")).calls[0];
+  assert(call.plugin === "SystemBars" && call.method === "setStyle", "the style goes to SystemBars.setStyle");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.6)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a translucent dark overlay over a light page reads as dark");
+  assert(styles(run({ top: [{ bg: "rgba(0, 0, 0, 0.2)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a faint overlay over a light page stays light");
+  assert(styles(run({ top: [{ bg: "rgb(255, 255, 255)" }, { bg: "rgb(0, 0, 0)" }], body: "rgb(0, 0, 0)" })) === "StatusBar:LIGHT", "an opaque layer hides what is under it");
+  assert(styles(run({ top: [{ bg: "oklch(0.2 0 0)" }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "an oklch() color is read through the canvas");
+  assert(styles(run({ top: [{ bg: "bogus(1)" }], body: "rgb(15, 23, 42)" })) === "StatusBar:DARK", "a color the canvas rejects is ignored");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "transparent", theme: ["#0f172a"] })) === "StatusBar:DARK", "a transparent page falls back to the theme color");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)", theme: ["#ffffff"] })) === "StatusBar:LIGHT", "a light theme color gives dark bar content");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0)", html: "rgba(0, 0, 0, 0)" })) === "", "nothing known reports nothing");
+  assert(run({ top: [], body: "rgb(255, 255, 255)", capacitor: false }).calls.length === 0, "a page without Capacitor is left alone");
+  assert(styles(run({ ...page("rgb(255, 255, 255)"), reject: true })) === "StatusBar:LIGHT", "a rejected call does not throw");
+  // body and html come back from elementsFromPoint too: a translucent body counts once.
+  assert(styles(run({ top: [{}, "body", "html"], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a translucent body already in the stack is not composited twice");
+  assert(styles(run({ top: [{}], body: "rgba(0, 0, 0, 0.4)", html: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a body missing from the stack is still counted once");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0 }], body: "rgb(255, 255, 255)" })) === "StatusBar:LIGHT", "a backdrop at opacity 0 is not an overlay");
+  assert(styles(run({ top: [{ bg: "rgb(0, 0, 0)", opacity: 0.8 }], body: "rgb(255, 255, 255)" })) === "StatusBar:DARK", "a backdrop at opacity 0.8 is");
+  // The bottom sample must never reach iOS, where setStyle ignores `bar` and styles the status bar.
+  const sides = { top: [{ bg: "rgb(255, 255, 255)" }], bottom: [{ bg: "rgb(0, 0, 0)" }], body: "rgba(0, 0, 0, 0)" };
+  assert(styles(run(sides)) === "StatusBar:LIGHT", "iOS reports only the top edge");
+  assert(styles(run({ ...sides, platform: "android" })) === "StatusBar:LIGHT,NavigationBar:DARK", "Android reports both edges");
+  assert(run({ ...sides, platform: "android", viewport: "width=device-width" }).calls.length === 0 && run({ ...sides, platform: "android", viewport: null }).calls.length === 0, "Android does nothing without viewport-fit=cover");
+  assert(styles(run({ ...sides, platform: "ios", viewport: "width=device-width" })) === "StatusBar:LIGHT", "iOS leaves the decision to the native side");
+  assert(run({ ...page("rgb(15, 23, 42)"), framed: true }).listeners.length === 0, "a frame does nothing");
+  // Idempotence and change detection: a second load does nothing; a repeat check with the same
+  // color sends nothing; a changed color sends once.
+  const r = run(page("rgb(255, 255, 255)"));
+  const listening = r.listeners.length;
+  r.load();
+  r.flush();
+  assert(r.listeners.length === listening && r.calls.length === 1, "the probe runs once per document");
+  r.win.mutate();
+  r.flush();
+  assert(r.calls.length === 1, "an unchanged color is not sent again");
+  r.world.body.bg = "rgb(15, 23, 42)";
+  r.win.mutate();
+  r.win.mutate();
+  assert(r.win.timers.length === 1, "a burst of mutations queues one check");
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK", "a theme switch is reported once");
+  r.win.__mitraShellBars.recheck();
+  r.flush();
+  assert(styles(r) === "StatusBar:LIGHT,StatusBar:DARK,StatusBar:DARK", "recheck sends the current style again");
+}
+// The asynchronous icon flow on its real path (fetchManifest, materializePageIcon, pageIcon and the
+// ranking wired as the call site does it) against a server on loopback.
+async function selftestIconFlow() {
+  const assert = (cond, msg) => { if (!cond) fail(`selftest: ${msg}`); };
+  const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const SVG = "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>";
+  const hits = {};
+  const manifest = JSON.stringify({ background_color: "#ffffff", icons: [{ src: "/i/m.png", sizes: "512x512" }, { src: "/i/m.svg", type: "image/svg+xml" }] });
+  const routes = {
+    "/m/ok.json": (res) => res.writeHead(200, { "content-type": "application/manifest+json" }).end(manifest),
+    "/m/text.json": (res) => res.writeHead(200).end("<html>not json"),
+    "/m/big.json": (res) => res.writeHead(200).end(`{"icons":[],"pad":"${"a".repeat(MANIFEST_MAX_BYTES)}"}`),
+    "/i/spa.png": (res) => res.writeHead(200, { "content-type": "text/html" }).end("<html><body><svg width='1'></svg></body></html>"),
+    "/i/fake.png": (res) => res.writeHead(200, { "content-type": "image/png" }).end(Buffer.from("GIF89a not a png")),
+    "/i/real.png": (res) => res.writeHead(200, { "content-type": "image/png" }).end(PNG),
+    "/i/m.svg": (res) => res.writeHead(200, { "content-type": "image/svg+xml" }).end(SVG),
+    // No content-length, so only the capped read can stop it.
+    "/i/huge.png": (res) => {
+      res.on("error", () => {});
+      res.writeHead(200, { "content-type": "image/png" });
+      const chunk = Buffer.alloc(1048576);
+      for (let i = 0; i <= ICON_MAX_BYTES / chunk.length && !res.destroyed; i++) res.write(chunk);
+      res.end();
+    }
+  };
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, "http://x").pathname;
+    hits[path] = (hits[path] || 0) + 1;
+    (routes[path] || ((r) => r.writeHead(404).end("missing")))(res);
+  });
+  const logs = [];
+  const realLog = console.log;
+  const dir = mkdtempSync(join(tmpdir(), "mitra-icon-selftest-"));
+  try {
+    await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    console.log = (m) => logs.push(String(m));
+
+    const ok = await fetchManifest(`${base}/m/ok.json`);
+    assert(ok.backgroundColor === "#ffffff" && ok.icons.length === 2, "a served manifest gives its icons and its background color");
+    for (const bad of ["/m/missing.json", "/m/text.json", "/m/big.json"]) {
+      const r = await fetchManifest(`${base}${bad}`);
+      assert(r.icons.length === 0 && r.backgroundColor === undefined, `${bad} is ignored`);
+    }
+    assert(logs.some((l) => l.includes("HTTP 404")) && logs.some((l) => l.includes("not JSON")) && logs.some((l) => l.includes("over 1 MB")), "each ignored manifest logs its reason");
+
+    // The call site: scrape, then pageIcon, then materializePageIcon.
+    const scraped = scrape(`<link rel="manifest" href="/m/ok.json"><link rel="apple-touch-icon" href="/i/real.png" sizes="180x180">`, base);
+    const wired = await pageIcon(scraped);
+    assert(wired.backgroundColor === "#ffffff" && wired.icons[0] === `${base}/i/m.svg`, "the manifest vector ranks first and its color comes along");
+    const wiredDir = join(dir, "wired");
+    mkdirSync(wiredDir);
+    const used = await materializePageIcon(wired.icons, wiredDir);
+    assert(used && used.url === `${base}/i/m.svg` && readFileSync(used.path, "utf8") === SVG && used.path.endsWith("logo.svg"), "the first usable icon is written as logo.svg");
+
+    // 404, an HTML page with an svg in it, a wrong-bytes png, then the real one.
+    const links = ["404", "spa", "fake", "real"].map((n, i) => `<link rel="icon" href="/i/${n}.png" sizes="${512 >> i}x${512 >> i}">`).join("");
+    const ranked = rankIcons(scrape(links, base).iconCandidates);
+    assert(ranked.length === 4 && ranked[0].endsWith("/404.png") && ranked[3].endsWith("/real.png"), "the bigger declared sizes come first");
+    const skipDir = join(dir, "skip");
+    mkdirSync(skipDir);
+    const fourth = await materializePageIcon(ranked, skipDir);
+    assert(fourth && fourth.url === ranked[3] && fourth.path === join(skipDir, "logo.png") && readFileSync(fourth.path).equals(PNG), "failing candidates are skipped until the real PNG");
+    assert(["/i/404.png", "/i/spa.png", "/i/fake.png", "/i/real.png"].every((x) => hits[x] === 1), "each candidate is requested once, in order");
+    assert(logs.some((l) => l.includes("HTTP 404")) && logs.filter((l) => l.includes("not an SVG or a PNG")).length === 2, "each skipped icon logs its reason");
+
+    // Nothing usable: null, so the caller draws the initials.
+    const noneDir = join(dir, "none");
+    mkdirSync(noneDir);
+    assert(await materializePageIcon(ranked.slice(0, 3), noneDir) === null && readdirSync(noneDir).length === 0, "no usable icon returns null and writes nothing");
+    assert(await materializePageIcon([], noneDir) === null, "an empty list returns null");
+
+    // Attempts are capped.
+    const many = Array.from({ length: MAX_ICON_ATTEMPTS + 3 }, (_, i) => `${base}/i/gone${i}.png`);
+    logs.length = 0;
+    assert(await materializePageIcon(many, noneDir) === null, "candidates that all fail return null");
+    const reached = Object.keys(hits).filter((k) => k.startsWith("/i/gone")).length;
+    assert(reached === MAX_ICON_ATTEMPTS, `only ${MAX_ICON_ATTEMPTS} candidates are requested, got ${reached}`);
+    assert(logs.some((l) => l.includes("3 more candidates will not be tried")), "the untried candidates are logged");
+
+    // The size cap stops a body larger than an icon, and the next candidate is used.
+    const capDir = join(dir, "cap");
+    mkdirSync(capDir);
+    const afterHuge = await materializePageIcon([`${base}/i/huge.png`, `${base}/i/real.png`], capDir);
+    assert(afterHuge && afterHuge.url === `${base}/i/real.png` && logs.some((l) => l.includes("over 10 MB")), "an icon over the size cap is skipped");
+  } finally {
+    console.log = realLog;
+    server.closeAllConnections();
+    await new Promise((done) => server.close(done));
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 function log(msg) { console.log(`[generate] ${msg}`); }
 function fail(msg) { console.error(`[generate] ERROR: ${msg}`); process.exit(1); }
